@@ -21,8 +21,9 @@ use std::time::Duration;
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::Result;
 use buzz_core::kind::{
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
-    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+    KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER,
+    KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
@@ -1442,6 +1443,8 @@ async fn tokio_main() -> Result<()> {
                 kinds: config.kinds_override.clone().unwrap_or_else(|| {
                     vec![
                         KIND_STREAM_MESSAGE,
+                        KIND_FORUM_POST,
+                        KIND_FORUM_COMMENT,
                         KIND_WORKFLOW_APPROVAL_REQUESTED,
                         KIND_STREAM_REMINDER,
                     ]
@@ -3038,15 +3041,29 @@ fn spawn_failure_notice(
     content: String,
 ) {
     if let Some(rest) = rest_client {
-        let thread_tags = batch
+        let (thread_tags, triggering_kind, triggering_event_id) = batch
             .events
             .last()
-            .map(|be| queue::parse_thread_tags(&be.event))
+            .map(|be| {
+                (
+                    queue::parse_thread_tags(&be.event),
+                    be.event.kind.as_u16() as u32,
+                    Some(be.event.id),
+                )
+            })
             .unwrap_or_default();
         let rest = rest.clone();
         let channel_id = batch.channel_id;
         tokio::spawn(async move {
-            pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
+            pool::post_failure_notice(
+                &rest,
+                channel_id,
+                &thread_tags,
+                triggering_kind,
+                triggering_event_id,
+                &content,
+            )
+            .await;
         });
     }
 }
@@ -3649,9 +3666,13 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("kind `45001`"));
         assert!(prompt.contains("kind `45003`"));
         assert!(prompt.contains("stream default kind `9`"));
-        assert!(prompt.contains("if `[Context]` gives only a root event ID"));
+        assert!(prompt.contains(
+            "legacy kind-`40002`, reminder kind-`40007`, kind-`40008` diff, and workflow approval kind-`46010` stream roots"
+        ));
+        assert!(prompt.contains("inspect the supplied `Thread root kind` in `[Context]`"));
+        assert!(prompt.contains("only if the kind is unavailable"));
         assert!(prompt.contains("buzz messages thread --channel <UUID> --event <root-id>"));
-        assert!(prompt.contains("Never send kind `45003` beneath a kind-`9` root"));
+        assert!(prompt.contains("Never send kind `45003` beneath stream roots"));
     }
 }
 

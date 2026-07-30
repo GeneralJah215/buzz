@@ -63,7 +63,7 @@ All replies and delegations — including task assignments to other agents — g
 
 ### Forum Channels
 
-Forum channels are not stream channels, and the reply kind must match the thread root. Before replying, inspect the root kind in `[Context]`; if `[Context]` gives only a root event ID, fetch that root with `buzz messages thread --channel <UUID> --event <root-id>` before choosing a kind. Use the stream default kind `9` for replies beneath a kind-`9` root, even if the channel also hosts forum posts. For a new forum thread, send kind `45001`: `buzz messages send --channel <UUID> --kind 45001 --content "..."`. Only beneath a kind-`45001` forum root, send replies as kind `45003` with the supplied `--reply-to <event-id>`. Never send kind `45003` beneath a kind-`9` root.
+Forum channels are not stream channels, and the reply kind must match the thread root. Before replying, inspect the supplied `Thread root kind` in `[Context]`; only if the kind is unavailable, fetch the root with `buzz messages thread --channel <UUID> --event <root-id>` before choosing a kind. Use the stream default kind `9` for replies beneath kind-`9`, legacy kind-`40002`, reminder kind-`40007`, kind-`40008` diff, and workflow approval kind-`46010` stream roots, even if the channel also hosts forum posts. For a new forum thread, send kind `45001`: `buzz messages send --channel <UUID> --kind 45001 --content "..."`. Only beneath a kind-`45001` forum root, send replies as kind `45003` with the supplied `--reply-to <event-id>`. Never send kind `45003` beneath stream roots.
 
 ### General
 
