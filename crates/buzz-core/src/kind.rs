@@ -921,12 +921,19 @@ mod tests {
 
     #[test]
     fn thread_directory_kinds_have_the_required_storage_contract() {
+        // Registered *exactly* once, not merely present. `contains` proves only
+        // "at least once" and passes on a tree with duplicate ALL_KINDS entries,
+        // which is the shape a concurrent double-write produces.
         for kind in [
             KIND_THREAD_DIRECTORY_STATE,
             KIND_THREAD_DIRECTORY_ITEM,
             KIND_THREAD_DIRECTORY_BOUNDS,
         ] {
-            assert!(ALL_KINDS.contains(&kind));
+            let registrations = ALL_KINDS.iter().filter(|entry| **entry == kind).count();
+            assert_eq!(
+                registrations, 1,
+                "kind {kind} must be registered exactly once in ALL_KINDS, found {registrations}"
+            );
         }
         assert!(!is_relay_only_kind(KIND_THREAD_DIRECTORY_STATE));
         assert!(is_relay_only_kind(KIND_THREAD_DIRECTORY_ITEM));
