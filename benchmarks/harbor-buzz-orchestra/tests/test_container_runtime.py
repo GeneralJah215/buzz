@@ -1,5 +1,6 @@
 """The container runtime must launch the production stack, unmodified."""
 
+import asyncio
 import hashlib
 import json
 import re
@@ -781,6 +782,62 @@ async def test_usage_is_settled_before_teardown_kills_the_agent(tmp_path, monkey
 
     assert order[0] == "usage", "teardown ran before the usage line was flushed"
     assert "kill" in order
+
+
+async def test_usage_is_settled_when_the_trial_times_out(tmp_path, monkeypatch):
+    """The timeout path has to settle too, and it is the path that matters most.
+
+    It used to fall straight through to the kill, on the reasoning that a turn
+    which never completed had nothing to flush. buzz-agent now reports after
+    every provider round, so an interrupted turn HAS reported — and under
+    `continue_until_timeout` every phase but the last ends here. Skipping the
+    settle on this path is what left 97% of one measured run's receipt rows at
+    all zeros while the provider billed it in full.
+    """
+    manifest = write_manifest(tmp_path)
+    trial = trial_handle((credential("orch-1", "orchestrator", "orch-model", "lead"),))
+    rt = runtime(tmp_path, poll_seconds=0, usage_settle_seconds=5)
+    order = []
+
+    class TimingOutEnvironment(Environment):
+        async def exec(self, command, env=None, **kwargs):
+            if "buzz-acp" in command:
+                return ExecResult(stdout="99\n", stderr="", return_code=0)
+            if command.startswith("cat "):
+                order.append("usage")
+                return ExecResult(
+                    stdout="goose usage update input=1 output=2\n",
+                    stderr="",
+                    return_code=0,
+                )
+            if "/proc/[0-9]*" in command:
+                order.append("kill")
+            return ExecResult(stdout="", stderr="", return_code=0)
+
+    async def never_done(*args, **kwargs):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(rt, "_install_stack", lambda env: _noop())
+    monkeypatch.setattr(rt, "_wait_for_agents_ready", lambda *a, **k: _noop())
+    monkeypatch.setattr(rt, "_wait_for_done", never_done)
+    monkeypatch.setattr(rt, "_buzz_json", lambda *a, **k: _value([]))
+    # TrialBudget is frozen, so swap in a zero-budget copy rather than mutating.
+    budget = manifest.trial_budget.model_copy(update={"timeout_seconds": 0})
+    manifest = manifest.model_copy(update={"trial_budget": budget})
+
+    with pytest.raises(asyncio.TimeoutError):
+        await rt.run(
+            instruction="do the thing",
+            environment=TimingOutEnvironment(),
+            manifest=manifest,
+            trial=trial,
+        )
+
+    assert "usage" in order, "the timeout path never settled usage"
+    assert order.index("usage") < order.index("kill"), (
+        "usage was settled after teardown killed the agent, which is the same "
+        "as not settling at all"
+    )
 
 
 async def test_wait_for_agents_ready_requires_every_channel_subscription(tmp_path):

@@ -381,12 +381,26 @@ class BuzzContainerRuntime:
                 ),
                 timeout=manifest.trial_budget.timeout_seconds,
             )
-            # `DONE:` is published before the turn's usage notification is, so
-            # teardown has to wait or the trial's tokens are lost. Inside the
-            # try, and only on this path: a timeout has no usage to flush.
-            await self._settle_usage(environment, agents)
             await self._verify_m1_output(environment, manifest)
         finally:
+            # `DONE:` is published before the turn's usage notification is, so
+            # teardown has to wait or the trial's tokens are lost.
+            #
+            # In the `finally`, so the TIMEOUT path settles too. That path used
+            # to fall straight through to the kill on the reasoning that "a turn
+            # that never completed has no usage to flush", which was true while
+            # buzz-agent reported once per turn and is not any more: it now
+            # reports after every provider round, so an unfinished turn has
+            # reported everything but its in-flight request. Skipping the settle
+            # here is what made `continue_until_timeout` runs uncostable —
+            # every phase but the last ends on this path, and 97% of one
+            # measured run's receipt rows came back all zeros.
+            #
+            # Cheap in the common case: this returns on the first poll once a
+            # usage line exists, which after the first round it does. Only a
+            # phase that never completed a single round can spend the full
+            # budget, and that phase has nothing to report anyway.
+            await self._settle_usage(environment, agents)
             await self._stop_agents(environment, agents + infra)
             # Logs first, and ahead of anything that touches the network. The
             # verifier pre-install below used to run first and, when the proxy
@@ -1021,10 +1035,10 @@ class BuzzContainerRuntime:
     ) -> None:
         """Give each agent the moment it needs to report what it spent.
 
-        buzz-agent emits its `_goose/unstable/session/update` usage notification
-        once per turn, immediately *before* returning the `session/prompt`
-        response (buzz-agent/src/lib.rs:708). A solo agent gets exactly one turn
-        per trial, so that single notification is the only record of the trial's
+        buzz-agent emits a `_goose/unstable/session/update` usage notification
+        after every provider round, and once more immediately *before* returning
+        the `session/prompt` response. A solo agent gets exactly one turn per
+        trial, so the final notification is the complete record of the trial's
         tokens — and it is written after the agent has already published `DONE:`
         as a tool call.
 
@@ -1039,10 +1053,12 @@ class BuzzContainerRuntime:
         `DONE:` reaches the channel from inside a tool call, so the turn may
         still owe one model round-trip before it ends and reports, and for a
         thinking model that is tens of seconds, not milliseconds.
-        Waiting is pointless on the timeout path — a turn that never completed
-        has no usage to flush — so callers only invoke this once `DONE:` is seen.
-        A miss is not fatal; the accounting note already reports an unpriced
-        trial, and losing the tokens is better than hanging the sweep.
+        Called on the timeout path too, not just after `DONE:`. An interrupted
+        turn has still reported every round it finished, and under
+        `continue_until_timeout` the interrupted turn is the normal case, not
+        the exception. A miss is not fatal; the accounting note already reports
+        an unpriced trial, and losing the tokens is better than hanging the
+        sweep.
         """
         deadline = asyncio.get_running_loop().time() + self.usage_settle_seconds
         pending = {agent.credential.agent_id: agent for agent in agents}
