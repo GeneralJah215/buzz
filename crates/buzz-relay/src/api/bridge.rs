@@ -379,6 +379,305 @@ fn extract_page_offset(raw: &Value, limit: Option<i64>) -> Option<i64> {
 /// consume it (docs/bridge-channel-window.md).
 const BRIDGE_WINDOW_DEFAULT_LIMIT: u32 = 50;
 const BRIDGE_WINDOW_MAX_LIMIT: u32 = 200;
+const BRIDGE_DIRECTORY_DEFAULT_LIMIT: u32 = 25;
+const BRIDGE_DIRECTORY_MAX_LIMIT: u32 = 100;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadDirectoryCursorWire {
+    pinned: bool,
+    activity_at: i64,
+    root_id: String,
+    /// Pinned auto-active aging bound. Replayed so later pages filter against
+    /// the same instant as the first page (BUG-008).
+    activity_cutoff: i64,
+}
+
+fn encode_thread_directory_cursor(
+    cursor: &buzz_db::thread::ThreadDirectoryCursor,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let wire = ThreadDirectoryCursorWire {
+        pinned: cursor.pinned,
+        activity_at: cursor.activity_at.timestamp(),
+        root_id: hex::encode(&cursor.root_event_id),
+        activity_cutoff: cursor.activity_cutoff.timestamp(),
+    };
+    let bytes = serde_json::to_vec(&wire)
+        .map_err(|error| internal_error(&format!("directory cursor encode: {error}")))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_thread_directory_cursor(
+    value: &str,
+) -> Result<buzz_db::thread::ThreadDirectoryCursor, (StatusCode, Json<Value>)> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    if value.is_empty() || value.len() > 2048 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "thread_index: malformed directory_cursor",
+        ));
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(value).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "thread_index: malformed directory_cursor",
+        )
+    })?;
+    let wire: ThreadDirectoryCursorWire = serde_json::from_slice(&bytes).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "thread_index: malformed directory_cursor",
+        )
+    })?;
+    let activity_at = chrono::DateTime::from_timestamp(wire.activity_at, 0).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "thread_index: malformed directory_cursor",
+        )
+    })?;
+    let activity_cutoff =
+        chrono::DateTime::from_timestamp(wire.activity_cutoff, 0).ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "thread_index: malformed directory_cursor",
+            )
+        })?;
+    let root_event_id = hex::decode(wire.root_id).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "thread_index: malformed directory_cursor",
+        )
+    })?;
+    if root_event_id.len() != 32 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "thread_index: malformed directory_cursor",
+        ));
+    }
+    Ok(buzz_db::thread::ThreadDirectoryCursor {
+        pinned: wire.pinned,
+        activity_at,
+        root_event_id,
+        activity_cutoff,
+    })
+}
+
+fn generated_thread_title(content: &str) -> String {
+    let Some(line) = content.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return "Untitled thread".to_string();
+    };
+    let mut candidate = line.trim_start();
+    loop {
+        let before = candidate;
+        if let Some(rest) = candidate.strip_prefix('>') {
+            candidate = rest.trim_start();
+        } else if let Some(rest) = candidate
+            .strip_prefix("- ")
+            .or_else(|| candidate.strip_prefix("* "))
+            .or_else(|| candidate.strip_prefix("+ "))
+        {
+            candidate = rest.trim_start();
+        } else {
+            let heading_len = candidate.chars().take_while(|ch| *ch == '#').count();
+            if heading_len > 0
+                && candidate
+                    .chars()
+                    .nth(heading_len)
+                    .is_some_and(char::is_whitespace)
+            {
+                candidate = candidate[heading_len..].trim_start();
+            } else {
+                let marker_len = candidate
+                    .char_indices()
+                    .take_while(|(_, ch)| ch.is_ascii_digit())
+                    .last()
+                    .map(|(index, ch)| index + ch.len_utf8())
+                    .unwrap_or(0);
+                let remainder = &candidate[marker_len..];
+                if marker_len > 0 && (remainder.starts_with(". ") || remainder.starts_with(") ")) {
+                    candidate = remainder[2..].trim_start();
+                }
+            }
+        }
+        if candidate == before {
+            break;
+        }
+    }
+
+    let collapsed = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "Untitled thread".to_string();
+    }
+    let chars: Vec<char> = collapsed.chars().collect();
+    if chars.len() <= 80 {
+        collapsed
+    } else {
+        chars[..79]
+            .iter()
+            .copied()
+            .chain(std::iter::once('…'))
+            .collect()
+    }
+}
+
+async fn handle_thread_directory_filter(
+    state: &AppState,
+    tenant: &buzz_core::TenantContext,
+    raw: &Value,
+    filter: &nostr::Filter,
+    accessible_channels: &[uuid::Uuid],
+    events: &mut Vec<Value>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    use buzz_core::kind::{KIND_THREAD_DIRECTORY_BOUNDS, KIND_THREAD_DIRECTORY_ITEM};
+
+    let Some(channel_id) = extract_channel_from_filter(filter) else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "thread_index requires exactly one #h channel",
+        ));
+    };
+
+    let directory_state = match raw.get("directory_state").and_then(Value::as_str) {
+        Some("active") => buzz_db::thread::ThreadDirectoryState::Active,
+        Some("archived") => buzz_db::thread::ThreadDirectoryState::Archived,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "thread_index: directory_state must be active or archived",
+            ));
+        }
+    };
+    let state_name = match directory_state {
+        buzz_db::thread::ThreadDirectoryState::Active => "active",
+        buzz_db::thread::ThreadDirectoryState::Archived => "archived",
+    };
+    let request_cursor = match raw.get("directory_cursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "thread_index: malformed directory_cursor",
+            ));
+        }
+    };
+    let cursor = request_cursor
+        .map(decode_thread_directory_cursor)
+        .transpose()?;
+    let limit = filter
+        .limit
+        .map(|value| (value as u32).min(BRIDGE_DIRECTORY_MAX_LIMIT))
+        .unwrap_or(BRIDGE_DIRECTORY_DEFAULT_LIMIT)
+        .max(1);
+
+    // An inaccessible channel yields an empty page instead of an early return,
+    // so "exactly one bounds overlay" holds on every path. This discloses
+    // nothing: `accessible_channels` is a membership list, not an existence
+    // check, so a channel that does not exist is equally absent and already
+    // produced this exact response. Request-shape errors above (bad
+    // `directory_state` or `directory_cursor`) are still 400 here, because they
+    // depend only on the request body and fire identically for a channel the
+    // caller can read.
+    let page = if accessible_channels.contains(&channel_id) {
+        state
+            .db
+            .get_thread_directory(
+                tenant.community(),
+                channel_id,
+                directory_state,
+                limit,
+                cursor,
+            )
+            .await
+            .map_err(|error| internal_error(&format!("thread directory query: {error}")))?
+    } else {
+        buzz_db::thread::ThreadDirectoryPage {
+            rows: Vec::new(),
+            has_more: false,
+            next_cursor: None,
+        }
+    };
+
+    let parse_tag = |parts: [&str; 2]| {
+        nostr::Tag::parse(parts)
+            .map_err(|error| internal_error(&format!("directory overlay tag: {error}")))
+    };
+    let sign_overlay = |kind: u32, tags: Vec<nostr::Tag>, content: String| {
+        nostr::EventBuilder::new(nostr::Kind::Custom(kind as u16), content)
+            .tags(tags)
+            .sign_with_keys(&state.relay_keypair)
+            .map_err(|error| internal_error(&format!("directory overlay sign: {error}")))
+    };
+    let channel_text = channel_id.to_string();
+
+    for row in &page.rows {
+        let root_id = row.root.event.id.to_hex();
+        let title = row
+            .title_override
+            .clone()
+            .unwrap_or_else(|| generated_thread_title(&row.root.event.content));
+        let root_author = crate::handlers::ingest::effective_message_author(
+            &row.root.event,
+            &state.relay_keypair.public_key(),
+        );
+        let content = serde_json::json!({
+            "title": title,
+            "title_override": row.title_override,
+            "root_author": hex::encode(root_author),
+            "root_created_at": row.root.event.created_at.as_secs(),
+            "reply_count": row.reply_count,
+            "descendant_count": row.descendant_count,
+            "last_reply_at": row.last_reply_at.map(|value| value.timestamp()).unwrap_or(0),
+            "participants": row.participants.iter().map(hex::encode).collect::<Vec<_>>(),
+            "pinned": row.pinned,
+            "archived": row.archived,
+            "state_created_at": row.state_created_at.map(|value| value.timestamp()).unwrap_or(0),
+            "state_event_id": row.state_event_id.as_ref().map(hex::encode),
+        });
+        let tags = vec![
+            parse_tag(["e", &root_id])?,
+            parse_tag(["d", &root_id])?,
+            parse_tag(["h", &channel_text])?,
+        ];
+        let overlay = sign_overlay(KIND_THREAD_DIRECTORY_ITEM, tags, content.to_string())?;
+        events.push(
+            serde_json::to_value(overlay)
+                .map_err(|error| internal_error(&format!("directory item serialize: {error}")))?,
+        );
+    }
+
+    let next_cursor = page
+        .next_cursor
+        .as_ref()
+        .map(encode_thread_directory_cursor)
+        .transpose()?;
+    if page.has_more != next_cursor.is_some() {
+        return Err(internal_error("directory cursor invariant violated"));
+    }
+    let request_suffix = request_cursor.unwrap_or("head");
+    let d_value = format!("{channel_text}:{state_name}:{request_suffix}");
+    let content = serde_json::json!({
+        "has_more": page.has_more,
+        "next_cursor": next_cursor,
+    });
+    let bounds = sign_overlay(
+        KIND_THREAD_DIRECTORY_BOUNDS,
+        vec![
+            parse_tag(["d", &d_value])?,
+            parse_tag(["h", &channel_text])?,
+        ],
+        content.to_string(),
+    )?;
+    events.push(
+        serde_json::to_value(bounds)
+            .map_err(|error| internal_error(&format!("directory bounds serialize: {error}")))?,
+    );
+
+    Ok(())
+}
 
 /// Aux closure kinds: reactions, deletions (NIP-09 + NIP-29), edits.
 const WINDOW_AUX_KINDS: [u32; 4] = [
@@ -1032,6 +1331,24 @@ async fn query_events_authed(
 
     let mut events: Vec<Value> = Vec::new();
     let mut handled: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    // Thread-directory filters are a relay-synthesized, channel-id-only read
+    // model and never fall through to the generic stored-event query.
+    for (idx, (raw, filter)) in raw_filters.iter().zip(filters.iter()).enumerate() {
+        if !extension_flag(raw, "thread_index") {
+            continue;
+        }
+        handle_thread_directory_filter(
+            state,
+            tenant,
+            raw,
+            filter,
+            &accessible_channels,
+            &mut events,
+        )
+        .await?;
+        handled.insert(idx);
+    }
 
     // Channel-window filters (`top_level: true`) — the GUI read-model surface.
     // Dispatched first: a window filter is never a feed/thread/catchall query.
@@ -3764,6 +4081,68 @@ mod tests {
         assert!(
             log.contains(&pubkey_hex[..16]),
             "attribution line must carry the pubkey;\nlog:\n{log}"
+        );
+    }
+
+    /// BUG-008. The pinned auto-active cutoff only helps if it survives the
+    /// round trip to the client and back. If `activity_cutoff` were dropped
+    /// from the wire format, every later page would silently fall back to a
+    /// fresh window and the db-side fix would be inert -- with no test failure
+    /// anywhere, because the db test cannot run on a machine without Postgres.
+    /// This one runs everywhere.
+    #[test]
+    fn directory_cursor_round_trip_preserves_the_pinned_activity_cutoff() {
+        let cutoff = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid cutoff");
+        let original = buzz_db::thread::ThreadDirectoryCursor {
+            pinned: true,
+            activity_at: chrono::DateTime::from_timestamp(1_800_000_000, 0)
+                .expect("valid activity"),
+            root_event_id: vec![7u8; 32],
+            activity_cutoff: cutoff,
+        };
+
+        let encoded = encode_thread_directory_cursor(&original).expect("encode");
+        let decoded = decode_thread_directory_cursor(&encoded).expect("decode");
+
+        assert_eq!(
+            decoded, original,
+            "every cursor dimension must survive the round trip, including the \
+             pinned activity_cutoff"
+        );
+        assert_eq!(
+            decoded.activity_cutoff, cutoff,
+            "the pinned cutoff is the whole point of BUG-008; losing it \
+             silently reverts later pages to a fresh 30-day window"
+        );
+    }
+
+    /// The cursor is opaque to clients, so every malformed shape must be a 400
+    /// rather than a panic or a silent default. Spec line 204.
+    #[test]
+    fn directory_cursor_rejects_malformed_input() {
+        for bad in ["", "!!!not-base64!!!", "YWJj"] {
+            let result = decode_thread_directory_cursor(bad);
+            assert!(
+                result.is_err(),
+                "malformed cursor {bad:?} must be rejected, not defaulted"
+            );
+        }
+
+        // Structurally valid base64+JSON, but the root id is the wrong length.
+        let short_root = {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use base64::Engine as _;
+            let wire = serde_json::json!({
+                "pinned": false,
+                "activity_at": 1_700_000_000i64,
+                "root_id": "aabb",
+                "activity_cutoff": 1_700_000_000i64,
+            });
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wire).expect("serialize"))
+        };
+        assert!(
+            decode_thread_directory_cursor(&short_root).is_err(),
+            "a root id that is not 32 bytes must be rejected"
         );
     }
 }

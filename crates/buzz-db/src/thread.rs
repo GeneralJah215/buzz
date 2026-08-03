@@ -6,7 +6,7 @@
 
 use buzz_core::StoredEvent;
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use uuid::Uuid;
 
 use buzz_core::CommunityId;
@@ -77,6 +77,81 @@ pub struct ChannelWindow {
     /// the scan position, captured before event reconstruction so a page whose
     /// tail row fails to reconstruct still advances. `Some` iff `has_more`.
     pub next_cursor: Option<(DateTime<Utc>, Vec<u8>)>,
+}
+
+/// Directory partition requested by the desktop sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadDirectoryState {
+    /// Threads visible in the default active directory.
+    Active,
+    /// Threads explicitly archived by shared metadata.
+    Archived,
+}
+
+/// Complete keyset for the directory's deterministic ordering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadDirectoryCursor {
+    /// Pin ordering dimension; meaningful for active pages.
+    pub pinned: bool,
+    /// Latest root/reply activity ordering dimension.
+    pub activity_at: DateTime<Utc>,
+    /// Root event-id tiebreak ordering dimension.
+    pub root_event_id: Vec<u8>,
+    /// Auto-active aging bound, pinned at the first page and replayed on every
+    /// later page. Recomputing it per page would let a root sitting on the
+    /// 30-day boundary leave the result set between pages, and the keyset
+    /// cannot see that: the row is not ordered past, it is filtered out, so it
+    /// would be skipped on every page. Not an ordering dimension.
+    pub activity_cutoff: DateTime<Utc>,
+}
+
+/// One authoritative directory row before relay overlay projection.
+#[derive(Debug, Clone)]
+pub struct ThreadDirectoryRow {
+    /// Stored depth-zero root event.
+    pub root: StoredEvent,
+    /// Direct reply count from `thread_metadata`.
+    pub reply_count: i32,
+    /// All descendant replies from `thread_metadata`.
+    pub descendant_count: i32,
+    /// Latest reply timestamp, when any reply exists.
+    pub last_reply_at: Option<DateTime<Utc>>,
+    /// Effective activity timestamp used for ordering.
+    pub activity_at: DateTime<Utc>,
+    /// Up to ten newest-first participant pubkeys.
+    pub participants: Vec<Vec<u8>>,
+    /// Latest shared title override, or none for a generated title.
+    pub title_override: Option<String>,
+    /// Latest shared pin state.
+    pub pinned: bool,
+    /// Latest shared archive state.
+    pub archived: bool,
+    /// Timestamp of the reduced state event, when one exists.
+    pub state_created_at: Option<DateTime<Utc>>,
+    /// Event id of the reduced state event, when one exists.
+    pub state_event_id: Option<Vec<u8>>,
+}
+
+/// One keyset page of the channel-scoped thread directory.
+#[derive(Debug, Clone)]
+pub struct ThreadDirectoryPage {
+    /// Retained directory rows in the requested deterministic order.
+    pub rows: Vec<ThreadDirectoryRow>,
+    /// Whether a row exists after the retained page.
+    pub has_more: bool,
+    /// Complete keyset for the next page iff `has_more` is true.
+    pub next_cursor: Option<ThreadDirectoryCursor>,
+}
+
+/// Reduced latest non-deleted shared state for one directory root.
+#[derive(Debug, Clone)]
+pub struct ThreadDirectoryStateRecord {
+    /// Signed JSON snapshot content.
+    pub content: String,
+    /// State event creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// State event id.
+    pub event_id: Vec<u8>,
 }
 
 /// Raw thread_metadata row -- used when processing deletes or computing ancestry.
@@ -606,6 +681,288 @@ pub async fn get_channel_window(
     .await
 }
 
+/// Fetch one authoritative thread-directory page for a channel.
+///
+/// The latest non-deleted kind:40009 state is reduced independently for each
+/// root by `(created_at DESC, id ASC)`. Every join and subquery is constrained
+/// by both community and channel before matching an event id.
+pub async fn get_thread_directory(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    state: ThreadDirectoryState,
+    limit: u32,
+    cursor: Option<ThreadDirectoryCursor>,
+) -> Result<ThreadDirectoryPage> {
+    const STATE_KIND: i32 = buzz_core::kind::KIND_THREAD_DIRECTORY_STATE as i32;
+    const AUTO_ACTIVE_DAYS: i64 = 30;
+
+    // Pin the aging bound once and carry it in the cursor. See
+    // `ThreadDirectoryCursor::activity_cutoff` for why this must not be
+    // recomputed per page.
+    let activity_cutoff = cursor
+        .as_ref()
+        .map(|cursor| cursor.activity_cutoff)
+        .unwrap_or_else(|| Utc::now() - chrono::Duration::days(AUTO_ACTIVE_DAYS));
+
+    let mut qb = QueryBuilder::<Postgres>::new(
+        r#"
+        SELECT
+            e.id,
+            e.pubkey,
+            e.created_at,
+            e.kind,
+            e.tags,
+            e.content,
+            e.sig,
+            e.received_at,
+            e.channel_id,
+            tm.reply_count,
+            tm.descendant_count,
+            tm.last_reply_at,
+            COALESCE(tm.last_reply_at, e.created_at) AS activity_at,
+            ds.title_override,
+            COALESCE(ds.pinned, false) AS pinned,
+            COALESCE(ds.archived, false) AS archived,
+            ds.state_created_at,
+            ds.state_event_id
+        FROM thread_metadata tm
+        JOIN events e
+          ON e.community_id = tm.community_id
+         AND e.created_at = tm.event_created_at
+         AND e.id = tm.event_id
+        LEFT JOIN LATERAL (
+            SELECT
+                s.content::jsonb ->> 'title' AS title_override,
+                (s.content::jsonb ->> 'pinned')::boolean AS pinned,
+                (s.content::jsonb ->> 'archived')::boolean AS archived,
+                s.created_at AS state_created_at,
+                s.id AS state_event_id
+            FROM events s
+            WHERE s.community_id = e.community_id
+              AND s.channel_id = e.channel_id
+              AND s.kind = "#,
+    );
+    qb.push_bind(STATE_KIND);
+    qb.push(
+        r#"
+              AND s.deleted_at IS NULL
+              AND s.tags @> jsonb_build_array(
+                    jsonb_build_array('e', encode(e.id, 'hex'), '', 'root')
+                  )
+            ORDER BY s.created_at DESC, s.id ASC
+            LIMIT 1
+        ) ds ON true
+        WHERE tm.community_id = "#,
+    );
+    qb.push_bind(community_id.as_uuid());
+    qb.push(" AND tm.channel_id = ");
+    qb.push_bind(channel_id);
+    qb.push(
+        r#"
+          AND tm.depth = 0
+          AND tm.descendant_count > 0
+          AND e.deleted_at IS NULL
+          AND e.channel_id = "#,
+    );
+    qb.push_bind(channel_id);
+
+    match state {
+        ThreadDirectoryState::Active => {
+            qb.push(
+                " AND COALESCE(ds.archived, false) = false\
+                   AND (ds.title_override IS NOT NULL\
+                        OR COALESCE(ds.pinned, false) = true\
+                        OR (tm.descendant_count >= 3\
+                            AND COALESCE(tm.last_reply_at, e.created_at) >= ",
+            );
+            qb.push_bind(activity_cutoff);
+            qb.push("))");
+            if let Some(cursor) = &cursor {
+                qb.push(" AND (COALESCE(ds.pinned, false) < ");
+                qb.push_bind(cursor.pinned);
+                qb.push(" OR (COALESCE(ds.pinned, false) = ");
+                qb.push_bind(cursor.pinned);
+                qb.push(" AND (COALESCE(tm.last_reply_at, e.created_at) < ");
+                qb.push_bind(cursor.activity_at);
+                qb.push(" OR (COALESCE(tm.last_reply_at, e.created_at) = ");
+                qb.push_bind(cursor.activity_at);
+                qb.push(" AND e.id > ");
+                qb.push_bind(cursor.root_event_id.clone());
+                qb.push("))))");
+            }
+            qb.push(
+                " ORDER BY COALESCE(ds.pinned, false) DESC,\
+                           COALESCE(tm.last_reply_at, e.created_at) DESC,\
+                           e.id ASC LIMIT ",
+            );
+        }
+        ThreadDirectoryState::Archived => {
+            qb.push(" AND COALESCE(ds.archived, false) = true");
+            if let Some(cursor) = &cursor {
+                qb.push(" AND (COALESCE(tm.last_reply_at, e.created_at) < ");
+                qb.push_bind(cursor.activity_at);
+                qb.push(" OR (COALESCE(tm.last_reply_at, e.created_at) = ");
+                qb.push_bind(cursor.activity_at);
+                qb.push(" AND e.id > ");
+                qb.push_bind(cursor.root_event_id.clone());
+                qb.push("))");
+            }
+            qb.push(
+                " ORDER BY COALESCE(tm.last_reply_at, e.created_at) DESC,\
+                           e.id ASC LIMIT ",
+            );
+        }
+    }
+    qb.push_bind(limit as i64 + 1);
+
+    let mut db_rows = qb.build().fetch_all(pool).await?;
+    let has_more = db_rows.len() > limit as usize;
+    db_rows.truncate(limit as usize);
+
+    let next_cursor = if has_more {
+        db_rows
+            .last()
+            .map(|row| {
+                Ok::<_, sqlx::Error>(ThreadDirectoryCursor {
+                    pinned: row.try_get("pinned")?,
+                    activity_at: row.try_get("activity_at")?,
+                    root_event_id: row.try_get("id")?,
+                    activity_cutoff,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+
+    let mut rows = Vec::with_capacity(db_rows.len());
+    for row in db_rows {
+        let reply_count = row.try_get("reply_count")?;
+        let descendant_count = row.try_get("descendant_count")?;
+        let last_reply_at = row.try_get("last_reply_at")?;
+        let activity_at = row.try_get("activity_at")?;
+        let title_override = row.try_get("title_override")?;
+        let pinned = row.try_get("pinned")?;
+        let archived = row.try_get("archived")?;
+        let state_created_at = row.try_get("state_created_at")?;
+        let state_event_id = row.try_get("state_event_id")?;
+        let Some(root) = row_to_stored_event(row)? else {
+            continue;
+        };
+        rows.push(ThreadDirectoryRow {
+            root,
+            reply_count,
+            descendant_count,
+            last_reply_at,
+            activity_at,
+            participants: Vec::new(),
+            title_override,
+            pinned,
+            archived,
+            state_created_at,
+            state_event_id,
+        });
+    }
+
+    let roots: Vec<Vec<u8>> = rows
+        .iter()
+        .map(|row| row.root.event.id.as_bytes().to_vec())
+        .collect();
+    if !roots.is_empty() {
+        let participant_rows = sqlx::query(
+            r#"
+            SELECT root_event_id, pubkey FROM (
+                SELECT
+                    tm.root_event_id,
+                    e.pubkey,
+                    MAX(e.created_at) AS last_seen,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY tm.root_event_id
+                        ORDER BY MAX(e.created_at) DESC
+                    ) AS rn
+                FROM thread_metadata tm
+                JOIN events e
+                  ON e.community_id = tm.community_id
+                 AND e.created_at = tm.event_created_at
+                 AND e.id = tm.event_id
+                WHERE tm.community_id = $1
+                  AND tm.channel_id = $2
+                  AND tm.root_event_id = ANY($3)
+                  AND e.deleted_at IS NULL
+                GROUP BY tm.root_event_id, e.pubkey
+            ) participants
+            WHERE rn <= 10
+            ORDER BY root_event_id, rn
+            "#,
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .bind(&roots)
+        .fetch_all(pool)
+        .await?;
+
+        let mut by_root: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for row in participant_rows {
+            by_root
+                .entry(row.try_get("root_event_id")?)
+                .or_default()
+                .push(row.try_get("pubkey")?);
+        }
+        for row in &mut rows {
+            if let Some(participants) = by_root.remove(row.root.event.id.as_bytes().as_slice()) {
+                row.participants = participants;
+            }
+        }
+    }
+
+    Ok(ThreadDirectoryPage {
+        rows,
+        has_more,
+        next_cursor,
+    })
+}
+
+/// Reduce the latest non-deleted kind:40009 snapshot for one root.
+pub async fn get_latest_thread_directory_state(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    root_event_id: &[u8],
+) -> Result<Option<ThreadDirectoryStateRecord>> {
+    let root_hex = hex::encode(root_event_id);
+    let root_tag = serde_json::json!([["e", root_hex, "", "root"]]);
+    let row = sqlx::query(
+        r#"
+        SELECT content, created_at, id
+        FROM events
+        WHERE community_id = $1
+          AND channel_id = $2
+          AND kind = $3
+          AND deleted_at IS NULL
+          AND tags @> $4
+        ORDER BY created_at DESC, id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .bind(buzz_core::kind::KIND_THREAD_DIRECTORY_STATE as i32)
+    .bind(root_tag)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|row| {
+        Ok(ThreadDirectoryStateRecord {
+            content: row.try_get("content")?,
+            created_at: row.try_get("created_at")?,
+            event_id: row.try_get("id")?,
+        })
+    })
+    .transpose()
+}
+
 /// [`get_channel_window`] on a specific session — the replica-routing path
 /// runs the page (and its participants batch) on the exact reader connection
 /// whose heartbeat observation proved coverage (the proof is
@@ -886,6 +1243,13 @@ mod tests {
     fn event_created_at(event: &nostr::Event) -> DateTime<Utc> {
         DateTime::from_timestamp(event.created_at.as_secs() as i64, 0)
             .expect("event timestamp is valid")
+    }
+
+    fn make_stream_event_at(keys: &Keys, content: &str, at: DateTime<Utc>) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(9), content)
+            .custom_created_at(nostr::Timestamp::from(at.timestamp() as u64))
+            .sign_with_keys(keys)
+            .expect("sign event")
     }
 
     async fn make_test_community(pool: &PgPool) -> Uuid {
@@ -1774,5 +2138,133 @@ mod tests {
             quiet_row.thread_summary.is_none(),
             "reply-less row carries no summary"
         );
+    }
+
+    /// BUG-008. The auto-active window used to be `now() - 30 days` evaluated
+    /// inside the SQL on every call, so page 2 filtered against a later instant
+    /// than page 1. A root sitting on the boundary could be inside the result
+    /// set for page 1 and outside it for page 2, and the keyset cursor cannot
+    /// compensate: the row is not ordered past, it is filtered out, so it is
+    /// skipped on every page and never returned at all.
+    ///
+    /// The cutoff is now pinned at page 1 and replayed through the cursor. This
+    /// pins that behavior without needing the clock to move: it hands
+    /// `get_thread_directory` two cursors that differ *only* in
+    /// `activity_cutoff` and asserts the aging decision follows the cursor
+    /// rather than the wall clock. If the query ever recomputes `now()`, the
+    /// wide-cutoff case stops returning the root and this fails.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn thread_directory_ages_against_the_cursor_cutoff_not_a_fresh_now() {
+        let pool = setup_pool().await;
+        let author = Keys::generate();
+        let (channel, community) = create_test_channel(
+            &pool,
+            &format!("thread-dir-cutoff-{}", Uuid::new_v4()),
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            author.public_key().to_bytes().as_slice(),
+            None,
+        )
+        .await
+        .expect("create channel");
+
+        // A root whose last activity is 100 days old: outside a fresh 30-day
+        // window, inside a 365-day one. It needs three descendants to qualify
+        // for the auto-active partition at all.
+        let root_at = Utc::now() - chrono::Duration::days(100);
+        let root = make_stream_event_at(&author, "aging root", root_at);
+        let root_created_at = event_created_at(&root);
+        insert_event_with_thread_metadata(&pool, community, &root, Some(channel.id), None)
+            .await
+            .expect("insert root event");
+
+        for index in 0..3 {
+            let reply_at = root_at + chrono::Duration::seconds(index + 1);
+            let reply = make_stream_event_at(&author, &format!("reply {index}"), reply_at);
+            insert_event_with_thread_metadata(
+                &pool,
+                community,
+                &reply,
+                Some(channel.id),
+                Some(ThreadMetadataParams {
+                    event_id: reply.id.as_bytes(),
+                    event_created_at: event_created_at(&reply),
+                    channel_id: channel.id,
+                    parent_event_id: Some(root.id.as_bytes()),
+                    parent_event_created_at: Some(root_created_at),
+                    root_event_id: Some(root.id.as_bytes()),
+                    root_event_created_at: Some(root_created_at),
+                    depth: 1,
+                    broadcast: false,
+                }),
+            )
+            .await
+            .expect("insert reply");
+        }
+
+        // Both cursors sit far in the future on the ordering dimensions, so the
+        // keyset admits the root in both cases and the only thing that can
+        // change the outcome is `activity_cutoff`.
+        let cursor_at = |cutoff: DateTime<Utc>| ThreadDirectoryCursor {
+            pinned: false,
+            activity_at: Utc::now(),
+            root_event_id: vec![0u8; 32],
+            activity_cutoff: cutoff,
+        };
+
+        let wide = get_thread_directory(
+            &pool,
+            community,
+            channel.id,
+            ThreadDirectoryState::Active,
+            25,
+            Some(cursor_at(Utc::now() - chrono::Duration::days(365))),
+        )
+        .await
+        .expect("wide-cutoff page");
+        assert!(
+            wide.rows.iter().any(|row| row.root.event.id == root.id),
+            "a 365-day pinned cutoff must still include a 100-day-old root; \
+             if this fails the query is recomputing now() instead of reading \
+             the cursor"
+        );
+
+        let narrow = get_thread_directory(
+            &pool,
+            community,
+            channel.id,
+            ThreadDirectoryState::Active,
+            25,
+            Some(cursor_at(Utc::now() - chrono::Duration::days(30))),
+        )
+        .await
+        .expect("narrow-cutoff page");
+        assert!(
+            !narrow.rows.iter().any(|row| row.root.event.id == root.id),
+            "a 30-day pinned cutoff must exclude the same 100-day-old root, \
+             proving the two runs differed only by the cursor's cutoff"
+        );
+
+        // The pinned cutoff must survive onto the next page, or later pages
+        // silently revert to a fresh window.
+        let pinned = Utc::now() - chrono::Duration::days(365);
+        let first = get_thread_directory(
+            &pool,
+            community,
+            channel.id,
+            ThreadDirectoryState::Active,
+            1,
+            Some(cursor_at(pinned)),
+        )
+        .await
+        .expect("first page");
+        if let Some(next) = first.next_cursor {
+            assert_eq!(
+                next.activity_cutoff, pinned,
+                "next_cursor must replay the pinned cutoff unchanged"
+            );
+        }
     }
 }

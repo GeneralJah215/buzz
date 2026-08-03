@@ -425,6 +425,14 @@ pub const KIND_THREAD_SUMMARY: u32 = 39005;
 /// clients must not infer `has_more` from row counts.
 pub const KIND_WINDOW_BOUNDS: u32 = 39006;
 
+// Thread-directory overlays (relay-signed, synthesized at query time, never
+// stored). Appended to bridge `/query` responses for `thread_index` requests.
+/// Thread-directory item overlay: `e`/`d` tag = root event id and `h` tag = channel id.
+pub const KIND_THREAD_DIRECTORY_ITEM: u32 = 39007;
+/// Thread-directory bounds overlay: `d` tag =
+/// `<channel_id>:<active|archived>:<request-cursor-or-head>`.
+pub const KIND_THREAD_DIRECTORY_BOUNDS: u32 = 39008;
+
 /// Workflow definition (parameterized replaceable, d=workflow_uuid).
 pub const KIND_WORKFLOW_DEF: u32 = 30620;
 
@@ -478,6 +486,9 @@ pub const KIND_STREAM_MESSAGE_SCHEDULED: u32 = 40006;
 pub const KIND_STREAM_REMINDER: u32 = 40007;
 /// A diff/patch message showing file changes (unified diff format).
 pub const KIND_STREAM_MESSAGE_DIFF: u32 = 40008;
+/// Client-authored thread-directory state for one root: title override, pin, and archive.
+/// Stored append-only; it is not a timeline row and must not affect thread counters.
+pub const KIND_THREAD_DIRECTORY_STATE: u32 = 40009;
 /// Canvas (shared document) for a channel.
 pub const KIND_CANVAS: u32 = 40100;
 /// System message for channel state changes (join, leave, rename, etc.).
@@ -678,6 +689,8 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_NIP29_GROUP_ROLES,
     KIND_THREAD_SUMMARY,
     KIND_WINDOW_BOUNDS,
+    KIND_THREAD_DIRECTORY_ITEM,
+    KIND_THREAD_DIRECTORY_BOUNDS,
     KIND_PRESENCE_UPDATE,
     KIND_TYPING_INDICATOR,
     KIND_HUDDLE_REACTION,
@@ -693,6 +706,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_STREAM_MESSAGE_SCHEDULED,
     KIND_STREAM_REMINDER,
     KIND_STREAM_MESSAGE_DIFF,
+    KIND_THREAD_DIRECTORY_STATE,
     KIND_CANVAS,
     KIND_SYSTEM_MESSAGE,
     KIND_CHANNEL_SUMMARY,
@@ -822,6 +836,8 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
+            | KIND_THREAD_DIRECTORY_ITEM
+            | KIND_THREAD_DIRECTORY_BOUNDS
     )
 }
 
@@ -849,6 +865,11 @@ const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 3062
 const _: () = assert!(is_parameterized_replaceable(KIND_PROJECT)); // 30621 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_SUMMARY)); // 39005 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WINDOW_BOUNDS)); // 39006 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_DIRECTORY_ITEM)); // 39007 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_DIRECTORY_BOUNDS)); // 39008 ∈ 30000–39999
+const _: () = assert!(!is_parameterized_replaceable(KIND_THREAD_DIRECTORY_STATE));
+const _: () = assert!(!is_replaceable(KIND_THREAD_DIRECTORY_STATE));
+const _: () = assert!(!is_ephemeral(KIND_THREAD_DIRECTORY_STATE));
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(
@@ -896,6 +917,31 @@ mod tests {
     fn nip43_membership_snapshot_is_relay_only() {
         assert!(is_relay_only_kind(KIND_NIP43_MEMBERSHIP_LIST));
         assert!(!is_relay_only_kind(KIND_NIP43_LEAVE_REQUEST));
+    }
+
+    #[test]
+    fn thread_directory_kinds_have_the_required_storage_contract() {
+        // Registered *exactly* once, not merely present. `contains` proves only
+        // "at least once" and passes on a tree with duplicate ALL_KINDS entries,
+        // which is the shape a concurrent double-write produces.
+        for kind in [
+            KIND_THREAD_DIRECTORY_STATE,
+            KIND_THREAD_DIRECTORY_ITEM,
+            KIND_THREAD_DIRECTORY_BOUNDS,
+        ] {
+            let registrations = ALL_KINDS.iter().filter(|entry| **entry == kind).count();
+            assert_eq!(
+                registrations, 1,
+                "kind {kind} must be registered exactly once in ALL_KINDS, found {registrations}"
+            );
+        }
+        assert!(!is_relay_only_kind(KIND_THREAD_DIRECTORY_STATE));
+        assert!(is_relay_only_kind(KIND_THREAD_DIRECTORY_ITEM));
+        assert!(is_relay_only_kind(KIND_THREAD_DIRECTORY_BOUNDS));
+        assert!(!is_parameterized_replaceable(KIND_THREAD_DIRECTORY_STATE));
+        assert!(is_parameterized_replaceable(KIND_THREAD_DIRECTORY_ITEM));
+        assert!(is_parameterized_replaceable(KIND_THREAD_DIRECTORY_BOUNDS));
+        assert!(!is_ephemeral(KIND_THREAD_DIRECTORY_STATE));
     }
 
     #[test]

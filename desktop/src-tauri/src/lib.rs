@@ -767,6 +767,7 @@ pub fn run() {
             get_forum_thread,
             get_thread_replies,
             get_channel_window,
+            get_thread_directory,
             get_channel_messages_before,
             edit_message,
             delete_message,
