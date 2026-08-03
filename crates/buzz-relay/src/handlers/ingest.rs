@@ -879,6 +879,39 @@ struct ThreadDirectoryStateContent {
 
 /// Validate the complete kind:40009 envelope and its channel authority before
 /// the event can enter durable storage.
+/// Channel and root a stored `kind:40009` addresses, read back off the event.
+///
+/// Only meaningful for events that already passed
+/// [`validate_thread_directory_state`], which is what guarantees exactly one
+/// `h` tag and one root-marked `e` tag. This is a read-back for the directory
+/// fan-out (the state event names the root whose sidebar row just changed), not
+/// a second validation pass, so it returns `None` rather than a reason on any
+/// shape it does not recognise.
+pub(crate) fn thread_directory_state_target(event: &Event) -> Option<(Uuid, Vec<u8>)> {
+    let mut channel_id = None;
+    let mut root_id = None;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        match parts.first().map(|part| part.as_str()) {
+            Some("h") if parts.len() == 2 && channel_id.is_none() => {
+                channel_id = parts[1].parse::<Uuid>().ok();
+            }
+            Some("e")
+                if parts.len() == 4
+                    && parts[2].is_empty()
+                    && parts[3] == "root"
+                    && root_id.is_none() =>
+            {
+                root_id = hex::decode(parts[1].as_str())
+                    .ok()
+                    .filter(|decoded| decoded.len() == 32);
+            }
+            _ => {}
+        }
+    }
+    Some((channel_id?, root_id?))
+}
+
 async fn validate_thread_directory_state(
     community_id: CommunityId,
     event: &Event,
@@ -3001,6 +3034,19 @@ async fn ingest_event_inner(
             meta.channel_id,
             meta.root_event_id.clone(),
         );
+    }
+
+    // Metadata-update trigger, spec line 171. A stored kind:40009 changes the
+    // title, pin, or archive state of the root it names. It carries no thread
+    // metadata by design (it is excluded from `resolve_nip10_thread_meta` so it
+    // cannot move reply counters), so the block above never sees it and the
+    // target has to be read back off the event's own tags.
+    if kind_u32 == KIND_THREAD_DIRECTORY_STATE {
+        if let Some((channel_id, root_id)) = thread_directory_state_target(&event) {
+            crate::handlers::side_effects::emit_live_thread_directory_item(
+                tenant, state, channel_id, root_id,
+            );
+        }
     }
 
     let pubkey_hex = auth.pubkey().to_hex();

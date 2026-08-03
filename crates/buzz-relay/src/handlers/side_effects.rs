@@ -11,7 +11,7 @@ use buzz_core::kind::{
     KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED,
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS,
     KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION,
-    KIND_THREAD_DIRECTORY_ITEM, KIND_THREAD_SUMMARY,
+    KIND_THREAD_DIRECTORY_ITEM, KIND_THREAD_DIRECTORY_STATE, KIND_THREAD_SUMMARY,
 };
 use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
@@ -1985,6 +1985,25 @@ async fn handle_delete_event_side_effect(
         emit_live_thread_directory_item(tenant, state, channel_id, directory_root);
     }
 
+    // Metadata-event-deletion trigger, spec line 171. Deleting a kind:40009
+    // exposes the next-newest state for that root (or none at all), so the row
+    // has to be recomputed. The deleted event names its own target.
+    if let Some(target_event) = state
+        .db
+        .get_event_by_id_including_deleted(tenant.community(), &target_id)
+        .await
+        .ok()
+        .flatten()
+    {
+        if u32::from(target_event.event.kind.as_u16()) == KIND_THREAD_DIRECTORY_STATE {
+            if let Some((state_channel_id, root_id)) =
+                crate::handlers::ingest::thread_directory_state_target(&target_event.event)
+            {
+                emit_live_thread_directory_item(tenant, state, state_channel_id, root_id);
+            }
+        }
+    }
+
     let actor_hex = hex::encode(event.pubkey.to_bytes());
     let mut tombstone = serde_json::json!({
         "type": "message_deleted",
@@ -2527,6 +2546,17 @@ async fn handle_standard_deletion_event(
             });
             if let Some(directory_root) = directory_root {
                 emit_live_thread_directory_item(tenant, state, channel_id, directory_root);
+            }
+        }
+
+        // Metadata-event-deletion trigger, spec line 171. Deleting a kind:40009
+        // exposes the next-newest state for that root, so recompute its row.
+        // `target_event` is already in hand here, unlike the single-delete path.
+        if u32::from(target_event.event.kind.as_u16()) == KIND_THREAD_DIRECTORY_STATE {
+            if let Some((state_channel_id, root_id)) =
+                crate::handlers::ingest::thread_directory_state_target(&target_event.event)
+            {
+                emit_live_thread_directory_item(tenant, state, state_channel_id, root_id);
             }
         }
 
