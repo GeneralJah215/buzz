@@ -2992,6 +2992,15 @@ async fn ingest_event_inner(
             meta.channel_id,
             meta.root_event_id.clone(),
         );
+        // Same insert changed the root's directory row: the descendant count
+        // moved, and it may have just crossed the three-descendant threshold
+        // into active membership. Spec line 171, reply-insert trigger.
+        crate::handlers::side_effects::emit_live_thread_directory_item(
+            tenant,
+            state,
+            meta.channel_id,
+            meta.root_event_id.clone(),
+        );
     }
 
     let pubkey_hex = auth.pubkey().to_hex();

@@ -1964,8 +1964,25 @@ async fn handle_delete_event_side_effect(
 
     // Thread counters were decremented in the same transaction — push a fresh
     // relay-signed 39005 so live badge counts also count *down*.
-    if let Some(root_id) = root_id {
+    if let Some(root_id) = root_id.clone() {
         emit_live_thread_summary(tenant, state, channel_id, root_id);
+    }
+
+    // Directory fan-out, spec lines 171-173. Two distinct cases, and the 39005
+    // guard above only covers the first:
+    //   - a reply was deleted -> its root's row changed, and dropping below
+    //     three descendants disqualifies it (`present: false`).
+    //   - the *root itself* was deleted -> `thread_metadata.root_event_id` is
+    //     NULL for a root, so `root_id` is None here and the 39005 emit above
+    //     is skipped entirely. The directory still has to hear about it, so
+    //     address the target directly and let the helper report it absent.
+    let directory_root = root_id.or_else(|| {
+        meta.as_ref()
+            .filter(|meta| meta.depth == 0)
+            .map(|_| target_id.clone())
+    });
+    if let Some(directory_root) = directory_root {
+        emit_live_thread_directory_item(tenant, state, channel_id, directory_root);
     }
 
     let actor_hex = hex::encode(event.pubkey.to_bytes());
@@ -2495,8 +2512,22 @@ async fn handle_standard_deletion_event(
 
         // Thread counters were decremented in the same transaction — push a
         // fresh relay-signed 39005 so live badge counts also count *down*.
-        if let (Some(root_id), Some(channel_id)) = (root_id, target_event.channel_id) {
+        if let (Some(root_id), Some(channel_id)) = (root_id.clone(), target_event.channel_id) {
             emit_live_thread_summary(tenant, state, channel_id, root_id);
+        }
+
+        // Directory fan-out. As in the single-delete path above, a deleted root
+        // carries no `root_event_id`, so address the target itself and let the
+        // helper report it absent. Spec lines 171-173.
+        if let Some(channel_id) = target_event.channel_id {
+            let directory_root = root_id.or_else(|| {
+                meta.as_ref()
+                    .filter(|meta| meta.depth == 0)
+                    .map(|_| target_id.clone())
+            });
+            if let Some(directory_root) = directory_root {
+                emit_live_thread_directory_item(tenant, state, channel_id, directory_root);
+            }
         }
 
         if u32::from(target_event.event.kind.as_u16()) == KIND_REACTION {
