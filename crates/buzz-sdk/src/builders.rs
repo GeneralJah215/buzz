@@ -13,6 +13,7 @@ use buzz_core::{
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_PROJECT,
         KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_THREAD_DIRECTORY_STATE,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -242,6 +243,34 @@ pub fn build_message(
 /// `recipient_pubkey` is the cleartext `p` tag used by the relay for owner-only
 /// routing. `agent_pubkey` identifies the managed agent whose observer stream
 /// this frame belongs to. `encrypted_content` must be NIP-44 v2 ciphertext.
+
+/// Build a full shared thread-directory state snapshot (kind:40009).
+pub fn build_thread_directory_update(
+    channel_id: Uuid,
+    root_event_id: nostr::EventId,
+    title: Option<&str>,
+    pinned: bool,
+    archived: bool,
+) -> Result<EventBuilder, SdkError> {
+    if pinned && archived {
+        return Err(SdkError::InvalidInput(
+            "thread directory state cannot be both pinned and archived".into(),
+        ));
+    }
+    let title = title.map(str::trim).map(str::to_owned).transpose().and_then(|title| {
+        if title.is_empty() || title.chars().count() > 120 || title.chars().any(|c| c.is_control()) {
+            Err(SdkError::InvalidInput(
+                "thread directory title must be a single-line 1-120 character string".into(),
+            ))
+        } else {
+            Ok(title)
+        }
+    })?;
+    let root = root_event_id.to_hex();
+    let tags = vec![tag(&["h", &channel_id.to_string()])?, tag(&["e", &root, "", "root"])?];
+    let content = serde_json::json!({ "title": title, "pinned": pinned, "archived": archived });
+    Ok(EventBuilder::new(Kind::Custom(KIND_THREAD_DIRECTORY_STATE as u16), content.to_string()).tags(tags))
+}
 pub fn build_agent_observer_frame(
     recipient_pubkey: &str,
     agent_pubkey: &str,
@@ -2249,6 +2278,29 @@ mod tests {
     }
 
     #[test]
+
+    #[test]
+    fn thread_directory_update_is_a_canonical_full_snapshot() {
+        let channel_id = uuid();
+        let root_id = event_id();
+        let event = sign(
+            build_thread_directory_update(channel_id, root_id, Some(" Shared title "), true, false)
+                .unwrap(),
+        );
+
+        assert_eq!(event.kind.as_u16(), KIND_THREAD_DIRECTORY_STATE as u16);
+        assert_eq!(tag_values(&event, "h"), vec![channel_id.to_string()]);
+        let e_tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|tag| tag.as_slice().first().map(|value| value.as_str()) == Some("e"))
+            .collect();
+        assert_eq!(e_tags.len(), 1);
+        assert_eq!(e_tags[0].as_slice(), ["e", &root_id.to_hex(), "", "root"]);
+        assert_eq!(
+            event.content,
+            r#"{"title":"Shared title","pinned":true,"archived":false}"#
+        );
     fn agent_observer_frame_happy_path() {
         let sender = keys();
         let recipient = keys();

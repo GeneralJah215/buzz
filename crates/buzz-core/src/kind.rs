@@ -424,6 +424,12 @@ pub const KIND_THREAD_SUMMARY: u32 = 39005;
 /// content = `{has_more, next_cursor}`. The only authority on exhaustion —
 /// clients must not infer `has_more` from row counts.
 pub const KIND_WINDOW_BOUNDS: u32 = 39006;
+/// Relay-signed thread-directory item overlay.
+pub const KIND_THREAD_DIRECTORY_ITEM: u32 = 39007;
+/// Relay-signed thread-directory page bounds overlay.
+pub const KIND_THREAD_DIRECTORY_BOUNDS: u32 = 39008;
+/// Client-authored, append-only thread-directory state snapshot.
+pub const KIND_THREAD_DIRECTORY_STATE: u32 = 40009;
 
 /// Workflow definition (parameterized replaceable, d=workflow_uuid).
 pub const KIND_WORKFLOW_DEF: u32 = 30620;
@@ -478,6 +484,12 @@ pub const KIND_STREAM_MESSAGE_SCHEDULED: u32 = 40006;
 pub const KIND_STREAM_REMINDER: u32 = 40007;
 /// A diff/patch message showing file changes (unified diff format).
 pub const KIND_STREAM_MESSAGE_DIFF: u32 = 40008;
+/// Client-authored thread-directory state for one thread root: shared title
+/// override, pinned, and archived. Stored and append-only; current state is
+/// the newest non-deleted authorized event for the root. Not a timeline row —
+/// its `e` root tag must not mutate thread reply counters.
+/// See docs/nips/NIP-TD.md.
+pub const KIND_THREAD_DIRECTORY_STATE: u32 = 40009;
 /// Canvas (shared document) for a channel.
 pub const KIND_CANVAS: u32 = 40100;
 /// System message for channel state changes (join, leave, rename, etc.).
@@ -677,7 +689,12 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_NIP29_GROUP_MEMBERS,
     KIND_NIP29_GROUP_ROLES,
     KIND_THREAD_SUMMARY,
+    KIND_THREAD_DIRECTORY_ITEM,
+    KIND_THREAD_DIRECTORY_BOUNDS,
+    KIND_THREAD_DIRECTORY_STATE,
     KIND_WINDOW_BOUNDS,
+    KIND_THREAD_DIRECTORY_ITEM,
+    KIND_THREAD_DIRECTORY_BOUNDS,
     KIND_PRESENCE_UPDATE,
     KIND_TYPING_INDICATOR,
     KIND_HUDDLE_REACTION,
@@ -693,6 +710,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_STREAM_MESSAGE_SCHEDULED,
     KIND_STREAM_REMINDER,
     KIND_STREAM_MESSAGE_DIFF,
+    KIND_THREAD_DIRECTORY_STATE,
     KIND_CANVAS,
     KIND_SYSTEM_MESSAGE,
     KIND_CHANNEL_SUMMARY,
@@ -822,6 +840,10 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
+            | KIND_THREAD_DIRECTORY_ITEM
+            | KIND_THREAD_DIRECTORY_ITEM
+            | KIND_THREAD_DIRECTORY_BOUNDS
+            | KIND_THREAD_DIRECTORY_BOUNDS
     )
 }
 
@@ -849,6 +871,14 @@ const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 3062
 const _: () = assert!(is_parameterized_replaceable(KIND_PROJECT)); // 30621 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_SUMMARY)); // 39005 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WINDOW_BOUNDS)); // 39006 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_DIRECTORY_ITEM)); // 39007 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_DIRECTORY_ITEM)); // 39007 in 30000-39999
+const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_DIRECTORY_BOUNDS)); // 39008 in 30000-39999
+const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_DIRECTORY_BOUNDS)); // 39008 ∈ 30000–39999
+// 40009 is deliberately outside the addressable range: directory state is an
+// append-only stored event, not a replaceable one, so renames stay auditable.
+const _: () = assert!(!is_parameterized_replaceable(KIND_THREAD_DIRECTORY_STATE));
+const _: () = assert!(!is_replaceable(KIND_THREAD_DIRECTORY_STATE));
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(
@@ -898,6 +928,19 @@ mod tests {
         assert!(!is_relay_only_kind(KIND_NIP43_LEAVE_REQUEST));
     }
 
+
+    #[test]
+    fn thread_directory_kinds_are_registered_with_their_storage_contract() {
+        assert!(ALL_KINDS.contains(&KIND_THREAD_DIRECTORY_STATE));
+        assert!(ALL_KINDS.contains(&KIND_THREAD_DIRECTORY_ITEM));
+        assert!(ALL_KINDS.contains(&KIND_THREAD_DIRECTORY_BOUNDS));
+        assert!(!is_relay_only_kind(KIND_THREAD_DIRECTORY_STATE));
+        assert!(is_relay_only_kind(KIND_THREAD_DIRECTORY_ITEM));
+        assert!(is_relay_only_kind(KIND_THREAD_DIRECTORY_BOUNDS));
+        assert!(!is_parameterized_replaceable(KIND_THREAD_DIRECTORY_STATE));
+        assert!(is_parameterized_replaceable(KIND_THREAD_DIRECTORY_ITEM));
+        assert!(is_parameterized_replaceable(KIND_THREAD_DIRECTORY_BOUNDS));
+    }
     #[test]
     fn parameterized_replaceable_range() {
         assert!(!is_parameterized_replaceable(29999));
