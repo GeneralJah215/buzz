@@ -11,6 +11,7 @@ import {
   KIND_USER_STATUS,
   CHANNEL_EVENT_KINDS,
   KIND_CHANNEL_THREAD_SUMMARY,
+  KIND_THREAD_DIRECTORY_ITEM,
 } from "@/shared/constants/kinds";
 import {
   getTextPayload,
@@ -333,6 +334,22 @@ export class RelayClient {
         kinds: [...CHANNEL_EVENT_KINDS, KIND_CHANNEL_THREAD_SUMMARY],
         "#h": [channelId],
         limit: 1000,
+        since: Math.floor(Date.now() / 1_000),
+      },
+      onEvent,
+    );
+  }
+
+  /** Subscribe only to live thread-directory item overlays, never timeline rows. */
+  async subscribeToThreadDirectory(
+    channelId: string,
+    onEvent: (event: RelayEvent) => void,
+  ) {
+    return this.subscribe(
+      {
+        kinds: [KIND_THREAD_DIRECTORY_ITEM],
+        "#h": [channelId],
+        limit: 0,
         since: Math.floor(Date.now() / 1_000),
       },
       onEvent,
