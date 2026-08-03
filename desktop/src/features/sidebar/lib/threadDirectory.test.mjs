@@ -67,6 +67,7 @@ function boundsEvent(overrides = {}) {
   const {
     channelId = CHANNEL_ID,
     state = "active",
+    requestCursor = null,
     content: contentOverrides,
     ...eventOverrides
   } = overrides;
@@ -85,7 +86,7 @@ function boundsEvent(overrides = {}) {
     created_at: 200,
     kind: KIND_THREAD_DIRECTORY_BOUNDS,
     tags: [
-      ["d", `${channelId}:${state}:head`],
+      ["d", `${channelId}:${state}:${requestCursor ?? "head"}`],
       ["h", channelId],
     ],
     content,
@@ -104,6 +105,68 @@ test("parses a channel-matched item and its single bounds overlay", () => {
   assert.equal(page.items[0].rootId, ROOT_A);
   assert.equal(page.bounds.hasMore, false);
   assert.equal(page.bounds.nextCursor, null);
+});
+
+test("binds the bounds overlay to the exact requested cursor", () => {
+  const cursor = "opaque-page-cursor";
+  const page = parseThreadDirectoryPage(
+    [itemEvent(), boundsEvent({ requestCursor: cursor })],
+    CHANNEL_ID,
+    "active",
+    cursor,
+  );
+  assert.equal(page.bounds.hasMore, false);
+
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [itemEvent(), boundsEvent({ requestCursor: "stale-cursor" })],
+        CHANNEL_ID,
+        "active",
+        cursor,
+      ),
+    /requested page/i,
+  );
+});
+
+test("rejects malformed duplicate tags and noncanonical hex identities", () => {
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [
+          itemEvent({
+            tags: [
+              ["e", ROOT_A],
+              ["d", ROOT_A],
+              ["h", CHANNEL_ID],
+              ["h", CHANNEL_ID, "extra"],
+            ],
+          }),
+          boundsEvent(),
+        ],
+        CHANNEL_ID,
+        "active",
+      ),
+    /exactly one h tag/i,
+  );
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [itemEvent({ rootId: "not-hex" }), boundsEvent()],
+        CHANNEL_ID,
+        "active",
+      ),
+    /root/i,
+  );
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [itemEvent({ content: { root_author: "not-hex" } }), boundsEvent()],
+        CHANNEL_ID,
+        "active",
+      ),
+    /root_author/i,
+  );
 });
 
 for (const [name, events] of [

@@ -68,15 +68,22 @@ function exactlyOneTagValue(
   name: string,
   label: string,
 ): string {
-  const tags = event.tags.filter(
-    (tag) => tag.length === 2 && tag[0] === name && typeof tag[1] === "string",
-  );
-  if (tags.length !== 1 || !tags[0][1]) {
+  const tags = event.tags.filter((tag) => tag[0] === name);
+  if (
+    tags.length !== 1 ||
+    tags[0].length !== 2 ||
+    typeof tags[0][1] !== "string" ||
+    !tags[0][1]
+  ) {
     throw new Error(
       `Thread directory ${label} must have exactly one ${name} tag.`,
     );
   }
   return tags[0][1];
+}
+
+function isCanonicalHexIdentity(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
 
 function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
@@ -86,6 +93,9 @@ function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
     );
   }
   const rootId = exactlyOneTagValue(event, "e", "item");
+  if (!isCanonicalHexIdentity(rootId)) {
+    throw new Error("Thread directory item has an invalid root id.");
+  }
   if (exactlyOneTagValue(event, "d", "item") !== rootId) {
     throw new Error("Thread directory item root tags do not match.");
   }
@@ -99,6 +109,9 @@ function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
     if (typeof content[field] !== "string" || content[field].length === 0) {
       throw new Error(`Thread directory item has an invalid ${field}.`);
     }
+  }
+  if (!isCanonicalHexIdentity(content.root_author)) {
+    throw new Error("Thread directory item has an invalid root_author.");
   }
   if (
     content.title_override !== null &&
@@ -128,14 +141,15 @@ function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
   }
   if (
     !Array.isArray(content.participants) ||
-    content.participants.some((participant) => typeof participant !== "string")
+    content.participants.some(
+      (participant) => !isCanonicalHexIdentity(participant),
+    )
   ) {
     throw new Error("Thread directory item has invalid participants.");
   }
   if (
     content.state_event_id !== null &&
-    (typeof content.state_event_id !== "string" ||
-      content.state_event_id.length === 0)
+    !isCanonicalHexIdentity(content.state_event_id)
   ) {
     throw new Error("Thread directory item has an invalid state event id.");
   }
@@ -170,6 +184,7 @@ function parseBounds(
   event: RelayEvent,
   channelId: string,
   state: ThreadDirectoryState,
+  cursor: string | null,
 ): ThreadDirectoryBounds {
   if (event.kind !== KIND_THREAD_DIRECTORY_BOUNDS) {
     throw new Error(
@@ -180,7 +195,7 @@ function parseBounds(
     throw new Error("Thread directory bounds are scoped to another channel.");
   }
   const requestTag = exactlyOneTagValue(event, "d", "bounds");
-  if (!requestTag.startsWith(`${channelId}:${state}:`)) {
+  if (requestTag !== `${channelId}:${state}:${cursor ?? "head"}`) {
     throw new Error("Thread directory bounds do not match the requested page.");
   }
   const content = parseJson(event.content, "bounds");
@@ -213,6 +228,7 @@ export function parseThreadDirectoryPage(
   events: RelayEvent[],
   channelId: string,
   state: ThreadDirectoryState,
+  cursor: string | null = null,
 ): ThreadDirectoryPage {
   const items: ThreadDirectoryItem[] = [];
   const bounds: RelayEvent[] = [];
@@ -232,7 +248,7 @@ export function parseThreadDirectoryPage(
       "Thread directory response must contain exactly one bounds overlay.",
     );
   }
-  return { items, bounds: parseBounds(bounds[0], channelId, state) };
+  return { items, bounds: parseBounds(bounds[0], channelId, state, cursor) };
 }
 
 /** Fetch a lazy, relay-authoritative directory page for one channel. */
@@ -248,7 +264,7 @@ export async function getThreadDirectoryPage(
     cursor,
     limitRows,
   });
-  return parseThreadDirectoryPage(events, channelId, state);
+  return parseThreadDirectoryPage(events, channelId, state, cursor);
 }
 
 /** Publish the complete signed shared-state snapshot for a directory root. */
