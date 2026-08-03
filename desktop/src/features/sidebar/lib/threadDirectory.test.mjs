@@ -9,6 +9,7 @@ import {
   mergeThreadDirectoryLiveProjection,
   reconcileThreadDirectoryItems,
   resolveThreadDirectoryTitle,
+  rollbackThreadDirectoryOptimisticProjection,
   sortThreadDirectoryItems,
   threadDirectoryProjection,
   threadDirectoryLiveQueryKey,
@@ -493,7 +494,7 @@ test("reconciliation deduplicates across pages and applies one global sort", () 
     ],
     new Map(),
     "active",
-    200,
+    10_000_000,
   );
   assert.deepEqual(
     items.map((item) => item.rootId),
@@ -534,13 +535,13 @@ test("causal fence protects newer live state and lets a later page supersede it"
   );
 });
 
-test("stale false loses to newer true and equal-revision false clears", () => {
+test("stale live false loses to a newer page and equal-revision false clears", () => {
   const item = parseThreadDirectoryPage(
     [itemEvent(), boundsEvent()],
     CHANNEL_ID,
     "active",
   ).items[0];
-  const current = threadDirectoryProjection(item, "live", 2);
+  const current = threadDirectoryProjection(item, "page", 1);
   const staleFalse = threadDirectoryProjection(
     {
       ...item,
@@ -548,7 +549,7 @@ test("stale false loses to newer true and equal-revision false clears", () => {
       projectionCreatedAt: item.projectionCreatedAt - 1,
     },
     "live",
-    3,
+    2,
   );
   assert.equal(
     chooseThreadDirectoryProjection(current, staleFalse).item.present,
@@ -557,8 +558,8 @@ test("stale false loses to newer true and equal-revision false clears", () => {
 
   const equalFalse = threadDirectoryProjection(
     { ...item, present: false },
-    "live",
-    2,
+    "page",
+    1,
   );
   assert.equal(
     chooseThreadDirectoryProjection(current, equalFalse).item.present,
@@ -607,4 +608,61 @@ test("scope disposal removes only obsolete exact page and live caches", () => {
   assert.equal(client.getQueryData(activeKey), undefined);
   assert.equal(client.getQueryData(liveKey), "live");
   assert.equal(client.getQueryData(siblingKey), "sibling");
+});
+
+test("optimistic rollback preserves unrelated and newer live projections", () => {
+  const item = parseThreadDirectoryPage(
+    [itemEvent(), boundsEvent()],
+    CHANNEL_ID,
+    "active",
+  ).items[0];
+  const prior = threadDirectoryProjection(item, "live", 1);
+  const optimistic = threadDirectoryProjection(
+    { ...item, pinned: true },
+    "optimistic",
+    2,
+  );
+  const other = threadDirectoryProjection(
+    {
+      ...item,
+      rootId: ROOT_B,
+      projectionEventId: "1".repeat(64),
+    },
+    "live",
+    3,
+  );
+  const state = {
+    nextOrder: 3,
+    byRootId: new Map([
+      [ROOT_A, optimistic],
+      [ROOT_B, other],
+    ]),
+  };
+
+  const rolledBack = rollbackThreadDirectoryOptimisticProjection(
+    state,
+    ROOT_A,
+    2,
+    prior,
+  );
+  assert.equal(rolledBack.byRootId.get(ROOT_A), prior);
+  assert.equal(rolledBack.byRootId.get(ROOT_B), other);
+
+  const newerRoot = threadDirectoryProjection(item, "live", 4);
+  const withNewerRoot = {
+    nextOrder: 4,
+    byRootId: new Map([
+      [ROOT_A, newerRoot],
+      [ROOT_B, other],
+    ]),
+  };
+  assert.equal(
+    rollbackThreadDirectoryOptimisticProjection(
+      withNewerRoot,
+      ROOT_A,
+      2,
+      prior,
+    ),
+    withNewerRoot,
+  );
 });

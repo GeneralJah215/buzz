@@ -145,10 +145,6 @@ export function chooseThreadDirectoryProjection(
   left: ThreadDirectoryProjection,
   right: ThreadDirectoryProjection,
 ): ThreadDirectoryProjection {
-  if (left.source !== right.source && left.sourceOrder !== right.sourceOrder) {
-    return left.sourceOrder > right.sourceOrder ? left : right;
-  }
-
   if (left.item.projectionCreatedAt !== right.item.projectionCreatedAt) {
     return left.item.projectionCreatedAt > right.item.projectionCreatedAt
       ? left
@@ -272,8 +268,16 @@ export function reconcileThreadDirectoryItems(
   for (const projection of liveByRootId.values()) add(projection);
   return sortThreadDirectoryItems(
     [...byRoot.values()]
-      .map((projection) => projection.item)
-      .filter((item) => isThreadDirectoryItemInState(item, state, asOfSeconds)),
+      .filter((projection) =>
+        isThreadDirectoryItemInState(
+          projection.item,
+          state,
+          projection.source === "optimistic"
+            ? asOfSeconds
+            : projection.item.projectionCreatedAt,
+        ),
+      )
+      .map((projection) => projection.item),
   );
 }
 
@@ -293,6 +297,29 @@ export function mergeThreadDirectoryLiveProjection(
       : projection,
   );
   return { nextOrder: sourceOrder, byRootId };
+}
+
+/** Roll back only the optimistic root, preserving unrelated or newer live work. */
+export function rollbackThreadDirectoryOptimisticProjection(
+  current: ThreadDirectoryLiveState,
+  rootId: string,
+  optimisticOrder: number,
+  previousProjection: ThreadDirectoryProjection | undefined,
+): ThreadDirectoryLiveState {
+  const currentProjection = current.byRootId.get(rootId);
+  if (
+    currentProjection?.source !== "optimistic" ||
+    currentProjection.sourceOrder !== optimisticOrder
+  ) {
+    return current;
+  }
+  const byRootId = new Map(current.byRootId);
+  if (previousProjection) {
+    byRootId.set(rootId, previousProjection);
+  } else {
+    byRootId.delete(rootId);
+  }
+  return { ...current, byRootId };
 }
 
 /** The directory proves a dot; a numeric count is valid only when supplied by loaded thread data. */

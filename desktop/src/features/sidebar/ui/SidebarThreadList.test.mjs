@@ -202,6 +202,10 @@ test("production JSX wires navigation, drag isolation, and mutation rollback err
   assert.match(UI_SOURCE, /\{directory\.updateError\.message/);
   assert.match(
     HOOK_SOURCE,
-    /onError:[\s\S]*setQueryData\(liveQueryKey, context\.previous\)/,
+    /onError:[\s\S]*rollbackThreadDirectoryOptimisticProjection/,
+  );
+  assert.match(
+    HOOK_SOURCE,
+    /subscribeToReconnects[\s\S]*startSubscription\(\)/,
   );
 });

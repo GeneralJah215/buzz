@@ -21,11 +21,13 @@ import {
   discardPreviousThreadDirectoryScope,
   mergeThreadDirectoryLiveProjection,
   reconcileThreadDirectoryItems,
+  rollbackThreadDirectoryOptimisticProjection,
   threadDirectoryLiveQueryKey,
   threadDirectoryQueryKey,
   threadDirectoryStateSnapshot,
   type StampedThreadDirectoryPage,
   type ThreadDirectoryLiveState,
+  type ThreadDirectoryProjection,
   type ThreadDirectoryQueryScope,
 } from "./lib/threadDirectory";
 
@@ -151,38 +153,54 @@ export function useThreadDirectory({
   React.useEffect(() => {
     if (!queryEnabled || !channelId) return;
     let disposed = false;
+    let subscribing = false;
     let unsubscribe: (() => Promise<void>) | null = null;
-    void relayClient
-      .subscribeToThreadDirectory(channelId, (event) => {
-        let item: ThreadDirectoryItem;
-        try {
-          item = parseThreadDirectoryItemOverlay(event, channelId);
-        } catch (error) {
+    let retryDelayMs = 1_000;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    const startSubscription = () => {
+      if (disposed || subscribing || unsubscribe) return;
+      subscribing = true;
+      void relayClient
+        .subscribeToThreadDirectory(channelId, (event) => {
+          let item: ThreadDirectoryItem;
+          try {
+            item = parseThreadDirectoryItemOverlay(event, channelId);
+          } catch (error) {
+            console.warn(
+              "Ignoring malformed live thread-directory overlay",
+              error,
+            );
+            return;
+          }
+          queryClient.setQueryData<ThreadDirectoryLiveState>(
+            liveQueryKey,
+            (current = EMPTY_LIVE_STATE) =>
+              mergeThreadDirectoryLiveProjection(current, item, "live"),
+          );
+        })
+        .then((dispose) => {
+          retryDelayMs = 1_000;
+          if (disposed) {
+            void dispose();
+          } else {
+            unsubscribe = dispose;
+          }
+        })
+        .catch((error) => {
           console.warn(
-            "Ignoring malformed live thread-directory overlay",
+            "Could not subscribe to live thread-directory overlays",
             error,
           );
-          return;
-        }
-        queryClient.setQueryData<ThreadDirectoryLiveState>(
-          liveQueryKey,
-          (current = EMPTY_LIVE_STATE) =>
-            mergeThreadDirectoryLiveProjection(current, item, "live"),
-        );
-      })
-      .then((dispose) => {
-        if (disposed) {
-          void dispose();
-        } else {
-          unsubscribe = dispose;
-        }
-      })
-      .catch((error) => {
-        console.warn(
-          "Could not subscribe to live thread-directory overlays",
-          error,
-        );
-      });
+          if (!disposed) {
+            retryTimer = setTimeout(startSubscription, retryDelayMs);
+            retryDelayMs = Math.min(retryDelayMs * 2, 30_000);
+          }
+        })
+        .finally(() => {
+          subscribing = false;
+        });
+    };
+    startSubscription();
     const unsubscribeReconnect = relayClient.subscribeToReconnects(() => {
       queryClient.setQueryData<ThreadDirectoryLiveState>(
         liveQueryKey,
@@ -192,10 +210,16 @@ export function useThreadDirectory({
         }),
       );
       void queryClient.resetQueries({ queryKey, exact: true });
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      startSubscription();
     });
     return () => {
       disposed = true;
       unsubscribeReconnect();
+      if (retryTimer) clearTimeout(retryTimer);
       if (unsubscribe) void unsubscribe();
     };
   }, [channelId, liveQueryKey, queryClient, queryEnabled, queryKey]);
@@ -204,7 +228,11 @@ export function useThreadDirectory({
     RelayEvent,
     Error,
     ThreadDirectoryMutationVariables,
-    { previous: ThreadDirectoryLiveState }
+    {
+      rootId: string;
+      previousProjection: ThreadDirectoryProjection | undefined;
+      optimisticOrder: number | null;
+    }
   >({
     mutationFn: async ({ rootId, snapshot }) => {
       if (!channelId)
@@ -222,22 +250,51 @@ export function useThreadDirectory({
         state,
         rootId,
       );
-      if (!item) return { previous };
+      if (!item) {
+        return {
+          rootId,
+          previousProjection: previous.byRootId.get(rootId),
+          optimisticOrder: null,
+        };
+      }
       const optimistic = {
         ...item,
         titleOverride: snapshot.title,
         pinned: snapshot.pinned,
         archived: snapshot.archived,
       };
+      let optimisticOrder: number | null = null;
+      queryClient.setQueryData<ThreadDirectoryLiveState>(
+        liveQueryKey,
+        (current = EMPTY_LIVE_STATE) => {
+          const next = mergeThreadDirectoryLiveProjection(
+            current,
+            optimistic,
+            "optimistic",
+          );
+          optimisticOrder = next.byRootId.get(rootId)?.sourceOrder ?? null;
+          return next;
+        },
+      );
+      return {
+        rootId,
+        previousProjection: previous.byRootId.get(rootId),
+        optimisticOrder,
+      };
+    },
+    onError: (_error, _variables, context) => {
+      if (!context || context.optimisticOrder === null) return;
+      const optimisticOrder = context.optimisticOrder;
       queryClient.setQueryData<ThreadDirectoryLiveState>(
         liveQueryKey,
         (current = EMPTY_LIVE_STATE) =>
-          mergeThreadDirectoryLiveProjection(current, optimistic, "optimistic"),
+          rollbackThreadDirectoryOptimisticProjection(
+            current,
+            context.rootId,
+            optimisticOrder,
+            context.previousProjection,
+          ),
       );
-      return { previous };
-    },
-    onError: (_error, _variables, context) => {
-      if (context) queryClient.setQueryData(liveQueryKey, context.previous);
     },
     onSettled: () => queryClient.invalidateQueries({ queryKey, exact: true }),
   });
