@@ -1032,17 +1032,40 @@ pub fn emit_live_thread_directory_item(
             &state.relay_keypair.public_key(),
         );
 
+        // Directory membership, mirroring the SQL predicates in
+        // `get_thread_directory`: archived membership is `archived = true`;
+        // active membership additionally requires an override, a pin, or three
+        // descendants with recent activity. Outside both is `present: false`.
+        //
+        // Aging out is deliberately not swept on a timer (Cody's ruling); this
+        // only ever evaluates on a real trigger, and a trigger that finds a
+        // root already aged out correctly reports it as absent.
+        const AUTO_ACTIVE_DAYS: i64 = 30;
+        let activity_at = last_reply_at.or_else(|| {
+            chrono::DateTime::from_timestamp(root.event.created_at.as_secs() as i64, 0)
+        });
+        let recently_active = activity_at.is_some_and(|activity_at| {
+            activity_at >= chrono::Utc::now() - chrono::Duration::days(AUTO_ACTIVE_DAYS)
+        });
+        let qualifies_active = title_override.is_some()
+            || pinned
+            || (descendant_count >= 3 && recently_active);
+        let present = !root_deleted
+            && descendant_count > 0
+            && (archived || qualifies_active);
+
         let content = serde_json::json!({
             "title": title,
             "title_override": title_override,
             "root_author": hex::encode(root_author),
             "root_created_at": root.event.created_at.as_secs(),
-            "reply_count": summary.reply_count,
-            "descendant_count": summary.descendant_count,
-            "last_reply_at": summary.last_reply_at.map(|t| t.timestamp()).unwrap_or(0),
-            "participants": summary.participants.iter().map(hex::encode).collect::<Vec<_>>(),
+            "reply_count": reply_count,
+            "descendant_count": descendant_count,
+            "last_reply_at": last_reply_at.map(|t| t.timestamp()).unwrap_or(0),
+            "participants": participants.iter().map(hex::encode).collect::<Vec<_>>(),
             "pinned": pinned,
             "archived": archived,
+            "present": present,
             "state_created_at": state_created_at,
             "state_event_id": state_event_id,
         });
