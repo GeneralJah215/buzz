@@ -26,21 +26,27 @@ function itemEvent(overrides = {}) {
     content: contentOverrides,
     ...eventOverrides
   } = overrides;
-  const content = {
-    title: "Generated title",
-    title_override: null,
-    root_author: PUBKEY,
-    root_created_at: 100,
-    reply_count: 3,
-    descendant_count: 3,
-    last_reply_at: 200,
-    participants: [PUBKEY],
-    pinned: false,
-    archived: false,
-    state_created_at: 0,
-    state_event_id: null,
-    ...contentOverrides,
-  };
+  // A string override is a raw content body, used to exercise the malformed-JSON
+  // path. It must not be spread: spreading "{" yields { 0: "{" }, which merges
+  // into a *valid* item and makes the rejection test silently unfalsifiable.
+  const content =
+    typeof contentOverrides === "string"
+      ? contentOverrides
+      : JSON.stringify({
+          title: "Generated title",
+          title_override: null,
+          root_author: PUBKEY,
+          root_created_at: 100,
+          reply_count: 3,
+          descendant_count: 3,
+          last_reply_at: 200,
+          participants: [PUBKEY],
+          pinned: false,
+          archived: false,
+          state_created_at: 0,
+          state_event_id: null,
+          ...contentOverrides,
+        });
   return {
     id: "d".repeat(64),
     pubkey: PUBKEY,
@@ -51,7 +57,7 @@ function itemEvent(overrides = {}) {
       ["d", rootId],
       ["h", channelId],
     ],
-    content: JSON.stringify(content),
+    content,
     sig: "sig",
     ...eventOverrides,
   };
@@ -64,11 +70,15 @@ function boundsEvent(overrides = {}) {
     content: contentOverrides,
     ...eventOverrides
   } = overrides;
-  const content = {
-    has_more: false,
-    next_cursor: null,
-    ...contentOverrides,
-  };
+  // Same rule as itemEvent: a string override is a raw content body, never spread.
+  const content =
+    typeof contentOverrides === "string"
+      ? contentOverrides
+      : JSON.stringify({
+          has_more: false,
+          next_cursor: null,
+          ...contentOverrides,
+        });
   return {
     id: "e".repeat(64),
     pubkey: PUBKEY,
@@ -78,7 +88,7 @@ function boundsEvent(overrides = {}) {
       ["d", `${channelId}:${state}:head`],
       ["h", channelId],
     ],
-    content: JSON.stringify(content),
+    content,
     sig: "sig",
     ...eventOverrides,
   };
