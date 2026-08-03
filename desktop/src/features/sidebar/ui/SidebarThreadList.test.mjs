@@ -206,6 +206,6 @@ test("production JSX wires navigation, drag isolation, and mutation rollback err
   );
   assert.match(
     HOOK_SOURCE,
-    /subscribeToReconnects[\s\S]*startSubscription\(\)/,
+    /subscribeToReconnects[\s\S]*subscription\.reconnect\(\)/,
   );
 });

@@ -30,6 +30,7 @@ import {
   type ThreadDirectoryProjection,
   type ThreadDirectoryQueryScope,
 } from "./lib/threadDirectory";
+import { createRetryingThreadDirectorySubscription } from "./lib/threadDirectorySubscription";
 
 export type UseThreadDirectoryOptions = {
   channelId: string | null;
@@ -152,16 +153,9 @@ export function useThreadDirectory({
 
   React.useEffect(() => {
     if (!queryEnabled || !channelId) return;
-    let disposed = false;
-    let subscribing = false;
-    let unsubscribe: (() => Promise<void>) | null = null;
-    let retryDelayMs = 1_000;
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    const startSubscription = () => {
-      if (disposed || subscribing || unsubscribe) return;
-      subscribing = true;
-      void relayClient
-        .subscribeToThreadDirectory(channelId, (event) => {
+    const subscription = createRetryingThreadDirectorySubscription({
+      subscribe: () =>
+        relayClient.subscribeToThreadDirectory(channelId, (event) => {
           let item: ThreadDirectoryItem;
           try {
             item = parseThreadDirectoryItemOverlay(event, channelId);
@@ -177,30 +171,14 @@ export function useThreadDirectory({
             (current = EMPTY_LIVE_STATE) =>
               mergeThreadDirectoryLiveProjection(current, item, "live"),
           );
-        })
-        .then((dispose) => {
-          retryDelayMs = 1_000;
-          if (disposed) {
-            void dispose();
-          } else {
-            unsubscribe = dispose;
-          }
-        })
-        .catch((error) => {
-          console.warn(
-            "Could not subscribe to live thread-directory overlays",
-            error,
-          );
-          if (!disposed) {
-            retryTimer = setTimeout(startSubscription, retryDelayMs);
-            retryDelayMs = Math.min(retryDelayMs * 2, 30_000);
-          }
-        })
-        .finally(() => {
-          subscribing = false;
-        });
-    };
-    startSubscription();
+        }),
+      onError: (error) => {
+        console.warn(
+          "Could not subscribe to live thread-directory overlays",
+          error,
+        );
+      },
+    });
     const unsubscribeReconnect = relayClient.subscribeToReconnects(() => {
       queryClient.setQueryData<ThreadDirectoryLiveState>(
         liveQueryKey,
@@ -210,17 +188,11 @@ export function useThreadDirectory({
         }),
       );
       void queryClient.resetQueries({ queryKey, exact: true });
-      if (retryTimer) {
-        clearTimeout(retryTimer);
-        retryTimer = null;
-      }
-      startSubscription();
+      subscription.reconnect();
     });
     return () => {
-      disposed = true;
       unsubscribeReconnect();
-      if (retryTimer) clearTimeout(retryTimer);
-      if (unsubscribe) void unsubscribe();
+      subscription.dispose();
     };
   }, [channelId, liveQueryKey, queryClient, queryEnabled, queryKey]);
 
