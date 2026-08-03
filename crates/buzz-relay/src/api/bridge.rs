@@ -4116,6 +4116,50 @@ mod tests {
         );
     }
 
+    /// The cursor wire format carries a Unix **second**, so it cannot represent
+    /// sub-second precision. That is why `get_thread_directory` truncates the
+    /// cutoff to whole seconds *before* its first SQL bind: binding a
+    /// sub-second value on page 1 and a truncated one on page 2 moves the
+    /// cutoff backwards mid-pagination, admitting on page 2 a row that page 1
+    /// filtered out.
+    ///
+    /// This pins the granularity contract. If the wire format ever gains
+    /// sub-second precision, this test fails and whoever changed it must revisit
+    /// the truncation in `crates/buzz-db/src/thread.rs`.
+    #[test]
+    fn directory_cursor_wire_format_is_whole_seconds_only() {
+        let sub_second = chrono::DateTime::from_timestamp(1_700_000_000, 500_000_000)
+            .expect("valid sub-second instant");
+        assert_eq!(
+            sub_second.timestamp_subsec_nanos(),
+            500_000_000,
+            "fixture must actually carry sub-second precision"
+        );
+
+        let cursor = buzz_db::thread::ThreadDirectoryCursor {
+            pinned: false,
+            activity_at: sub_second,
+            root_event_id: vec![3u8; 32],
+            activity_cutoff: sub_second,
+        };
+        let decoded = decode_thread_directory_cursor(
+            &encode_thread_directory_cursor(&cursor).expect("encode"),
+        )
+        .expect("decode");
+
+        assert_eq!(
+            decoded.activity_cutoff.timestamp_subsec_nanos(),
+            0,
+            "the wire format drops sub-second precision, so the db layer must \
+             truncate before its first bind rather than after"
+        );
+        assert_eq!(
+            decoded.activity_cutoff.timestamp(),
+            sub_second.timestamp(),
+            "truncation must floor to the same second, never round up"
+        );
+    }
+
     /// The cursor is opaque to clients, so every malformed shape must be a 400
     /// rather than a panic or a silent default. Spec line 204.
     #[test]

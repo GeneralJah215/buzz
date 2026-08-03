@@ -700,10 +700,21 @@ pub async fn get_thread_directory(
     // Pin the aging bound once and carry it in the cursor. See
     // `ThreadDirectoryCursor::activity_cutoff` for why this must not be
     // recomputed per page.
-    let activity_cutoff = cursor
-        .as_ref()
-        .map(|cursor| cursor.activity_cutoff)
-        .unwrap_or_else(|| Utc::now() - chrono::Duration::days(AUTO_ACTIVE_DAYS));
+    //
+    // Truncated to whole seconds *before* the first bind, because the cursor
+    // wire format carries a Unix second. Binding sub-second precision on page 1
+    // and a truncated value on page 2 would move the cutoff backwards between
+    // pages, so a row inside that sub-second sliver would be filtered out of
+    // page 1 and admitted on page 2 -- reintroducing the boundary
+    // inconsistency this pin exists to remove.
+    let activity_cutoff = match cursor.as_ref() {
+        Some(cursor) => cursor.activity_cutoff,
+        None => {
+            let bound = Utc::now() - chrono::Duration::days(AUTO_ACTIVE_DAYS);
+            DateTime::from_timestamp(bound.timestamp(), 0)
+                .expect("a Utc::now()-derived timestamp is always representable")
+        }
+    };
 
     let mut qb = QueryBuilder::<Postgres>::new(
         r#"
