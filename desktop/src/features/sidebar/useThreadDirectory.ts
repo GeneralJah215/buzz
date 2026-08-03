@@ -45,7 +45,9 @@ type ThreadDirectoryMutationVariables = ThreadDirectoryMutationInput & {
 
 type DirectoryData = InfiniteData<ThreadDirectoryCachePage>;
 
-function cachePage(page: Awaited<ReturnType<typeof getThreadDirectoryPage>>): ThreadDirectoryCachePage {
+function cachePage(
+  page: Awaited<ReturnType<typeof getThreadDirectoryPage>>,
+): ThreadDirectoryCachePage {
   return { ...page, removedRootIds: new Set<string>() };
 }
 
@@ -72,7 +74,9 @@ function mergeLiveItem(
   return {
     ...data,
     pages: data.pages.map((page, index) => {
-      const hasItem = page.items.some((current) => current.rootId === item.rootId);
+      const hasItem = page.items.some(
+        (current) => current.rootId === item.rootId,
+      );
       if (!matchingState) return removeThreadDirectoryItem(page, item.rootId);
       if (hasItem || (index === 0 && !alreadyPresent)) {
         return mergeLiveThreadDirectoryItem(page, item);
@@ -98,16 +102,15 @@ export function useThreadDirectory({
   const queryClient = useQueryClient();
   const queryKey = React.useMemo(
     () =>
-      threadDirectoryQueryKey(
-        communityId,
-        relayUrl,
-        pubkey,
-        channelId,
-        state,
-      ),
+      threadDirectoryQueryKey(communityId, relayUrl, pubkey, channelId, state),
     [channelId, communityId, pubkey, relayUrl, state],
   );
-  const queryEnabled = enabled && channelId !== null && communityId !== null && relayUrl !== null && pubkey !== null;
+  const queryEnabled =
+    enabled &&
+    channelId !== null &&
+    communityId !== null &&
+    relayUrl !== null &&
+    pubkey !== null;
 
   const query = useInfiniteQuery<
     ThreadDirectoryCachePage,
@@ -120,8 +123,11 @@ export function useThreadDirectory({
     enabled: queryEnabled,
     initialPageParam: null,
     queryFn: ({ pageParam }) => {
-      if (!channelId) throw new Error("A channel is required for its thread directory.");
-      return getThreadDirectoryPage(channelId, state, pageParam).then(cachePage);
+      if (!channelId)
+        throw new Error("A channel is required for its thread directory.");
+      return getThreadDirectoryPage(channelId, state, pageParam).then(
+        cachePage,
+      );
     },
     getNextPageParam: (lastPage) =>
       lastPage.bounds.hasMore ? lastPage.bounds.nextCursor : undefined,
@@ -137,7 +143,10 @@ export function useThreadDirectory({
         try {
           item = parseThreadDirectoryItemOverlay(event, channelId);
         } catch (error) {
-          console.warn("Ignoring malformed live thread-directory overlay", error);
+          console.warn(
+            "Ignoring malformed live thread-directory overlay",
+            error,
+          );
           return;
         }
         queryClient.setQueryData<DirectoryData>(queryKey, (current) =>
@@ -152,7 +161,10 @@ export function useThreadDirectory({
         }
       })
       .catch((error) => {
-        console.warn("Could not subscribe to live thread-directory overlays", error);
+        console.warn(
+          "Could not subscribe to live thread-directory overlays",
+          error,
+        );
       });
     const unsubscribeReconnect = relayClient.subscribeToReconnects(() => {
       void queryClient.invalidateQueries({ queryKey, exact: true });
@@ -171,7 +183,8 @@ export function useThreadDirectory({
     { previous: DirectoryData | undefined }
   >({
     mutationFn: async ({ rootId, snapshot }) => {
-      if (!channelId) throw new Error("A channel is required to update a thread.");
+      if (!channelId)
+        throw new Error("A channel is required to update a thread.");
       return publishThreadDirectoryState(channelId, rootId, snapshot);
     },
     onMutate: async ({ rootId, snapshot }) => {

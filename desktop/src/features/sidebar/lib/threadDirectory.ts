@@ -27,14 +27,19 @@ export function threadDirectoryQueryKey(
   ] as const;
 }
 
-function activityAt(item: Pick<ThreadDirectoryItem, "lastReplyAt" | "rootCreatedAt">) {
+function activityAt(
+  item: Pick<ThreadDirectoryItem, "lastReplyAt" | "rootCreatedAt">,
+) {
   return item.lastReplyAt || item.rootCreatedAt;
 }
 
 /** Apply the relay's active ordering to a copied item list. */
-export function sortThreadDirectoryItems<T extends Pick<ThreadDirectoryItem, "rootId" | "pinned" | "lastReplyAt" | "rootCreatedAt">>(
-  items: readonly T[],
-): T[] {
+export function sortThreadDirectoryItems<
+  T extends Pick<
+    ThreadDirectoryItem,
+    "rootId" | "pinned" | "lastReplyAt" | "rootCreatedAt"
+  >,
+>(items: readonly T[]): T[] {
   return [...items].sort((left, right) => {
     if (left.pinned !== right.pinned) return left.pinned ? -1 : 1;
     const activityDifference = activityAt(right) - activityAt(left);
@@ -75,7 +80,10 @@ export function mergeThreadDirectoryPage(
   for (const item of incoming) {
     if (!current.removedRootIds.has(item.rootId)) byRoot.set(item.rootId, item);
   }
-  return { items: sortThreadDirectoryItems([...byRoot.values()]), removedRootIds: current.removedRootIds };
+  return {
+    items: sortThreadDirectoryItems([...byRoot.values()]),
+    removedRootIds: current.removedRootIds,
+  };
 }
 
 /** Add/replace a live item when it belongs to the currently viewed directory. */
@@ -87,10 +95,7 @@ export function mergeLiveThreadDirectoryItem(
   removedRootIds.delete(item.rootId);
   return {
     ...page,
-    ...mergeThreadDirectoryPage(
-      { items: page.items, removedRootIds },
-      [item],
-    ),
+    ...mergeThreadDirectoryPage({ items: page.items, removedRootIds }, [item]),
   };
 }
 
@@ -117,7 +122,9 @@ export function threadDirectoryUnreadState(
   return {
     isUnread,
     unreadCount:
-      loadedUnreadCount !== null && Number.isSafeInteger(loadedUnreadCount) && loadedUnreadCount >= 0
+      loadedUnreadCount !== null &&
+      Number.isSafeInteger(loadedUnreadCount) &&
+      loadedUnreadCount >= 0
         ? loadedUnreadCount
         : null,
   };

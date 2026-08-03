@@ -72,14 +72,18 @@ function exactlyOneTagValue(
     (tag) => tag.length === 2 && tag[0] === name && typeof tag[1] === "string",
   );
   if (tags.length !== 1 || !tags[0][1]) {
-    throw new Error(`Thread directory ${label} must have exactly one ${name} tag.`);
+    throw new Error(
+      `Thread directory ${label} must have exactly one ${name} tag.`,
+    );
   }
   return tags[0][1];
 }
 
 function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
   if (event.kind !== KIND_THREAD_DIRECTORY_ITEM) {
-    throw new Error("Thread directory response contains an unexpected item kind.");
+    throw new Error(
+      "Thread directory response contains an unexpected item kind.",
+    );
   }
   const rootId = exactlyOneTagValue(event, "e", "item");
   if (exactlyOneTagValue(event, "d", "item") !== rootId) {
@@ -98,7 +102,8 @@ function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
   }
   if (
     content.title_override !== null &&
-    (typeof content.title_override !== "string" || content.title_override.length === 0)
+    (typeof content.title_override !== "string" ||
+      content.title_override.length === 0)
   ) {
     throw new Error("Thread directory item has an invalid title override.");
   }
@@ -117,7 +122,7 @@ function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
   if (
     typeof content.pinned !== "boolean" ||
     typeof content.archived !== "boolean" ||
-    content.pinned === true && content.archived === true
+    (content.pinned === true && content.archived === true)
   ) {
     throw new Error("Thread directory item has invalid shared state.");
   }
@@ -129,7 +134,8 @@ function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
   }
   if (
     content.state_event_id !== null &&
-    (typeof content.state_event_id !== "string" || content.state_event_id.length === 0)
+    (typeof content.state_event_id !== "string" ||
+      content.state_event_id.length === 0)
   ) {
     throw new Error("Thread directory item has an invalid state event id.");
   }
@@ -166,7 +172,9 @@ function parseBounds(
   state: ThreadDirectoryState,
 ): ThreadDirectoryBounds {
   if (event.kind !== KIND_THREAD_DIRECTORY_BOUNDS) {
-    throw new Error("Thread directory response contains an unexpected bounds kind.");
+    throw new Error(
+      "Thread directory response contains an unexpected bounds kind.",
+    );
   }
   if (exactlyOneTagValue(event, "h", "bounds") !== channelId) {
     throw new Error("Thread directory bounds are scoped to another channel.");
@@ -181,11 +189,15 @@ function parseBounds(
   }
   if (
     content.next_cursor !== null &&
-    (typeof content.next_cursor !== "string" || content.next_cursor.length === 0)
+    (typeof content.next_cursor !== "string" ||
+      content.next_cursor.length === 0)
   ) {
     throw new Error("Thread directory bounds have an invalid next cursor.");
   }
-  if ((content.has_more && content.next_cursor === null) || (!content.has_more && content.next_cursor !== null)) {
+  if (
+    (content.has_more && content.next_cursor === null) ||
+    (!content.has_more && content.next_cursor !== null)
+  ) {
     throw new Error("Thread directory bounds have an inconsistent cursor.");
   }
   return {
@@ -210,11 +222,15 @@ export function parseThreadDirectoryPage(
     } else if (event.kind === KIND_THREAD_DIRECTORY_BOUNDS) {
       bounds.push(event);
     } else {
-      throw new Error("Thread directory response contains an unexpected event kind.");
+      throw new Error(
+        "Thread directory response contains an unexpected event kind.",
+      );
     }
   }
   if (bounds.length !== 1) {
-    throw new Error("Thread directory response must contain exactly one bounds overlay.");
+    throw new Error(
+      "Thread directory response must contain exactly one bounds overlay.",
+    );
   }
   return { items, bounds: parseBounds(bounds[0], channelId, state) };
 }

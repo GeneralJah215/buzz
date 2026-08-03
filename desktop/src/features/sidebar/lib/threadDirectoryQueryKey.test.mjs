@@ -15,11 +15,41 @@ test("thread-directory keys isolate community, relay, identity, channel, and sta
     "active",
   );
   for (const changed of [
-    threadDirectoryQueryKey("community-b", "wss://relay-a.example", PUBKEY, CHANNEL, "active"),
-    threadDirectoryQueryKey("community-a", "wss://relay-b.example", PUBKEY, CHANNEL, "active"),
-    threadDirectoryQueryKey("community-a", "wss://relay-a.example", "d".repeat(64), CHANNEL, "active"),
-    threadDirectoryQueryKey("community-a", "wss://relay-a.example", PUBKEY, "other", "active"),
-    threadDirectoryQueryKey("community-a", "wss://relay-a.example", PUBKEY, CHANNEL, "archived"),
+    threadDirectoryQueryKey(
+      "community-b",
+      "wss://relay-a.example",
+      PUBKEY,
+      CHANNEL,
+      "active",
+    ),
+    threadDirectoryQueryKey(
+      "community-a",
+      "wss://relay-b.example",
+      PUBKEY,
+      CHANNEL,
+      "active",
+    ),
+    threadDirectoryQueryKey(
+      "community-a",
+      "wss://relay-a.example",
+      "d".repeat(64),
+      CHANNEL,
+      "active",
+    ),
+    threadDirectoryQueryKey(
+      "community-a",
+      "wss://relay-a.example",
+      PUBKEY,
+      "other",
+      "active",
+    ),
+    threadDirectoryQueryKey(
+      "community-a",
+      "wss://relay-a.example",
+      PUBKEY,
+      CHANNEL,
+      "archived",
+    ),
   ]) {
     assert.notDeepEqual(changed, base);
   }

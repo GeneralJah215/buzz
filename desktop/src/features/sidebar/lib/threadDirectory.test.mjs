@@ -108,8 +108,22 @@ test("parses a channel-matched item and its single bounds overlay", () => {
 
 for (const [name, events] of [
   ["wrong item kind", [itemEvent({ kind: 9 }), boundsEvent()]],
-  ["missing root tag", [itemEvent({ tags: [["d", ROOT_A], ["h", CHANNEL_ID]] }), boundsEvent()]],
-  ["channel mismatch", [itemEvent({ channelId: OTHER_CHANNEL_ID }), boundsEvent()]],
+  [
+    "missing root tag",
+    [
+      itemEvent({
+        tags: [
+          ["d", ROOT_A],
+          ["h", CHANNEL_ID],
+        ],
+      }),
+      boundsEvent(),
+    ],
+  ],
+  [
+    "channel mismatch",
+    [itemEvent({ channelId: OTHER_CHANNEL_ID }), boundsEvent()],
+  ],
   ["malformed item JSON", [itemEvent({ content: "{" }), boundsEvent()]],
   [
     "invalid count",
@@ -133,7 +147,12 @@ test("sorts pinned threads first, then newest activity with root-id tie break", 
   const sorted = sortThreadDirectoryItems([
     { rootId: ROOT_B, pinned: false, lastReplyAt: 20, rootCreatedAt: 1 },
     { rootId: ROOT_A, pinned: true, lastReplyAt: 10, rootCreatedAt: 1 },
-    { rootId: "0".repeat(64), pinned: false, lastReplyAt: 20, rootCreatedAt: 1 },
+    {
+      rootId: "0".repeat(64),
+      pinned: false,
+      lastReplyAt: 20,
+      rootCreatedAt: 1,
+    },
   ]);
   assert.deepEqual(
     sorted.map((item) => item.rootId),
@@ -163,12 +182,18 @@ test("uses an explicit title override and exposes only a proven unread count", (
     lastReplyAt: 200,
   };
   assert.equal(resolveThreadDirectoryTitle(item), "Shared title");
-  assert.deepEqual(threadDirectoryUnreadState(item, () => 150, null), {
-    isUnread: true,
-    unreadCount: null,
-  });
-  assert.deepEqual(threadDirectoryUnreadState(item, () => 150, 2), {
-    isUnread: true,
-    unreadCount: 2,
-  });
+  assert.deepEqual(
+    threadDirectoryUnreadState(item, () => 150, null),
+    {
+      isUnread: true,
+      unreadCount: null,
+    },
+  );
+  assert.deepEqual(
+    threadDirectoryUnreadState(item, () => 150, 2),
+    {
+      isUnread: true,
+      unreadCount: 2,
+    },
+  );
 });
