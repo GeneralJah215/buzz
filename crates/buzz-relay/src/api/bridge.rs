@@ -527,9 +527,6 @@ async fn handle_thread_directory_filter(
             "thread_index requires exactly one #h channel",
         ));
     };
-    if !accessible_channels.contains(&channel_id) {
-        return Ok(());
-    }
 
     let directory_state = match raw.get("directory_state").and_then(Value::as_str) {
         Some("active") => buzz_db::thread::ThreadDirectoryState::Active,
@@ -564,17 +561,33 @@ async fn handle_thread_directory_filter(
         .unwrap_or(BRIDGE_DIRECTORY_DEFAULT_LIMIT)
         .max(1);
 
-    let page = state
-        .db
-        .get_thread_directory(
-            tenant.community(),
-            channel_id,
-            directory_state,
-            limit,
-            cursor,
-        )
-        .await
-        .map_err(|error| internal_error(&format!("thread directory query: {error}")))?;
+    // An inaccessible channel yields an empty page instead of an early return,
+    // so "exactly one bounds overlay" holds on every path. This discloses
+    // nothing: `accessible_channels` is a membership list, not an existence
+    // check, so a channel that does not exist is equally absent and already
+    // produced this exact response. Request-shape errors above (bad
+    // `directory_state` or `directory_cursor`) are still 400 here, because they
+    // depend only on the request body and fire identically for a channel the
+    // caller can read.
+    let page = if accessible_channels.contains(&channel_id) {
+        state
+            .db
+            .get_thread_directory(
+                tenant.community(),
+                channel_id,
+                directory_state,
+                limit,
+                cursor,
+            )
+            .await
+            .map_err(|error| internal_error(&format!("thread directory query: {error}")))?
+    } else {
+        buzz_db::thread::ThreadDirectoryPage {
+            rows: Vec::new(),
+            has_more: false,
+            next_cursor: None,
+        }
+    };
 
     let parse_tag = |parts: [&str; 2]| {
         nostr::Tag::parse(parts)
