@@ -158,19 +158,29 @@ and clients cannot submit it.
     "participants": ["<hex pubkey>"],
     "pinned": false,
     "archived": false,
+    "present": true,
     "state_created_at": 0,
     "state_event_id": "<hex id or null>"
   }
   ```
 
+- `present` is optional and defaults to `true` when absent. `false` means the
+  root is no longer a member of this channel's directory in any state: root
+  deletion, eligibility disqualification (for example the descendant count
+  dropping below the active threshold), or aging out. When `present` is
+  `false`, the remaining fields carry best-effort last-known values; clients
+  key removal solely on `present` and apply it through the same
+  newest-state-wins merge ordering as any other overlay.
 - `participants` follows the existing 39005 cap and newest-first order.
 - The generated title is deterministic: take the root's first non-empty line,
   trim leading Markdown quote/heading/list markers, collapse whitespace, and
   cap at 80 Unicode scalar values with an ellipsis. Empty content becomes
   `Untitled thread`. Explicit titles are not Markdown-rendered.
 - A live 39007 is emitted after a reply insert, reply deletion, root deletion,
-  metadata update, or metadata-event deletion. Failure to fan out is
-  recoverable because the next directory query recomputes the item.
+  metadata update, or metadata-event deletion. A trigger that leaves the root
+  outside both the active and archived membership — including root deletion —
+  emits the overlay with `present: false`. Failure to fan out is recoverable
+  because the next directory query recomputes the item.
 
 `kind:39008` is a relay-signed directory-bounds overlay. It is synthesized,
 never stored, and client submission is rejected.
@@ -275,6 +285,9 @@ Database/bridge tests:
   the exact-multiple final-page case.
 - Emit refreshed live 39007 state after reply, reply deletion, root deletion,
   update, and update deletion.
+- Emit `present: false` when a trigger removes the root from directory
+  membership: root deletion, and a reply deletion that drops the descendant
+  count below the active threshold.
 
 Desktop unit/component tests:
 
@@ -282,6 +295,9 @@ Desktop unit/component tests:
   malformed JSON, invalid counts/timestamps, and mismatched bounds.
 - Merge live items by state/activity ordering without reviving an item deleted
   by a newer page.
+- Remove an item from every view on `present: false`, treat an absent
+  `present` field as `true`, and ignore a stale `present: false` older than
+  the item's current state.
 - Keep relay/pubkey/channel query keys isolated across community and identity
   switches.
 - Render disclosure, loading, empty, error, active, pinned, and archived states
