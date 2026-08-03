@@ -1,7 +1,10 @@
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation } from "@tanstack/react-router";
-import { deriveShellRoute } from "@/app/AppShell.helpers";
+import {
+  deriveShellRoute,
+  getThreadReadAtWithChannelFallback,
+} from "@/app/AppShell.helpers";
 import { AppShellProvider } from "@/app/AppShellContext";
 import * as BuzzTheme from "@/app/BuzzThemeSurfaces";
 import { AppShellOverlays } from "@/app/AppShellOverlays";
@@ -357,21 +360,13 @@ export function AppShell() {
   });
 
   const getThreadReadAt = React.useCallback(
-    (rootId: string, channelId?: string | null) => {
-      const threadReadAt = getOwnReadAt(`thread:${rootId}`);
-      if (!channelId) {
-        return threadReadAt;
-      }
-
-      const channelReadAt = getChannelReadAt(channelId);
-      if (threadReadAt === null) {
-        return channelReadAt;
-      }
-      if (channelReadAt === null) {
-        return threadReadAt;
-      }
-      return Math.max(threadReadAt, channelReadAt);
-    },
+    (rootId: string, channelId?: string | null) =>
+      getThreadReadAtWithChannelFallback({
+        rootId,
+        channelId,
+        getOwnReadAt,
+        getChannelReadAt,
+      }),
     [getChannelReadAt, getOwnReadAt],
   );
 

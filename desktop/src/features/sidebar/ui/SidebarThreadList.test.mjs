@@ -3,9 +3,11 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { AppShellProvider } from "@/app/AppShellContext";
 
 import {
   SidebarThreadDisclosure,
+  ThreadDirectoryRow,
   ThreadDirectoryResults,
   threadDirectoryActionPatch,
   threadDirectoryCanTogglePin,
@@ -39,8 +41,11 @@ const ITEM = {
   participants: ["b".repeat(64)],
   pinned: true,
   archived: false,
+  present: true,
   stateCreatedAt: 150,
   stateEventId: "c".repeat(64),
+  projectionCreatedAt: 200,
+  projectionEventId: "d".repeat(64),
 };
 
 function renderResults(overrides = {}) {
@@ -120,6 +125,34 @@ test("directory results render loading, empty, error, and pinned item states", (
   assert.equal(maximumButtonDepth(itemHtml), 1);
 });
 
+test("directory row reads the explicit channel marker and renders dot-only unread state", () => {
+  const calls = [];
+  const html = renderToStaticMarkup(
+    React.createElement(
+      AppShellProvider,
+      {
+        value: {
+          getThreadReadAt(rootId, channelId) {
+            calls.push([rootId, channelId]);
+            return 150;
+          },
+        },
+      },
+      React.createElement(ThreadDirectoryRow, {
+        channelId: CHANNEL_ID,
+        item: ITEM,
+        isUpdating: false,
+        onNavigate() {},
+        onRename() {},
+        onUpdate() {},
+      }),
+    ),
+  );
+  assert.deepEqual(calls, [[ROOT_ID, CHANNEL_ID]]);
+  assert.match(html, /aria-label="Unread thread"/);
+  assert.doesNotMatch(html, />3</);
+});
+
 test("stream disclosure is a separate accessible control and forums omit it", () => {
   const streamHtml = renderToStaticMarkup(
     React.createElement(SidebarThreadDisclosure, {
@@ -169,6 +202,6 @@ test("production JSX wires navigation, drag isolation, and mutation rollback err
   assert.match(UI_SOURCE, /\{directory\.updateError\.message/);
   assert.match(
     HOOK_SOURCE,
-    /onError:[\s\S]*setQueryData\(queryKey, context\?\.previous\)/,
+    /onError:[\s\S]*setQueryData\(liveQueryKey, context\.previous\)/,
   );
 });

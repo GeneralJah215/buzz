@@ -22,8 +22,11 @@ export type ThreadDirectoryItem = {
   participants: string[];
   pinned: boolean;
   archived: boolean;
+  present: boolean;
   stateCreatedAt: number;
   stateEventId: string | null;
+  projectionCreatedAt: number;
+  projectionEventId: string;
 };
 
 export type ThreadDirectoryBounds = {
@@ -86,11 +89,32 @@ function isCanonicalHexIdentity(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
 
+function requireExactTagNames(
+  event: RelayEvent,
+  expectedNames: readonly string[],
+  label: string,
+) {
+  if (
+    event.tags.length !== expectedNames.length ||
+    event.tags.some((tag) => !expectedNames.includes(tag[0]))
+  ) {
+    throw new Error(
+      `Thread directory ${label} must contain only canonical tags.`,
+    );
+  }
+}
+
 function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
   if (event.kind !== KIND_THREAD_DIRECTORY_ITEM) {
     throw new Error(
       "Thread directory response contains an unexpected item kind.",
     );
+  }
+  if (
+    !isCanonicalHexIdentity(event.id) ||
+    !isNonNegativeInteger(event.created_at)
+  ) {
+    throw new Error("Thread directory item has invalid projection metadata.");
   }
   const rootId = exactlyOneTagValue(event, "e", "item");
   if (!isCanonicalHexIdentity(rootId)) {
@@ -102,6 +126,7 @@ function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
   if (exactlyOneTagValue(event, "h", "item") !== channelId) {
     throw new Error("Thread directory item is scoped to another channel.");
   }
+  requireExactTagNames(event, ["e", "d", "h"], "item");
 
   const content = parseJson(event.content, "item");
   const stringFields = ["title", "root_author"] as const;
@@ -139,6 +164,9 @@ function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
   ) {
     throw new Error("Thread directory item has invalid shared state.");
   }
+  if (content.present !== undefined && typeof content.present !== "boolean") {
+    throw new Error("Thread directory item has an invalid present value.");
+  }
   if (
     !Array.isArray(content.participants) ||
     content.participants.some(
@@ -152,6 +180,11 @@ function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
     !isCanonicalHexIdentity(content.state_event_id)
   ) {
     throw new Error("Thread directory item has an invalid state event id.");
+  }
+  if ((content.state_created_at === 0) !== (content.state_event_id === null)) {
+    throw new Error(
+      "Thread directory item has inconsistent state revision metadata.",
+    );
   }
 
   return {
@@ -167,8 +200,11 @@ function parseItem(event: RelayEvent, channelId: string): ThreadDirectoryItem {
     participants: content.participants as string[],
     pinned: content.pinned as boolean,
     archived: content.archived as boolean,
+    present: (content.present as boolean | undefined) ?? true,
     stateCreatedAt: content.state_created_at as number,
     stateEventId: content.state_event_id as string | null,
+    projectionCreatedAt: event.created_at,
+    projectionEventId: event.id,
   };
 }
 
@@ -198,6 +234,7 @@ function parseBounds(
   if (requestTag !== `${channelId}:${state}:${cursor ?? "head"}`) {
     throw new Error("Thread directory bounds do not match the requested page.");
   }
+  requireExactTagNames(event, ["d", "h"], "bounds");
   const content = parseJson(event.content, "bounds");
   if (typeof content.has_more !== "boolean") {
     throw new Error("Thread directory bounds have an invalid has_more value.");

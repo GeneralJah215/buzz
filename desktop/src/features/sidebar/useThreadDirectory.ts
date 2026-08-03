@@ -3,6 +3,7 @@ import {
   type InfiniteData,
   useInfiniteQuery,
   useMutation,
+  useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
 
@@ -17,11 +18,15 @@ import {
 } from "@/shared/api/threadDirectory";
 import type { RelayEvent } from "@/shared/api/types";
 import {
-  mergeLiveThreadDirectoryItem,
-  removeThreadDirectoryItem,
+  discardPreviousThreadDirectoryScope,
+  mergeThreadDirectoryLiveProjection,
+  reconcileThreadDirectoryItems,
+  threadDirectoryLiveQueryKey,
   threadDirectoryQueryKey,
   threadDirectoryStateSnapshot,
-  type ThreadDirectoryCachePage,
+  type StampedThreadDirectoryPage,
+  type ThreadDirectoryLiveState,
+  type ThreadDirectoryQueryScope,
 } from "./lib/threadDirectory";
 
 export type UseThreadDirectoryOptions = {
@@ -43,47 +48,40 @@ type ThreadDirectoryMutationVariables = ThreadDirectoryMutationInput & {
   snapshot: ThreadDirectoryStateSnapshot;
 };
 
-type DirectoryData = InfiniteData<ThreadDirectoryCachePage>;
+type DirectoryData = InfiniteData<StampedThreadDirectoryPage, string | null>;
 
-function cachePage(
-  page: Awaited<ReturnType<typeof getThreadDirectoryPage>>,
-): ThreadDirectoryCachePage {
-  return { ...page, removedRootIds: new Set<string>() };
-}
+const EMPTY_LIVE_STATE: ThreadDirectoryLiveState = {
+  nextOrder: 0,
+  byRootId: new Map(),
+};
 
-function currentItem(data: DirectoryData | undefined, rootId: string) {
-  return data?.pages
-    .flatMap((page) => page.items)
-    .find((item) => item.rootId === rootId);
-}
-
-function isInState(item: ThreadDirectoryItem, state: ThreadDirectoryState) {
-  return state === "archived" ? item.archived : !item.archived;
-}
-
-function mergeLiveItem(
-  data: DirectoryData | undefined,
-  item: ThreadDirectoryItem,
-  state: ThreadDirectoryState,
-): DirectoryData | undefined {
-  if (!data) return data;
-  const matchingState = isInState(item, state);
-  const alreadyPresent = data.pages.some((page) =>
-    page.items.some((current) => current.rootId === item.rootId),
+function reserveSourceOrder(
+  queryClient: ReturnType<typeof useQueryClient>,
+  liveQueryKey: ReturnType<typeof threadDirectoryLiveQueryKey>,
+) {
+  let sourceOrder = 1;
+  queryClient.setQueryData<ThreadDirectoryLiveState>(
+    liveQueryKey,
+    (current = EMPTY_LIVE_STATE) => {
+      sourceOrder = current.nextOrder + 1;
+      return { ...current, nextOrder: sourceOrder };
+    },
   );
-  return {
-    ...data,
-    pages: data.pages.map((page, index) => {
-      const hasItem = page.items.some(
-        (current) => current.rootId === item.rootId,
-      );
-      if (!matchingState) return removeThreadDirectoryItem(page, item.rootId);
-      if (hasItem || (index === 0 && !alreadyPresent)) {
-        return mergeLiveThreadDirectoryItem(page, item);
-      }
-      return page;
-    }),
-  };
+  return sourceOrder;
+}
+
+function currentItem(
+  data: DirectoryData | undefined,
+  liveState: ThreadDirectoryLiveState,
+  state: ThreadDirectoryState,
+  rootId: string,
+) {
+  return reconcileThreadDirectoryItems(
+    data?.pages ?? [],
+    liveState.byRootId,
+    state,
+    Math.floor(Date.now() / 1_000),
+  ).find((item) => item.rootId === rootId);
 }
 
 /**
@@ -105,6 +103,23 @@ export function useThreadDirectory({
       threadDirectoryQueryKey(communityId, relayUrl, pubkey, channelId, state),
     [channelId, communityId, pubkey, relayUrl, state],
   );
+  const liveQueryKey = React.useMemo(
+    () => threadDirectoryLiveQueryKey(communityId, relayUrl, pubkey, channelId),
+    [channelId, communityId, pubkey, relayUrl],
+  );
+  const previousScopeRef = React.useRef<ThreadDirectoryQueryScope | null>(null);
+  React.useEffect(() => {
+    const currentScope = { client: queryClient, queryKey, liveQueryKey };
+    discardPreviousThreadDirectoryScope(previousScopeRef.current, currentScope);
+    previousScopeRef.current = currentScope;
+  }, [liveQueryKey, queryClient, queryKey]);
+  const liveQuery = useQuery({
+    queryKey: liveQueryKey,
+    queryFn: () => Promise.resolve(EMPTY_LIVE_STATE),
+    initialData: EMPTY_LIVE_STATE,
+    enabled: false,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
   const queryEnabled =
     enabled &&
     channelId !== null &&
@@ -113,7 +128,7 @@ export function useThreadDirectory({
     pubkey !== null;
 
   const query = useInfiniteQuery<
-    ThreadDirectoryCachePage,
+    StampedThreadDirectoryPage,
     Error,
     DirectoryData,
     typeof queryKey,
@@ -122,12 +137,12 @@ export function useThreadDirectory({
     queryKey,
     enabled: queryEnabled,
     initialPageParam: null,
-    queryFn: ({ pageParam }) => {
+    queryFn: async ({ pageParam }) => {
       if (!channelId)
         throw new Error("A channel is required for its thread directory.");
-      return getThreadDirectoryPage(channelId, state, pageParam).then(
-        cachePage,
-      );
+      const requestOrder = reserveSourceOrder(queryClient, liveQueryKey);
+      const page = await getThreadDirectoryPage(channelId, state, pageParam);
+      return { ...page, requestOrder };
     },
     getNextPageParam: (lastPage) =>
       lastPage.bounds.hasMore ? lastPage.bounds.nextCursor : undefined,
@@ -149,8 +164,10 @@ export function useThreadDirectory({
           );
           return;
         }
-        queryClient.setQueryData<DirectoryData>(queryKey, (current) =>
-          mergeLiveItem(current, item, state),
+        queryClient.setQueryData<ThreadDirectoryLiveState>(
+          liveQueryKey,
+          (current = EMPTY_LIVE_STATE) =>
+            mergeThreadDirectoryLiveProjection(current, item, "live"),
         );
       })
       .then((dispose) => {
@@ -167,20 +184,27 @@ export function useThreadDirectory({
         );
       });
     const unsubscribeReconnect = relayClient.subscribeToReconnects(() => {
-      void queryClient.invalidateQueries({ queryKey, exact: true });
+      queryClient.setQueryData<ThreadDirectoryLiveState>(
+        liveQueryKey,
+        (current = EMPTY_LIVE_STATE) => ({
+          nextOrder: current.nextOrder + 1,
+          byRootId: new Map(),
+        }),
+      );
+      void queryClient.resetQueries({ queryKey, exact: true });
     });
     return () => {
       disposed = true;
       unsubscribeReconnect();
       if (unsubscribe) void unsubscribe();
     };
-  }, [channelId, queryClient, queryEnabled, queryKey, state]);
+  }, [channelId, liveQueryKey, queryClient, queryEnabled, queryKey]);
 
   const mutation = useMutation<
     RelayEvent,
     Error,
     ThreadDirectoryMutationVariables,
-    { previous: DirectoryData | undefined }
+    { previous: ThreadDirectoryLiveState }
   >({
     mutationFn: async ({ rootId, snapshot }) => {
       if (!channelId)
@@ -189,8 +213,15 @@ export function useThreadDirectory({
     },
     onMutate: async ({ rootId, snapshot }) => {
       await queryClient.cancelQueries({ queryKey, exact: true });
-      const previous = queryClient.getQueryData<DirectoryData>(queryKey);
-      const item = currentItem(previous, rootId);
+      const previous =
+        queryClient.getQueryData<ThreadDirectoryLiveState>(liveQueryKey) ??
+        EMPTY_LIVE_STATE;
+      const item = currentItem(
+        queryClient.getQueryData<DirectoryData>(queryKey),
+        previous,
+        state,
+        rootId,
+      );
       if (!item) return { previous };
       const optimistic = {
         ...item,
@@ -198,13 +229,15 @@ export function useThreadDirectory({
         pinned: snapshot.pinned,
         archived: snapshot.archived,
       };
-      queryClient.setQueryData<DirectoryData>(queryKey, (current) =>
-        mergeLiveItem(current, optimistic, state),
+      queryClient.setQueryData<ThreadDirectoryLiveState>(
+        liveQueryKey,
+        (current = EMPTY_LIVE_STATE) =>
+          mergeThreadDirectoryLiveProjection(current, optimistic, "optimistic"),
       );
       return { previous };
     },
     onError: (_error, _variables, context) => {
-      queryClient.setQueryData(queryKey, context?.previous);
+      if (context) queryClient.setQueryData(liveQueryKey, context.previous);
     },
     onSettled: () => queryClient.invalidateQueries({ queryKey, exact: true }),
   });
@@ -213,6 +246,9 @@ export function useThreadDirectory({
     ({ rootId, patch }: ThreadDirectoryMutationInput) => {
       const item = currentItem(
         queryClient.getQueryData<DirectoryData>(queryKey),
+        queryClient.getQueryData<ThreadDirectoryLiveState>(liveQueryKey) ??
+          EMPTY_LIVE_STATE,
+        state,
         rootId,
       );
       if (!item) {
@@ -226,12 +262,23 @@ export function useThreadDirectory({
         snapshot: threadDirectoryStateSnapshot(item, patch),
       });
     },
-    [mutation.mutateAsync, queryClient, queryKey],
+    [liveQueryKey, mutation.mutateAsync, queryClient, queryKey, state],
+  );
+
+  const items = React.useMemo(
+    () =>
+      reconcileThreadDirectoryItems(
+        query.data?.pages ?? [],
+        liveQuery.data.byRootId,
+        state,
+        Math.floor(Date.now() / 1_000),
+      ),
+    [liveQuery.data.byRootId, query.data?.pages, state],
   );
 
   return {
     ...query,
-    items: query.data?.pages.flatMap((page) => page.items) ?? [],
+    items,
     updateThread,
     updateError: mutation.error,
     isUpdating: mutation.isPending,

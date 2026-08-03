@@ -1,10 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { QueryClient } from "@tanstack/react-query";
 
 import {
-  mergeThreadDirectoryPage,
+  chooseThreadDirectoryProjection,
+  discardPreviousThreadDirectoryScope,
+  isThreadDirectoryItemInState,
+  mergeThreadDirectoryLiveProjection,
+  reconcileThreadDirectoryItems,
   resolveThreadDirectoryTitle,
   sortThreadDirectoryItems,
+  threadDirectoryProjection,
+  threadDirectoryLiveQueryKey,
+  threadDirectoryQueryKey,
   threadDirectoryUnreadState,
 } from "./threadDirectory.ts";
 import { parseThreadDirectoryPage } from "@/shared/api/threadDirectory";
@@ -167,6 +175,76 @@ test("rejects malformed duplicate tags and noncanonical hex identities", () => {
       ),
     /root_author/i,
   );
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [itemEvent({ rootId: "A".repeat(64) }), boundsEvent()],
+        CHANNEL_ID,
+        "active",
+      ),
+    /root/i,
+  );
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [itemEvent({ content: { participants: ["not-hex"] } }), boundsEvent()],
+        CHANNEL_ID,
+        "active",
+      ),
+    /participants/i,
+  );
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [itemEvent({ content: { state_event_id: "not-hex" } }), boundsEvent()],
+        CHANNEL_ID,
+        "active",
+      ),
+    /state event id/i,
+  );
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [
+          itemEvent({
+            tags: [
+              ["e", ROOT_A],
+              ["d", ROOT_A],
+              ["h", CHANNEL_ID],
+              ["x", "unexpected"],
+            ],
+          }),
+          boundsEvent(),
+        ],
+        CHANNEL_ID,
+        "active",
+      ),
+    /canonical tags/i,
+  );
+});
+
+test("rejects inconsistent state timestamp and event-id pairs", () => {
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [
+          itemEvent({ content: { state_event_id: "f".repeat(64) } }),
+          boundsEvent(),
+        ],
+        CHANNEL_ID,
+        "active",
+      ),
+    /state revision/i,
+  );
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [itemEvent({ content: { state_created_at: 1 } }), boundsEvent()],
+        CHANNEL_ID,
+        "active",
+      ),
+    /state revision/i,
+  );
 });
 
 for (const [name, events] of [
@@ -223,17 +301,41 @@ test("sorts pinned threads first, then newest activity with root-id tie break", 
   );
 });
 
-test("a newer removal tombstone prevents a late page from reviving its root", () => {
+test("a newer live tombstone prevents a late page from reviving its root", () => {
   const item = parseThreadDirectoryPage(
     [itemEvent(), boundsEvent()],
     CHANNEL_ID,
     "active",
   ).items[0];
-  const merged = mergeThreadDirectoryPage(
-    { items: [], removedRootIds: new Set([ROOT_A]) },
-    [item],
+  const tombstone = {
+    ...item,
+    present: false,
+    projectionCreatedAt: 300,
+    projectionEventId: "f".repeat(64),
+  };
+  const live = mergeThreadDirectoryLiveProjection(
+    { nextOrder: 1, byRootId: new Map() },
+    tombstone,
+    "live",
   );
-  assert.deepEqual(merged.items, []);
+  const merged = reconcileThreadDirectoryItems(
+    [
+      {
+        items: [item],
+        bounds: {
+          channelId: CHANNEL_ID,
+          state: "active",
+          hasMore: false,
+          nextCursor: null,
+        },
+        requestOrder: 1,
+      },
+    ],
+    live.byRootId,
+    "active",
+    300,
+  );
+  assert.deepEqual(merged, []);
 });
 
 test("uses an explicit title override and exposes only a proven unread count", () => {
@@ -259,4 +361,250 @@ test("uses an explicit title override and exposes only a proven unread count", (
       unreadCount: 2,
     },
   );
+  assert.deepEqual(
+    threadDirectoryUnreadState(item, () => 250, 2),
+    {
+      isUnread: false,
+      unreadCount: null,
+    },
+  );
+  assert.deepEqual(
+    threadDirectoryUnreadState(item, () => 150, 0),
+    {
+      isUnread: true,
+      unreadCount: null,
+    },
+  );
+});
+
+test("present defaults true, false is retained, and non-boolean is rejected", () => {
+  const defaultPresent = parseThreadDirectoryPage(
+    [itemEvent(), boundsEvent()],
+    CHANNEL_ID,
+    "active",
+  ).items[0];
+  assert.equal(defaultPresent.present, true);
+
+  const removed = parseThreadDirectoryPage(
+    [itemEvent({ content: { present: false } }), boundsEvent()],
+    CHANNEL_ID,
+    "active",
+  ).items[0];
+  assert.equal(removed.present, false);
+
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [itemEvent({ content: { present: "false" } }), boundsEvent()],
+        CHANNEL_ID,
+        "active",
+      ),
+    /present/i,
+  );
+});
+
+test("active membership enforces persistence, threshold, cutoff, and zero-descendant exclusion", () => {
+  const cutoff = 1_000;
+  const base = {
+    present: true,
+    archived: false,
+    pinned: false,
+    titleOverride: null,
+    descendantCount: 3,
+    lastReplyAt: cutoff,
+    rootCreatedAt: 1,
+  };
+  assert.equal(
+    isThreadDirectoryItemInState(base, "active", cutoff + 30 * 86_400),
+    true,
+  );
+  assert.equal(
+    isThreadDirectoryItemInState(
+      { ...base, lastReplyAt: cutoff - 1 },
+      "active",
+      cutoff + 30 * 86_400,
+    ),
+    false,
+  );
+  assert.equal(
+    isThreadDirectoryItemInState(
+      { ...base, descendantCount: 2 },
+      "active",
+      cutoff,
+    ),
+    false,
+  );
+  assert.equal(
+    isThreadDirectoryItemInState(
+      { ...base, descendantCount: 2, titleOverride: "Persistent" },
+      "active",
+      cutoff + 40 * 86_400,
+    ),
+    true,
+  );
+  assert.equal(
+    isThreadDirectoryItemInState(
+      { ...base, descendantCount: 0, pinned: true },
+      "active",
+      cutoff,
+    ),
+    false,
+  );
+  assert.equal(
+    isThreadDirectoryItemInState(
+      { ...base, descendantCount: 0, archived: true },
+      "archived",
+      cutoff,
+    ),
+    false,
+  );
+  assert.equal(
+    isThreadDirectoryItemInState(
+      { ...base, present: false, pinned: true, titleOverride: "Still gone" },
+      "active",
+      cutoff,
+    ),
+    false,
+  );
+});
+
+test("reconciliation deduplicates across pages and applies one global sort", () => {
+  const itemA = parseThreadDirectoryPage(
+    [itemEvent(), boundsEvent()],
+    CHANNEL_ID,
+    "active",
+  ).items[0];
+  const itemB = {
+    ...itemA,
+    rootId: ROOT_B,
+    pinned: true,
+    projectionEventId: "1".repeat(64),
+  };
+  const bounds = {
+    channelId: CHANNEL_ID,
+    state: "active",
+    hasMore: false,
+    nextCursor: null,
+  };
+  const items = reconcileThreadDirectoryItems(
+    [
+      { items: [itemA], bounds, requestOrder: 1 },
+      { items: [itemA, itemB], bounds, requestOrder: 2 },
+    ],
+    new Map(),
+    "active",
+    200,
+  );
+  assert.deepEqual(
+    items.map((item) => item.rootId),
+    [ROOT_B, ROOT_A],
+  );
+});
+
+test("causal fence protects newer live state and lets a later page supersede it", () => {
+  const pageItem = parseThreadDirectoryPage(
+    [itemEvent(), boundsEvent()],
+    CHANNEL_ID,
+    "active",
+  ).items[0];
+  const liveItem = {
+    ...pageItem,
+    titleOverride: "Live title",
+    pinned: true,
+    replyCount: 2,
+  };
+  const liveProjection = threadDirectoryProjection(liveItem, "live", 2);
+  const stalePageProjection = threadDirectoryProjection(pageItem, "page", 1);
+  assert.equal(
+    chooseThreadDirectoryProjection(stalePageProjection, liveProjection).item
+      .titleOverride,
+    "Live title",
+  );
+
+  const freshPageItem = { ...pageItem, titleOverride: "Relay title" };
+  const freshPageProjection = threadDirectoryProjection(
+    freshPageItem,
+    "page",
+    3,
+  );
+  assert.equal(
+    chooseThreadDirectoryProjection(liveProjection, freshPageProjection).item
+      .titleOverride,
+    "Relay title",
+  );
+});
+
+test("stale false loses to newer true and equal-revision false clears", () => {
+  const item = parseThreadDirectoryPage(
+    [itemEvent(), boundsEvent()],
+    CHANNEL_ID,
+    "active",
+  ).items[0];
+  const current = threadDirectoryProjection(item, "live", 2);
+  const staleFalse = threadDirectoryProjection(
+    {
+      ...item,
+      present: false,
+      projectionCreatedAt: item.projectionCreatedAt - 1,
+    },
+    "live",
+    3,
+  );
+  assert.equal(
+    chooseThreadDirectoryProjection(current, staleFalse).item.present,
+    true,
+  );
+
+  const equalFalse = threadDirectoryProjection(
+    { ...item, present: false },
+    "live",
+    2,
+  );
+  assert.equal(
+    chooseThreadDirectoryProjection(current, equalFalse).item.present,
+    false,
+  );
+});
+
+test("scope disposal removes only obsolete exact page and live caches", () => {
+  const client = new QueryClient();
+  const activeKey = threadDirectoryQueryKey(
+    "community",
+    "wss://relay",
+    PUBKEY,
+    CHANNEL_ID,
+    "active",
+  );
+  const liveKey = threadDirectoryLiveQueryKey(
+    "community",
+    "wss://relay",
+    PUBKEY,
+    CHANNEL_ID,
+  );
+  const siblingKey = threadDirectoryQueryKey(
+    "community",
+    "wss://relay",
+    PUBKEY,
+    OTHER_CHANNEL_ID,
+    "active",
+  );
+  const archivedKey = threadDirectoryQueryKey(
+    "community",
+    "wss://relay",
+    PUBKEY,
+    CHANNEL_ID,
+    "archived",
+  );
+  client.setQueryData(activeKey, "active");
+  client.setQueryData(liveKey, "live");
+  client.setQueryData(siblingKey, "sibling");
+
+  discardPreviousThreadDirectoryScope(
+    { client, queryKey: activeKey, liveQueryKey: liveKey },
+    { client, queryKey: archivedKey, liveQueryKey: [...liveKey] },
+  );
+
+  assert.equal(client.getQueryData(activeKey), undefined);
+  assert.equal(client.getQueryData(liveKey), "live");
+  assert.equal(client.getQueryData(siblingKey), "sibling");
 });
