@@ -1294,7 +1294,9 @@ void main() {
         ]);
         await tester.pumpAndSettle();
 
-        expect(findRichText('Newest live update'), findsNothing);
+        final newestLiveUpdate = findRichText('Newest live update');
+        expect(newestLiveUpdate, findsOneWidget);
+        expect(tester.getTopLeft(newestLiveUpdate).dy, greaterThan(600));
         expect(
           find.byKey(const ValueKey('channel-jump-to-latest')),
           findsOneWidget,
