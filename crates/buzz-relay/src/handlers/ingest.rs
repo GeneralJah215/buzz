@@ -3255,6 +3255,79 @@ mod tests {
         assert!(!is_global_only_kind(KIND_THREAD_DIRECTORY_STATE));
     }
 
+    /// The directory fan-out reads a stored kind:40009's target back off its own
+    /// tags, because a 40009 is excluded from thread metadata by design and so
+    /// never reaches the reply-driven emit path. If this read-back is wrong the
+    /// sidebar silently stops updating on rename/pin/archive, with nothing
+    /// failing anywhere, so pin the shapes it must and must not accept.
+    #[test]
+    fn thread_directory_state_target_reads_back_the_channel_and_root() {
+        let channel_id = uuid::Uuid::new_v4();
+        let root = [7u8; 32];
+        let root_hex = hex::encode(root);
+
+        let event = make_event_with_tags(
+            KIND_THREAD_DIRECTORY_STATE,
+            r#"{"title":null,"pinned":false,"archived":false}"#,
+            &[
+                &["h", &channel_id.to_string()],
+                &["e", &root_hex, "", "root"],
+            ],
+        );
+        assert_eq!(
+            thread_directory_state_target(&event),
+            Some((channel_id, root.to_vec())),
+            "a well-formed state event must yield its channel and root"
+        );
+
+        // Every shape below is already rejected before storage by
+        // `validate_thread_directory_state`; the read-back must not invent a
+        // target for one anyway if it ever sees it.
+        let missing_h = make_event_with_tags(
+            KIND_THREAD_DIRECTORY_STATE,
+            "{}",
+            &[&["e", &root_hex, "", "root"]],
+        );
+        assert_eq!(thread_directory_state_target(&missing_h), None, "no h tag");
+
+        let missing_root = make_event_with_tags(
+            KIND_THREAD_DIRECTORY_STATE,
+            "{}",
+            &[&["h", &channel_id.to_string()]],
+        );
+        assert_eq!(
+            thread_directory_state_target(&missing_root),
+            None,
+            "no root e tag"
+        );
+
+        // A NIP-10 reply marker is not a root marker.
+        let reply_marker = make_event_with_tags(
+            KIND_THREAD_DIRECTORY_STATE,
+            "{}",
+            &[
+                &["h", &channel_id.to_string()],
+                &["e", &root_hex, "", "reply"],
+            ],
+        );
+        assert_eq!(
+            thread_directory_state_target(&reply_marker),
+            None,
+            "a reply-marked e tag must not be read as the directory root"
+        );
+
+        let short_root = make_event_with_tags(
+            KIND_THREAD_DIRECTORY_STATE,
+            "{}",
+            &[&["h", &channel_id.to_string()], &["e", "aabb", "", "root"]],
+        );
+        assert_eq!(
+            thread_directory_state_target(&short_root),
+            None,
+            "a root id that is not 32 bytes must be rejected"
+        );
+    }
+
     #[test]
     fn nip29_admin_kinds_require_h_tags() {
         for kind in [
