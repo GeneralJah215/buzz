@@ -247,8 +247,9 @@ filter:
 
 Protocol/core tests:
 
-- All three kinds are registered exactly once; 39007 and 39008 are relay-only;
-  40009 is regular stored and channel-scoped.
+- All three kinds are registered exactly once; 39007 and 39008 are relay-only
+  parameterized sidecars; 40009 is regular stored, channel-scoped, and pinned
+  by compile-time assertions as neither ephemeral nor replaceable.
 - The SDK builder emits exactly one `h`, one root-marked `e`, and the canonical
   full JSON snapshot.
 
