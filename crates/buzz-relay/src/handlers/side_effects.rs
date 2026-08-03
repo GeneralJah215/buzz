@@ -11,7 +11,7 @@ use buzz_core::kind::{
     KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED,
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS,
     KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION,
-    KIND_THREAD_SUMMARY,
+    KIND_THREAD_DIRECTORY_ITEM, KIND_THREAD_SUMMARY,
 };
 use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
@@ -881,6 +881,214 @@ pub fn emit_live_thread_summary(
                 .local_event_ids
                 .invalidate(&(tenant.community(), event.id.to_bytes()));
             warn!(root = %root_hex, "live thread summary Redis publish failed: {e}");
+        }
+        let stored = StoredEvent::new(event, Some(channel_id));
+        crate::handlers::event::fan_out_event_to_local_subscribers(
+            &state,
+            tenant.community(),
+            &stored,
+        )
+        .await;
+    });
+}
+
+/// Sign and fan out a fresh relay-signed `kind:39007` thread-directory item
+/// overlay for `root_id` after a change that alters how the root appears in the
+/// sidebar directory.
+///
+/// Fan-out only — never stored, exactly like [`emit_live_thread_summary`]. The
+/// directory query in `api/bridge.rs` recomputes every item on each fetch, so a
+/// persisted copy would only add staleness. This live emit exists so a
+/// subscribed sidebar updates without refetching, and the spec explicitly calls
+/// a failed fan-out recoverable for that reason.
+///
+/// Content and tags are built to be byte-identical to the query-path overlay in
+/// `api/bridge.rs`; the generated title comes from the same shared
+/// [`crate::api::bridge::generated_thread_title`] rather than a second copy.
+///
+/// **Deliberately not called on root deletion.** The 39007 content shape has no
+/// way to express "this root is gone", and the desktop's only removal trigger is
+/// an `archived` mismatch, so emitting here would merge a deleted root back into
+/// the sidebar. That gap is tracked in BUG-010 and awaiting a ruling; until then
+/// a deleted root disappears on the next query rather than live.
+///
+/// Spawned: runs after the triggering write committed and must not add latency
+/// to the ingest acknowledgement.
+pub fn emit_live_thread_directory_item(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    root_id: Vec<u8>,
+) {
+    let tenant = tenant.clone();
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let root_hex = hex::encode(&root_id);
+
+        // The root supplies author, timestamp, and the fallback title. A
+        // soft-deleted root still has to be described, because the removal
+        // signal itself is a 39007 carrying `present: false` with best-effort
+        // last-known fields, so fall back to the including-deleted read rather
+        // than going silent. `StoredEvent` carries no `deleted_at`, so the
+        // difference between the two reads *is* the deletion signal.
+        let live = match state.db.get_event_by_id(tenant.community(), &root_id).await {
+            Ok(live) => live,
+            Err(e) => {
+                warn!(root = %root_hex, "live directory item root lookup failed: {e}");
+                return;
+            }
+        };
+        let root_deleted = live.is_none();
+        let root = match live {
+            Some(root) => root,
+            None => match state
+                .db
+                .get_event_by_id_including_deleted(tenant.community(), &root_id)
+                .await
+            {
+                Ok(Some(root)) => root,
+                // Never existed here: nothing to describe, not even a removal.
+                Ok(None) => return,
+                Err(e) => {
+                    warn!(root = %root_hex, "live directory item deleted-root lookup failed: {e}");
+                    return;
+                }
+            },
+        };
+        if root.channel_id != Some(channel_id) {
+            return;
+        }
+
+        // A root whose thread row is gone has no replies left to count. Zeroed
+        // counts are the correct last-known values for the removal overlay.
+        let summary = match state
+            .db
+            .get_thread_summary(tenant.community(), &root_id)
+            .await
+        {
+            Ok(summary) => summary,
+            Err(e) => {
+                warn!(root = %root_hex, "live directory item summary lookup failed: {e}");
+                return;
+            }
+        };
+        let (reply_count, descendant_count, last_reply_at, participants) = match &summary {
+            Some(summary) => (
+                summary.reply_count,
+                summary.descendant_count,
+                summary.last_reply_at,
+                summary.participants.clone(),
+            ),
+            None => (0, 0, None, Vec::new()),
+        };
+
+        // Reduced shared state: newest non-deleted authorized kind:40009.
+        // Absent is normal and means "no override, not pinned, not archived".
+        let shared = match state
+            .db
+            .get_latest_thread_directory_state(tenant.community(), channel_id, &root_id)
+            .await
+        {
+            Ok(shared) => shared,
+            Err(e) => {
+                warn!(root = %root_hex, "live directory item state lookup failed: {e}");
+                return;
+            }
+        };
+        let (title_override, pinned, archived, state_created_at, state_event_id) = match &shared {
+            Some(record) => {
+                let parsed: serde_json::Value = match serde_json::from_str(&record.content) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        warn!(root = %root_hex, "live directory item state parse failed: {e}");
+                        return;
+                    }
+                };
+                (
+                    parsed
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    parsed
+                        .get("pinned")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    parsed
+                        .get("archived")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    record.created_at.timestamp(),
+                    Some(hex::encode(&record.event_id)),
+                )
+            }
+            None => (None, false, false, 0, None),
+        };
+
+        let title = title_override
+            .clone()
+            .unwrap_or_else(|| crate::api::bridge::generated_thread_title(&root.event.content));
+        let root_author = crate::handlers::ingest::effective_message_author(
+            &root.event,
+            &state.relay_keypair.public_key(),
+        );
+
+        let content = serde_json::json!({
+            "title": title,
+            "title_override": title_override,
+            "root_author": hex::encode(root_author),
+            "root_created_at": root.event.created_at.as_secs(),
+            "reply_count": summary.reply_count,
+            "descendant_count": summary.descendant_count,
+            "last_reply_at": summary.last_reply_at.map(|t| t.timestamp()).unwrap_or(0),
+            "participants": summary.participants.iter().map(hex::encode).collect::<Vec<_>>(),
+            "pinned": pinned,
+            "archived": archived,
+            "state_created_at": state_created_at,
+            "state_event_id": state_event_id,
+        });
+
+        let tags = [
+            Tag::parse(["e", &root_hex]),
+            Tag::parse(["d", &root_hex]),
+            Tag::parse(["h", &channel_id.to_string()]),
+        ];
+        let mut parsed = Vec::with_capacity(tags.len());
+        for tag in tags {
+            match tag {
+                Ok(tag) => parsed.push(tag),
+                Err(e) => {
+                    warn!(root = %root_hex, "live directory item tag failed: {e}");
+                    return;
+                }
+            }
+        }
+
+        let event = match EventBuilder::new(
+            Kind::Custom(KIND_THREAD_DIRECTORY_ITEM as u16),
+            content.to_string(),
+        )
+        .tags(parsed)
+        .sign_with_keys(&state.relay_keypair)
+        {
+            Ok(event) => event,
+            Err(e) => {
+                warn!(root = %root_hex, "live directory item sign failed: {e}");
+                return;
+            }
+        };
+
+        // Redis before local fan-out so subscribers on other relay pods receive
+        // it too, matching `emit_live_thread_summary`.
+        state.mark_local_event(tenant.community(), &event.id);
+        if let Err(e) = state
+            .pubsub
+            .publish_event(&tenant, EventTopic::Channel(channel_id), &event)
+            .await
+        {
+            state
+                .local_event_ids
+                .invalidate(&(tenant.community(), event.id.to_bytes()));
+            warn!(root = %root_hex, "live directory item Redis publish failed: {e}");
         }
         let stored = StoredEvent::new(event, Some(channel_id));
         crate::handlers::event::fan_out_event_to_local_subscribers(

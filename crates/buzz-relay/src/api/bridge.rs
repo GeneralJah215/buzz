@@ -465,7 +465,12 @@ fn decode_thread_directory_cursor(
     })
 }
 
-fn generated_thread_title(content: &str) -> String {
+/// Deterministic display title for a root with no shared override.
+///
+/// Shared with the live 39007 fan-out in `handlers::side_effects` so the query
+/// door and the live door produce byte-identical titles. Duplicating it is how
+/// the two drift.
+pub(crate) fn generated_thread_title(content: &str) -> String {
     let Some(line) = content.lines().map(str::trim).find(|line| !line.is_empty()) else {
         return "Untitled thread".to_string();
     };
