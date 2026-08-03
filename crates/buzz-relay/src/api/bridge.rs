@@ -388,6 +388,9 @@ struct ThreadDirectoryCursorWire {
     pinned: bool,
     activity_at: i64,
     root_id: String,
+    /// Pinned auto-active aging bound. Replayed so later pages filter against
+    /// the same instant as the first page (BUG-008).
+    activity_cutoff: i64,
 }
 
 fn encode_thread_directory_cursor(
@@ -399,6 +402,7 @@ fn encode_thread_directory_cursor(
         pinned: cursor.pinned,
         activity_at: cursor.activity_at.timestamp(),
         root_id: hex::encode(&cursor.root_event_id),
+        activity_cutoff: cursor.activity_cutoff.timestamp(),
     };
     let bytes = serde_json::to_vec(&wire)
         .map_err(|error| internal_error(&format!("directory cursor encode: {error}")))?;
@@ -434,6 +438,13 @@ fn decode_thread_directory_cursor(
             "thread_index: malformed directory_cursor",
         )
     })?;
+    let activity_cutoff =
+        chrono::DateTime::from_timestamp(wire.activity_cutoff, 0).ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "thread_index: malformed directory_cursor",
+            )
+        })?;
     let root_event_id = hex::decode(wire.root_id).map_err(|_| {
         api_error(
             StatusCode::BAD_REQUEST,
@@ -450,6 +461,7 @@ fn decode_thread_directory_cursor(
         pinned: wire.pinned,
         activity_at,
         root_event_id,
+        activity_cutoff,
     })
 }
 
@@ -4069,6 +4081,68 @@ mod tests {
         assert!(
             log.contains(&pubkey_hex[..16]),
             "attribution line must carry the pubkey;\nlog:\n{log}"
+        );
+    }
+
+    /// BUG-008. The pinned auto-active cutoff only helps if it survives the
+    /// round trip to the client and back. If `activity_cutoff` were dropped
+    /// from the wire format, every later page would silently fall back to a
+    /// fresh window and the db-side fix would be inert -- with no test failure
+    /// anywhere, because the db test cannot run on a machine without Postgres.
+    /// This one runs everywhere.
+    #[test]
+    fn directory_cursor_round_trip_preserves_the_pinned_activity_cutoff() {
+        let cutoff = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid cutoff");
+        let original = buzz_db::thread::ThreadDirectoryCursor {
+            pinned: true,
+            activity_at: chrono::DateTime::from_timestamp(1_800_000_000, 0)
+                .expect("valid activity"),
+            root_event_id: vec![7u8; 32],
+            activity_cutoff: cutoff,
+        };
+
+        let encoded = encode_thread_directory_cursor(&original).expect("encode");
+        let decoded = decode_thread_directory_cursor(&encoded).expect("decode");
+
+        assert_eq!(
+            decoded, original,
+            "every cursor dimension must survive the round trip, including the \
+             pinned activity_cutoff"
+        );
+        assert_eq!(
+            decoded.activity_cutoff, cutoff,
+            "the pinned cutoff is the whole point of BUG-008; losing it \
+             silently reverts later pages to a fresh 30-day window"
+        );
+    }
+
+    /// The cursor is opaque to clients, so every malformed shape must be a 400
+    /// rather than a panic or a silent default. Spec line 204.
+    #[test]
+    fn directory_cursor_rejects_malformed_input() {
+        for bad in ["", "!!!not-base64!!!", "YWJj"] {
+            let result = decode_thread_directory_cursor(bad);
+            assert!(
+                result.is_err(),
+                "malformed cursor {bad:?} must be rejected, not defaulted"
+            );
+        }
+
+        // Structurally valid base64+JSON, but the root id is the wrong length.
+        let short_root = {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use base64::Engine as _;
+            let wire = serde_json::json!({
+                "pinned": false,
+                "activity_at": 1_700_000_000i64,
+                "root_id": "aabb",
+                "activity_cutoff": 1_700_000_000i64,
+            });
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wire).expect("serialize"))
+        };
+        assert!(
+            decode_thread_directory_cursor(&short_root).is_err(),
+            "a root id that is not 32 bytes must be rejected"
         );
     }
 }

@@ -97,6 +97,12 @@ pub struct ThreadDirectoryCursor {
     pub activity_at: DateTime<Utc>,
     /// Root event-id tiebreak ordering dimension.
     pub root_event_id: Vec<u8>,
+    /// Auto-active aging bound, pinned at the first page and replayed on every
+    /// later page. Recomputing it per page would let a root sitting on the
+    /// 30-day boundary leave the result set between pages, and the keyset
+    /// cannot see that: the row is not ordered past, it is filtered out, so it
+    /// would be skipped on every page. Not an ordering dimension.
+    pub activity_cutoff: DateTime<Utc>,
 }
 
 /// One authoritative directory row before relay overlay projection.
@@ -691,6 +697,14 @@ pub async fn get_thread_directory(
     const STATE_KIND: i32 = buzz_core::kind::KIND_THREAD_DIRECTORY_STATE as i32;
     const AUTO_ACTIVE_DAYS: i64 = 30;
 
+    // Pin the aging bound once and carry it in the cursor. See
+    // `ThreadDirectoryCursor::activity_cutoff` for why this must not be
+    // recomputed per page.
+    let activity_cutoff = cursor
+        .as_ref()
+        .map(|cursor| cursor.activity_cutoff)
+        .unwrap_or_else(|| Utc::now() - chrono::Duration::days(AUTO_ACTIVE_DAYS));
+
     let mut qb = QueryBuilder::<Postgres>::new(
         r#"
         SELECT
@@ -760,9 +774,9 @@ pub async fn get_thread_directory(
                    AND (ds.title_override IS NOT NULL\
                         OR COALESCE(ds.pinned, false) = true\
                         OR (tm.descendant_count >= 3\
-                            AND COALESCE(tm.last_reply_at, e.created_at) >= now() - ",
+                            AND COALESCE(tm.last_reply_at, e.created_at) >= ",
             );
-            qb.push_bind(chrono::Duration::days(AUTO_ACTIVE_DAYS));
+            qb.push_bind(activity_cutoff);
             qb.push("))");
             if let Some(cursor) = &cursor {
                 qb.push(" AND (COALESCE(ds.pinned, false) < ");
@@ -814,6 +828,7 @@ pub async fn get_thread_directory(
                     pinned: row.try_get("pinned")?,
                     activity_at: row.try_get("activity_at")?,
                     root_event_id: row.try_get("id")?,
+                    activity_cutoff,
                 })
             })
             .transpose()?
@@ -1228,6 +1243,13 @@ mod tests {
     fn event_created_at(event: &nostr::Event) -> DateTime<Utc> {
         DateTime::from_timestamp(event.created_at.as_secs() as i64, 0)
             .expect("event timestamp is valid")
+    }
+
+    fn make_stream_event_at(keys: &Keys, content: &str, at: DateTime<Utc>) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(9), content)
+            .custom_created_at(nostr::Timestamp::from(at.timestamp() as u64))
+            .sign_with_keys(keys)
+            .expect("sign event")
     }
 
     async fn make_test_community(pool: &PgPool) -> Uuid {
@@ -2116,5 +2138,133 @@ mod tests {
             quiet_row.thread_summary.is_none(),
             "reply-less row carries no summary"
         );
+    }
+
+    /// BUG-008. The auto-active window used to be `now() - 30 days` evaluated
+    /// inside the SQL on every call, so page 2 filtered against a later instant
+    /// than page 1. A root sitting on the boundary could be inside the result
+    /// set for page 1 and outside it for page 2, and the keyset cursor cannot
+    /// compensate: the row is not ordered past, it is filtered out, so it is
+    /// skipped on every page and never returned at all.
+    ///
+    /// The cutoff is now pinned at page 1 and replayed through the cursor. This
+    /// pins that behavior without needing the clock to move: it hands
+    /// `get_thread_directory` two cursors that differ *only* in
+    /// `activity_cutoff` and asserts the aging decision follows the cursor
+    /// rather than the wall clock. If the query ever recomputes `now()`, the
+    /// wide-cutoff case stops returning the root and this fails.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn thread_directory_ages_against_the_cursor_cutoff_not_a_fresh_now() {
+        let pool = setup_pool().await;
+        let author = Keys::generate();
+        let (channel, community) = create_test_channel(
+            &pool,
+            &format!("thread-dir-cutoff-{}", Uuid::new_v4()),
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            author.public_key().to_bytes().as_slice(),
+            None,
+        )
+        .await
+        .expect("create channel");
+
+        // A root whose last activity is 100 days old: outside a fresh 30-day
+        // window, inside a 365-day one. It needs three descendants to qualify
+        // for the auto-active partition at all.
+        let root_at = Utc::now() - chrono::Duration::days(100);
+        let root = make_stream_event_at(&author, "aging root", root_at);
+        let root_created_at = event_created_at(&root);
+        insert_event_with_thread_metadata(&pool, community, &root, Some(channel.id), None)
+            .await
+            .expect("insert root event");
+
+        for index in 0..3 {
+            let reply_at = root_at + chrono::Duration::seconds(index + 1);
+            let reply = make_stream_event_at(&author, &format!("reply {index}"), reply_at);
+            insert_event_with_thread_metadata(
+                &pool,
+                community,
+                &reply,
+                Some(channel.id),
+                Some(ThreadMetadataParams {
+                    event_id: reply.id.as_bytes(),
+                    event_created_at: event_created_at(&reply),
+                    channel_id: channel.id,
+                    parent_event_id: Some(root.id.as_bytes()),
+                    parent_event_created_at: Some(root_created_at),
+                    root_event_id: Some(root.id.as_bytes()),
+                    root_event_created_at: Some(root_created_at),
+                    depth: 1,
+                    broadcast: false,
+                }),
+            )
+            .await
+            .expect("insert reply");
+        }
+
+        // Both cursors sit far in the future on the ordering dimensions, so the
+        // keyset admits the root in both cases and the only thing that can
+        // change the outcome is `activity_cutoff`.
+        let cursor_at = |cutoff: DateTime<Utc>| ThreadDirectoryCursor {
+            pinned: false,
+            activity_at: Utc::now(),
+            root_event_id: vec![0u8; 32],
+            activity_cutoff: cutoff,
+        };
+
+        let wide = get_thread_directory(
+            &pool,
+            community,
+            channel.id,
+            ThreadDirectoryState::Active,
+            25,
+            Some(cursor_at(Utc::now() - chrono::Duration::days(365))),
+        )
+        .await
+        .expect("wide-cutoff page");
+        assert!(
+            wide.rows.iter().any(|row| row.root.event.id == root.id),
+            "a 365-day pinned cutoff must still include a 100-day-old root; \
+             if this fails the query is recomputing now() instead of reading \
+             the cursor"
+        );
+
+        let narrow = get_thread_directory(
+            &pool,
+            community,
+            channel.id,
+            ThreadDirectoryState::Active,
+            25,
+            Some(cursor_at(Utc::now() - chrono::Duration::days(30))),
+        )
+        .await
+        .expect("narrow-cutoff page");
+        assert!(
+            !narrow.rows.iter().any(|row| row.root.event.id == root.id),
+            "a 30-day pinned cutoff must exclude the same 100-day-old root, \
+             proving the two runs differed only by the cursor's cutoff"
+        );
+
+        // The pinned cutoff must survive onto the next page, or later pages
+        // silently revert to a fresh window.
+        let pinned = Utc::now() - chrono::Duration::days(365);
+        let first = get_thread_directory(
+            &pool,
+            community,
+            channel.id,
+            ThreadDirectoryState::Active,
+            1,
+            Some(cursor_at(pinned)),
+        )
+        .await
+        .expect("first page");
+        if let Some(next) = first.next_cursor {
+            assert_eq!(
+                next.activity_cutoff, pinned,
+                "next_cursor must replay the pinned cutoff unchanged"
+            );
+        }
     }
 }
