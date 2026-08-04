@@ -4,7 +4,7 @@ import { QueryClient } from "@tanstack/react-query";
 
 import {
   chooseThreadDirectoryProjection,
-  discardPreviousThreadDirectoryScope,
+  discardThreadDirectoryScope,
   isThreadDirectoryItemInState,
   mergeThreadDirectoryLiveProjection,
   reconcileThreadDirectoryItems,
@@ -567,7 +567,7 @@ test("stale live false loses to a newer page and equal-revision false clears", (
   );
 });
 
-test("scope disposal removes only obsolete exact page and live caches", () => {
+test("scope disposal removes only its exact page and live caches", () => {
   const client = new QueryClient();
   const activeKey = threadDirectoryQueryKey(
     "community",
@@ -589,24 +589,18 @@ test("scope disposal removes only obsolete exact page and live caches", () => {
     OTHER_CHANNEL_ID,
     "active",
   );
-  const archivedKey = threadDirectoryQueryKey(
-    "community",
-    "wss://relay",
-    PUBKEY,
-    CHANNEL_ID,
-    "archived",
-  );
   client.setQueryData(activeKey, "active");
   client.setQueryData(liveKey, "live");
   client.setQueryData(siblingKey, "sibling");
 
-  discardPreviousThreadDirectoryScope(
-    { client, queryKey: activeKey, liveQueryKey: liveKey },
-    { client, queryKey: archivedKey, liveQueryKey: [...liveKey] },
-  );
+  discardThreadDirectoryScope({
+    client,
+    queryKey: activeKey,
+    liveQueryKey: liveKey,
+  });
 
   assert.equal(client.getQueryData(activeKey), undefined);
-  assert.equal(client.getQueryData(liveKey), "live");
+  assert.equal(client.getQueryData(liveKey), undefined);
   assert.equal(client.getQueryData(siblingKey), "sibling");
 });
 
