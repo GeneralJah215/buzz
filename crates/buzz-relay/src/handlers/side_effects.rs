@@ -902,15 +902,20 @@ pub fn emit_live_thread_summary(
 /// subscribed sidebar updates without refetching, and the spec explicitly calls
 /// a failed fan-out recoverable for that reason.
 ///
-/// Content and tags are built to be byte-identical to the query-path overlay in
-/// `api/bridge.rs`; the generated title comes from the same shared
-/// [`crate::api::bridge::generated_thread_title`] rather than a second copy.
+/// Tags match the query-path overlay in `api/bridge.rs`, and the generated
+/// title comes from the shared [`crate::api::bridge::generated_thread_title`]
+/// rather than a second copy. The content is **not** byte-identical: only this
+/// path emits the optional `present` field, because only this path can observe
+/// a root leaving the directory. Membership itself is decided with the shared
+/// [`buzz_db::thread::auto_active_cutoff`], so the two paths cannot disagree on
+/// the boundary.
 ///
-/// **Deliberately not called on root deletion.** The 39007 content shape has no
-/// way to express "this root is gone", and the desktop's only removal trigger is
-/// an `archived` mismatch, so emitting here would merge a deleted root back into
-/// the sidebar. That gap is tracked in BUG-010 and awaiting a ruling; until then
-/// a deleted root disappears on the next query rather than live.
+/// **This is called on root deletion,** and that case is not symmetric with the
+/// 39005 summary next door: a depth-0 root has `thread_metadata.root_event_id =
+/// NULL`, so the callers fall back to the deletion target itself. The helper
+/// then reports the root absent via `present: false` rather than going silent,
+/// which is what stops a deleted thread from being merged back into a live
+/// sidebar.
 ///
 /// Spawned: runs after the triggering write committed and must not add latency
 /// to the ingest acknowledgement.
@@ -1040,13 +1045,17 @@ pub fn emit_live_thread_directory_item(
         // Aging out is deliberately not swept on a timer (Cody's ruling); this
         // only ever evaluates on a real trigger, and a trigger that finds a
         // root already aged out correctly reports it as absent.
-        const AUTO_ACTIVE_DAYS: i64 = 30;
+        //
+        // The bound comes from `buzz_db::thread::auto_active_cutoff` rather
+        // than being recomputed here. Writing the arithmetic out a second time
+        // is exactly how this path drifted from the SQL one before (BUG-013):
+        // the query floors to a whole second and this did not, so a root on the
+        // boundary was live-absent and query-present at the same moment.
         let activity_at = last_reply_at.or_else(|| {
             chrono::DateTime::from_timestamp(root.event.created_at.as_secs() as i64, 0)
         });
-        let recently_active = activity_at.is_some_and(|activity_at| {
-            activity_at >= chrono::Utc::now() - chrono::Duration::days(AUTO_ACTIVE_DAYS)
-        });
+        let cutoff = buzz_db::thread::auto_active_cutoff();
+        let recently_active = activity_at.is_some_and(|activity_at| activity_at >= cutoff);
         let qualifies_active = title_override.is_some()
             || pinned
             || (descendant_count >= 3 && recently_active);

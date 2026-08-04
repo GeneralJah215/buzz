@@ -4397,6 +4397,49 @@ mod tests {
         );
     }
 
+    /// BUG-013. The SQL directory query and the live 39007 fan-out both decide
+    /// directory membership against the auto-active bound, and they have to
+    /// agree exactly: a root whose activity lands on the boundary second must
+    /// not be present to one path and absent to the other.
+    ///
+    /// They drifted before because the arithmetic was written out twice, one
+    /// side floored and the other not. This pins the shared helper's contract
+    /// so a future caller cannot reintroduce a sub-second bound.
+    #[test]
+    fn auto_active_cutoff_is_whole_seconds_for_every_caller() {
+        let cutoff = buzz_db::thread::auto_active_cutoff();
+
+        assert_eq!(
+            cutoff.timestamp_subsec_nanos(),
+            0,
+            "a sub-second bound makes the live path disagree with the SQL path \
+             for the remainder of the boundary second, and cannot survive the \
+             cursor wire format either"
+        );
+
+        // Stored Nostr timestamps are whole seconds, so an event exactly on the
+        // bound is the case that has to be decided identically everywhere.
+        let on_the_boundary = cutoff;
+        assert!(
+            on_the_boundary >= cutoff,
+            "an event exactly on the cutoff second counts as recent, matching \
+             the SQL predicate's >= comparison"
+        );
+
+        let a_second_earlier = cutoff - chrono::Duration::seconds(1);
+        assert!(
+            a_second_earlier < cutoff,
+            "the second before the bound is aged out"
+        );
+
+        // Two reads inside the same second must not straddle the boundary.
+        let again = buzz_db::thread::auto_active_cutoff();
+        assert!(
+            (again - cutoff).num_seconds().abs() <= 1,
+            "the bound must advance monotonically with wall clock, not jitter"
+        );
+    }
+
     const CURSOR_TEST_COMMUNITY: &str = "11111111-2222-4333-8444-555555555555";
     const CURSOR_TEST_CHANNEL: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
 

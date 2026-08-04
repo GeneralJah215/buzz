@@ -143,6 +143,26 @@ pub struct ThreadDirectoryPage {
     pub next_cursor: Option<ThreadDirectoryCursor>,
 }
 
+/// Age at which a thread with no override and no pin leaves the active
+/// directory.
+pub const AUTO_ACTIVE_DAYS: i64 = 30;
+
+/// The auto-active aging bound, floored to a whole Unix second.
+///
+/// **Call this from every path that decides directory membership.** The SQL
+/// query and the relay's live 39007 fan-out both apply this predicate, and they
+/// have to agree exactly or a root on the boundary is judged present by one and
+/// absent by the other. They drifted once already (BUG-013) because the
+/// arithmetic was written out twice, so it lives here instead.
+///
+/// Flooring is load-bearing in its own right: the cursor wire format carries a
+/// Unix second, so a sub-second bound would shift between pages (BUG-008).
+pub fn auto_active_cutoff() -> DateTime<Utc> {
+    let bound = Utc::now() - chrono::Duration::days(AUTO_ACTIVE_DAYS);
+    DateTime::from_timestamp(bound.timestamp(), 0)
+        .expect("a Utc::now()-derived timestamp is always representable")
+}
+
 /// Reduced latest non-deleted shared state for one directory root.
 #[derive(Debug, Clone)]
 pub struct ThreadDirectoryStateRecord {
@@ -695,25 +715,13 @@ pub async fn get_thread_directory(
     cursor: Option<ThreadDirectoryCursor>,
 ) -> Result<ThreadDirectoryPage> {
     const STATE_KIND: i32 = buzz_core::kind::KIND_THREAD_DIRECTORY_STATE as i32;
-    const AUTO_ACTIVE_DAYS: i64 = 30;
 
     // Pin the aging bound once and carry it in the cursor. See
     // `ThreadDirectoryCursor::activity_cutoff` for why this must not be
-    // recomputed per page.
-    //
-    // Truncated to whole seconds *before* the first bind, because the cursor
-    // wire format carries a Unix second. Binding sub-second precision on page 1
-    // and a truncated value on page 2 would move the cutoff backwards between
-    // pages, so a row inside that sub-second sliver would be filtered out of
-    // page 1 and admitted on page 2 -- reintroducing the boundary
-    // inconsistency this pin exists to remove.
+    // recomputed per page, and `auto_active_cutoff` for why it is floored.
     let activity_cutoff = match cursor.as_ref() {
         Some(cursor) => cursor.activity_cutoff,
-        None => {
-            let bound = Utc::now() - chrono::Duration::days(AUTO_ACTIVE_DAYS);
-            DateTime::from_timestamp(bound.timestamp(), 0)
-                .expect("a Utc::now()-derived timestamp is always representable")
-        }
+        None => auto_active_cutoff(),
     };
 
     let mut qb = QueryBuilder::<Postgres>::new(
