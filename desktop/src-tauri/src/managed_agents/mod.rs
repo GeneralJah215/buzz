@@ -8,6 +8,7 @@ pub(crate) use agent_env::{
 };
 mod backend;
 pub(crate) mod config_bridge;
+pub(crate) mod control_token;
 pub(crate) mod custom_harnesses;
 mod discovery;
 pub(crate) mod effective_config;
