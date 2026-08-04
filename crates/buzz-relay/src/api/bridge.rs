@@ -385,6 +385,14 @@ const BRIDGE_DIRECTORY_MAX_LIMIT: u32 = 100;
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ThreadDirectoryCursorWire {
+    /// Format version. Bump to invalidate every outstanding cursor at once.
+    v: u8,
+    /// Community the cursor was minted for (UUID string).
+    c: String,
+    /// Channel the cursor was minted for (UUID string).
+    h: String,
+    /// Directory partition the cursor was minted for: `active` or `archived`.
+    s: String,
     pinned: bool,
     activity_at: i64,
     root_id: String,
@@ -393,69 +401,136 @@ struct ThreadDirectoryCursorWire {
     activity_cutoff: i64,
 }
 
+/// Current directory-cursor format version.
+const DIRECTORY_CURSOR_VERSION: u8 = 1;
+
+/// Longest cursor we will even look at, before any parsing work happens.
+/// A real cursor is ~250 bytes.
+const MAX_DIRECTORY_CURSOR_LEN: usize = 2048;
+
+/// Domain-separation label mixed into the cursor HMAC key derivation, so this
+/// use cannot be confused with the invite-code MAC built on the same keypair.
+const DIRECTORY_CURSOR_KEY_LABEL: &[u8] = b"buzz-thread-directory-cursor-v1";
+
+/// Derive the directory-cursor HMAC key from the relay's signing secret.
+///
+/// Mirrors `invite_token::derive_invite_key`: `sha256(secret || label)`.
+fn derive_directory_cursor_key(relay_keys: &nostr::Keys) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(relay_keys.secret_key().as_secret_bytes());
+    hasher.update(DIRECTORY_CURSOR_KEY_LABEL);
+    hasher.finalize().into()
+}
+
+/// Scope a cursor is bound to. A cursor minted for one scope must not be
+/// accepted in another, even when the caller can read both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectoryCursorScope<'a> {
+    pub community: uuid::Uuid,
+    pub channel: uuid::Uuid,
+    pub state: &'a str,
+}
+
+/// Mint an opaque, integrity-protected, scope-bound directory cursor.
+///
+/// The cursor carries `activity_cutoff`, which is a **filter predicate**, not
+/// just an ordering position: a caller who could edit it could widen the
+/// 30-day active window to anything and pull the whole channel's thread
+/// history into the "active" directory. That is why this is signed rather than
+/// merely opaque (BUG-011).
 fn encode_thread_directory_cursor(
+    key: &[u8; 32],
+    scope: DirectoryCursorScope<'_>,
     cursor: &buzz_db::thread::ThreadDirectoryCursor,
 ) -> Result<String, (StatusCode, Json<Value>)> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use hmac::{Hmac, KeyInit, Mac};
 
     let wire = ThreadDirectoryCursorWire {
+        v: DIRECTORY_CURSOR_VERSION,
+        c: scope.community.to_string(),
+        h: scope.channel.to_string(),
+        s: scope.state.to_string(),
         pinned: cursor.pinned,
         activity_at: cursor.activity_at.timestamp(),
         root_id: hex::encode(&cursor.root_event_id),
         activity_cutoff: cursor.activity_cutoff.timestamp(),
     };
-    let bytes = serde_json::to_vec(&wire)
+    let payload = serde_json::to_vec(&wire)
         .map_err(|error| internal_error(&format!("directory cursor encode: {error}")))?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
+
+    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key)
+        .expect("HMAC accepts any key size");
+    mac.update(&payload);
+    let tag = mac.finalize().into_bytes();
+
+    Ok(format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(&payload),
+        URL_SAFE_NO_PAD.encode(tag)
+    ))
 }
 
+/// Verify and open a directory cursor presented for `scope`.
+///
+/// Order matters, mirroring `invite_token::verify_invite`: the MAC is checked
+/// before anything inside the payload is trusted, and every failure returns the
+/// same coarse 400 so the endpoint is not an oracle for forging cursors.
+///
+/// A cursor minted for another community, channel, or partition is rejected
+/// even when the caller can legitimately read that other scope; the keyset
+/// position it carries is meaningless there and would silently produce a wrong
+/// page (BUG-011).
 fn decode_thread_directory_cursor(
+    key: &[u8; 32],
+    scope: DirectoryCursorScope<'_>,
     value: &str,
 ) -> Result<buzz_db::thread::ThreadDirectoryCursor, (StatusCode, Json<Value>)> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use hmac::{Hmac, KeyInit, Mac};
 
-    if value.is_empty() || value.len() > 2048 {
-        return Err(api_error(
+    let reject = || {
+        api_error(
             StatusCode::BAD_REQUEST,
             "thread_index: malformed directory_cursor",
-        ));
+        )
+    };
+
+    if value.is_empty() || value.len() > MAX_DIRECTORY_CURSOR_LEN {
+        return Err(reject());
     }
-    let bytes = URL_SAFE_NO_PAD.decode(value).map_err(|_| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "thread_index: malformed directory_cursor",
-        )
-    })?;
-    let wire: ThreadDirectoryCursorWire = serde_json::from_slice(&bytes).map_err(|_| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "thread_index: malformed directory_cursor",
-        )
-    })?;
-    let activity_at = chrono::DateTime::from_timestamp(wire.activity_at, 0).ok_or_else(|| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "thread_index: malformed directory_cursor",
-        )
-    })?;
+    let (payload_b64, mac_b64) = value.split_once('.').ok_or_else(reject)?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).map_err(|_| reject())?;
+    let tag = URL_SAFE_NO_PAD.decode(mac_b64).map_err(|_| reject())?;
+
+    // Constant-time MAC verification before trusting any field in the payload.
+    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key)
+        .expect("HMAC accepts any key size");
+    mac.update(&payload);
+    mac.verify_slice(&tag).map_err(|_| reject())?;
+
+    let wire: ThreadDirectoryCursorWire =
+        serde_json::from_slice(&payload).map_err(|_| reject())?;
+
+    if wire.v != DIRECTORY_CURSOR_VERSION {
+        return Err(reject());
+    }
+    // Scope binding. A valid MAC only proves this relay minted it, not that it
+    // was minted for the page being asked for.
+    if wire.c != scope.community.to_string()
+        || wire.h != scope.channel.to_string()
+        || wire.s != scope.state
+    {
+        return Err(reject());
+    }
+
+    let activity_at = chrono::DateTime::from_timestamp(wire.activity_at, 0).ok_or_else(reject)?;
     let activity_cutoff =
-        chrono::DateTime::from_timestamp(wire.activity_cutoff, 0).ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "thread_index: malformed directory_cursor",
-            )
-        })?;
-    let root_event_id = hex::decode(wire.root_id).map_err(|_| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "thread_index: malformed directory_cursor",
-        )
-    })?;
+        chrono::DateTime::from_timestamp(wire.activity_cutoff, 0).ok_or_else(reject)?;
+    let root_event_id = hex::decode(wire.root_id).map_err(|_| reject())?;
     if root_event_id.len() != 32 {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "thread_index: malformed directory_cursor",
-        ));
+        return Err(reject());
     }
     Ok(buzz_db::thread::ThreadDirectoryCursor {
         pinned: wire.pinned,
@@ -569,8 +644,14 @@ async fn handle_thread_directory_filter(
             ));
         }
     };
+    let cursor_key = derive_directory_cursor_key(&state.relay_keypair);
+    let cursor_scope = DirectoryCursorScope {
+        community: *tenant.community().as_uuid(),
+        channel: channel_id,
+        state: state_name,
+    };
     let cursor = request_cursor
-        .map(decode_thread_directory_cursor)
+        .map(|value| decode_thread_directory_cursor(&cursor_key, cursor_scope, value))
         .transpose()?;
     let limit = filter
         .limit
@@ -657,7 +738,7 @@ async fn handle_thread_directory_filter(
     let next_cursor = page
         .next_cursor
         .as_ref()
-        .map(encode_thread_directory_cursor)
+        .map(|cursor| encode_thread_directory_cursor(&cursor_key, cursor_scope, cursor))
         .transpose()?;
     if page.has_more != next_cursor.is_some() {
         return Err(internal_error("directory cursor invariant violated"));
@@ -4106,8 +4187,10 @@ mod tests {
             activity_cutoff: cutoff,
         };
 
-        let encoded = encode_thread_directory_cursor(&original).expect("encode");
-        let decoded = decode_thread_directory_cursor(&encoded).expect("decode");
+        let key = test_cursor_key();
+        let scope = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "active");
+        let encoded = encode_thread_directory_cursor(&key, scope, &original).expect("encode");
+        let decoded = decode_thread_directory_cursor(&key, scope, &encoded).expect("decode");
 
         assert_eq!(
             decoded, original,
@@ -4147,8 +4230,12 @@ mod tests {
             root_event_id: vec![3u8; 32],
             activity_cutoff: sub_second,
         };
+        let key = test_cursor_key();
+        let scope = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "active");
         let decoded = decode_thread_directory_cursor(
-            &encode_thread_directory_cursor(&cursor).expect("encode"),
+            &key,
+            scope,
+            &encode_thread_directory_cursor(&key, scope, &cursor).expect("encode"),
         )
         .expect("decode");
 
@@ -4169,29 +4256,188 @@ mod tests {
     /// rather than a panic or a silent default. Spec line 204.
     #[test]
     fn directory_cursor_rejects_malformed_input() {
-        for bad in ["", "!!!not-base64!!!", "YWJj"] {
-            let result = decode_thread_directory_cursor(bad);
+        let key = test_cursor_key();
+        let scope = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "active");
+
+        for bad in ["", "!!!not-base64!!!", "YWJj", "no-dot-separator", "a.b"] {
             assert!(
-                result.is_err(),
+                decode_thread_directory_cursor(&key, scope, bad).is_err(),
                 "malformed cursor {bad:?} must be rejected, not defaulted"
             );
         }
 
-        // Structurally valid base64+JSON, but the root id is the wrong length.
-        let short_root = {
-            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-            use base64::Engine as _;
-            let wire = serde_json::json!({
+        // Correctly signed, but the root id is the wrong length.
+        let short_root = sign_test_cursor(
+            &key,
+            serde_json::json!({
+                "v": DIRECTORY_CURSOR_VERSION,
+                "c": CURSOR_TEST_COMMUNITY,
+                "h": CURSOR_TEST_CHANNEL,
+                "s": "active",
                 "pinned": false,
                 "activity_at": 1_700_000_000i64,
                 "root_id": "aabb",
                 "activity_cutoff": 1_700_000_000i64,
-            });
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wire).expect("serialize"))
-        };
-        assert!(
-            decode_thread_directory_cursor(&short_root).is_err(),
-            "a root id that is not 32 bytes must be rejected"
+            }),
         );
+        assert!(
+            decode_thread_directory_cursor(&key, scope, &short_root).is_err(),
+            "a root id that is not 32 bytes must be rejected even when signed"
+        );
+    }
+
+    /// BUG-011. `activity_cutoff` is a **filter predicate**, not just an
+    /// ordering position: a caller who can edit it can widen the 30-day active
+    /// window to anything and pull a whole channel's thread history into the
+    /// active directory. Editing any signed field must fail the MAC.
+    #[test]
+    fn directory_cursor_rejects_a_tampered_payload() {
+        let key = test_cursor_key();
+        let scope = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "active");
+        let cursor = test_cursor();
+
+        let encoded = encode_thread_directory_cursor(&key, scope, &cursor).expect("encode");
+        let (payload_b64, mac_b64) = encoded.split_once('.').expect("cursor is payload.mac");
+
+        // Re-encode the payload with the aging bound pushed back to the epoch,
+        // keeping the original MAC. This is the actual attack.
+        let widened = {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use base64::Engine as _;
+            let mut wire: serde_json::Value =
+                serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload_b64).expect("decode"))
+                    .expect("payload is json");
+            wire["activity_cutoff"] = serde_json::json!(0i64);
+            format!(
+                "{}.{}",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wire).expect("serialize")),
+                mac_b64
+            )
+        };
+
+        assert!(
+            decode_thread_directory_cursor(&key, scope, &widened).is_err(),
+            "widening activity_cutoff must fail the MAC; if this passes, any \
+             caller can defeat the 30-day active window"
+        );
+
+        // A MAC from a different relay key must not verify either.
+        let foreign = encode_thread_directory_cursor(&[9u8; 32], scope, &cursor).expect("encode");
+        assert!(
+            decode_thread_directory_cursor(&key, scope, &foreign).is_err(),
+            "a cursor signed with another key must be rejected"
+        );
+    }
+
+    /// BUG-011. A valid MAC proves this relay minted the cursor, not that it
+    /// minted it for the page being requested. Replaying a cursor into another
+    /// channel or the other partition carries a keyset position that means
+    /// nothing there and would silently produce a wrong page.
+    #[test]
+    fn directory_cursor_rejects_cross_scope_replay() {
+        let key = test_cursor_key();
+        let minted_for = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "active");
+        let encoded =
+            encode_thread_directory_cursor(&key, minted_for, &test_cursor()).expect("encode");
+
+        let other_channel = test_scope(
+            CURSOR_TEST_COMMUNITY,
+            "9f8e7d6c-5b4a-4938-8271-615043f2e1d0",
+            "active",
+        );
+        let other_community = test_scope(
+            "0d1c2b3a-4958-4677-8695-a4b3c2d1e0f9",
+            CURSOR_TEST_CHANNEL,
+            "active",
+        );
+        let other_state = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "archived");
+
+        for (label, scope) in [
+            ("another channel", other_channel),
+            ("another community", other_community),
+            ("the archived partition", other_state),
+        ] {
+            assert!(
+                decode_thread_directory_cursor(&key, scope, &encoded).is_err(),
+                "a cursor minted for the active directory of one channel must \
+                 not be accepted in {label}"
+            );
+        }
+
+        // Sanity: it still works in the scope it was actually minted for, so
+        // the assertions above are rejecting on scope and not on something else.
+        assert!(
+            decode_thread_directory_cursor(&key, minted_for, &encoded).is_ok(),
+            "the cursor must still open in its own scope"
+        );
+    }
+
+    /// A version bump has to invalidate every outstanding cursor, otherwise the
+    /// field cannot be used to retire a broken format.
+    #[test]
+    fn directory_cursor_rejects_an_unknown_version() {
+        let key = test_cursor_key();
+        let scope = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "active");
+        let future = sign_test_cursor(
+            &key,
+            serde_json::json!({
+                "v": DIRECTORY_CURSOR_VERSION + 1,
+                "c": CURSOR_TEST_COMMUNITY,
+                "h": CURSOR_TEST_CHANNEL,
+                "s": "active",
+                "pinned": false,
+                "activity_at": 1_700_000_000i64,
+                "root_id": hex::encode([4u8; 32]),
+                "activity_cutoff": 1_700_000_000i64,
+            }),
+        );
+        assert!(
+            decode_thread_directory_cursor(&key, scope, &future).is_err(),
+            "a correctly signed cursor from an unknown version must be rejected"
+        );
+    }
+
+    const CURSOR_TEST_COMMUNITY: &str = "11111111-2222-4333-8444-555555555555";
+    const CURSOR_TEST_CHANNEL: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+
+    fn test_cursor_key() -> [u8; 32] {
+        [1u8; 32]
+    }
+
+    fn test_scope<'a>(community: &str, channel: &str, state: &'a str) -> DirectoryCursorScope<'a> {
+        DirectoryCursorScope {
+            community: community.parse().expect("valid community uuid"),
+            channel: channel.parse().expect("valid channel uuid"),
+            state,
+        }
+    }
+
+    fn test_cursor() -> buzz_db::thread::ThreadDirectoryCursor {
+        buzz_db::thread::ThreadDirectoryCursor {
+            pinned: false,
+            activity_at: chrono::DateTime::from_timestamp(1_800_000_000, 0)
+                .expect("valid activity"),
+            root_event_id: vec![4u8; 32],
+            activity_cutoff: chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .expect("valid cutoff"),
+        }
+    }
+
+    /// Sign an arbitrary payload the way the encoder would, so tests can build
+    /// shapes the encoder itself would never produce.
+    fn sign_test_cursor(key: &[u8; 32], wire: serde_json::Value) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        use hmac::{Hmac, KeyInit, Mac};
+
+        let payload = serde_json::to_vec(&wire).expect("serialize");
+        let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key)
+            .expect("HMAC accepts any key size");
+        mac.update(&payload);
+        format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(&payload),
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        )
     }
 }
