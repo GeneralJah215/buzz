@@ -32,8 +32,9 @@ use buzz_core::kind::{
     KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
     KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED,
     KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEAM_CATALOG, KIND_TEXT_NOTE,
-    KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER,
-    RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
+    KIND_THREAD_DIRECTORY_STATE, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+    RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER,
+    RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
@@ -253,6 +254,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_STREAM_MESSAGE_SCHEDULED
         | KIND_STREAM_REMINDER
         | KIND_STREAM_MESSAGE_DIFF
+        | KIND_THREAD_DIRECTORY_STATE
         | KIND_FORUM_POST
         | KIND_FORUM_VOTE
         | KIND_FORUM_COMMENT => Ok(Scope::MessagesWrite),
@@ -485,6 +487,7 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_STREAM_MESSAGE_SCHEDULED
             | KIND_STREAM_REMINDER
             | KIND_STREAM_MESSAGE_DIFF
+            | KIND_THREAD_DIRECTORY_STATE
             | KIND_CANVAS
             | KIND_FORUM_POST
             | KIND_FORUM_VOTE
@@ -860,6 +863,169 @@ async fn validate_edit_ownership(
         }
     }
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+struct RequiredNullableTitle(Option<String>);
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadDirectoryStateContent {
+    title: RequiredNullableTitle,
+    pinned: bool,
+    archived: bool,
+}
+
+/// Validate the complete kind:40009 envelope and its channel authority before
+/// the event can enter durable storage.
+/// Channel and root a stored `kind:40009` addresses, read back off the event.
+///
+/// Only meaningful for events that already passed
+/// [`validate_thread_directory_state`], which is what guarantees exactly one
+/// `h` tag and one root-marked `e` tag. This is a read-back for the directory
+/// fan-out (the state event names the root whose sidebar row just changed), not
+/// a second validation pass, so it returns `None` rather than a reason on any
+/// shape it does not recognise.
+pub(crate) fn thread_directory_state_target(event: &Event) -> Option<(Uuid, Vec<u8>)> {
+    let mut channel_id = None;
+    let mut root_id = None;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        match parts.first().map(|part| part.as_str()) {
+            Some("h") if parts.len() == 2 && channel_id.is_none() => {
+                channel_id = parts[1].parse::<Uuid>().ok();
+            }
+            Some("e")
+                if parts.len() == 4
+                    && parts[2].is_empty()
+                    && parts[3] == "root"
+                    && root_id.is_none() =>
+            {
+                root_id = hex::decode(parts[1].as_str())
+                    .ok()
+                    .filter(|decoded| decoded.len() == 32);
+            }
+            _ => {}
+        }
+    }
+    Some((channel_id?, root_id?))
+}
+
+async fn validate_thread_directory_state(
+    community_id: CommunityId,
+    event: &Event,
+    state: &AppState,
+) -> Result<(), String> {
+    let mut channel_id = None;
+    let mut root_id = None;
+
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        match parts.first().map(|part| part.as_str()) {
+            Some("h") if parts.len() == 2 && channel_id.is_none() => {
+                channel_id = Some(
+                    parts[1]
+                        .parse::<Uuid>()
+                        .map_err(|_| "thread directory state has an invalid h tag".to_string())?,
+                );
+            }
+            Some("e")
+                if parts.len() == 4
+                    && parts[2].is_empty()
+                    && parts[3] == "root"
+                    && root_id.is_none() =>
+            {
+                let decoded = hex::decode(parts[1].as_str())
+                    .map_err(|_| "thread directory state has an invalid root e tag".to_string())?;
+                if decoded.len() != 32 {
+                    return Err("thread directory state has an invalid root e tag".to_string());
+                }
+                root_id = Some(decoded);
+            }
+            _ => {
+                return Err(
+                    "thread directory state must contain exactly one h tag and one root e tag"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    let channel_id = channel_id.ok_or_else(|| {
+        "thread directory state must contain exactly one h tag and one root e tag".to_string()
+    })?;
+    let root_id = root_id.ok_or_else(|| {
+        "thread directory state must contain exactly one h tag and one root e tag".to_string()
+    })?;
+
+    let content: ThreadDirectoryStateContent = serde_json::from_str(&event.content)
+        .map_err(|error| format!("invalid thread directory state content: {error}"))?;
+    if content.pinned && content.archived {
+        return Err("thread directory state cannot be both pinned and archived".to_string());
+    }
+    if let Some(title) = content.title.0.as_deref() {
+        if title != title.trim()
+            || title.is_empty()
+            || title.chars().count() > 120
+            || title
+                .chars()
+                .any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}'))
+        {
+            return Err(
+                "thread directory title must be a trimmed single-line 1-120 character string"
+                    .to_string(),
+            );
+        }
+    }
+
+    let root = state
+        .db
+        .get_event_by_id(community_id, &root_id)
+        .await
+        .map_err(|error| format!("db error looking up thread root: {error}"))?
+        .ok_or_else(|| "thread directory root not found".to_string())?;
+    if root.channel_id != Some(channel_id) {
+        return Err("thread directory root belongs to a different channel".to_string());
+    }
+    let metadata = state
+        .db
+        .get_thread_metadata_by_event(community_id, &root_id)
+        .await
+        .map_err(|error| format!("db error looking up thread root metadata: {error}"))?
+        .ok_or_else(|| "thread directory target is not a thread root".to_string())?;
+    if metadata.channel_id != channel_id || metadata.depth != 0 {
+        return Err("thread directory target is not a depth-zero root".to_string());
+    }
+    if metadata.descendant_count < 1 {
+        return Err("thread directory root has no descendants".to_string());
+    }
+
+    let actor = event.pubkey.to_bytes().to_vec();
+    let role = state
+        .db
+        .get_member_role(community_id, channel_id, &actor)
+        .await
+        .map_err(|error| format!("db error checking channel role: {error}"))?
+        .ok_or_else(|| "restricted: actor is not an active channel member".to_string())?;
+    if matches!(role.as_str(), "owner" | "admin") {
+        return Ok(());
+    }
+
+    let author = effective_message_author(&root.event, &state.relay_keypair.public_key());
+    if author == actor {
+        return Ok(());
+    }
+    let owns_author = state
+        .db
+        .is_agent_owner(community_id, &author, &actor)
+        .await
+        .map_err(|error| format!("db error checking agent ownership: {error}"))?;
+    if owns_author {
+        Ok(())
+    } else {
+        Err("restricted: actor cannot manage this thread directory state".to_string())
+    }
 }
 
 /// Validate kind:45002 vote targets a forum post (45001) or comment (45003).
@@ -2348,6 +2514,12 @@ async fn ingest_event_inner(
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
+    if kind_u32 == KIND_THREAD_DIRECTORY_STATE {
+        validate_thread_directory_state(tenant.community(), &event, state)
+            .await
+            .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+    }
+
     if kind_u32 == KIND_FORUM_VOTE {
         validate_forum_vote_target(tenant.community(), &event, state)
             .await
@@ -2612,17 +2784,18 @@ async fn ingest_event_inner(
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
-    let thread_meta = if requires_h_channel_scope(kind_u32) {
-        if let Some(ch_id) = channel_id {
-            resolve_nip10_thread_meta(tenant.community(), &event, ch_id, state)
-                .await
-                .map_err(|msg| IngestError::Rejected(format!("invalid: {msg}")))?
+    let thread_meta =
+        if requires_h_channel_scope(kind_u32) && kind_u32 != KIND_THREAD_DIRECTORY_STATE {
+            if let Some(ch_id) = channel_id {
+                resolve_nip10_thread_meta(tenant.community(), &event, ch_id, state)
+                    .await
+                    .map_err(|msg| IngestError::Rejected(format!("invalid: {msg}")))?
+            } else {
+                None
+            }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
     // Pre-validate kind:0 content before storage so we don't store an event
     // whose profile sync will silently fail in the side-effect handler.
@@ -2852,6 +3025,28 @@ async fn ingest_event_inner(
             meta.channel_id,
             meta.root_event_id.clone(),
         );
+        // Same insert changed the root's directory row: the descendant count
+        // moved, and it may have just crossed the three-descendant threshold
+        // into active membership. Spec line 171, reply-insert trigger.
+        crate::handlers::side_effects::emit_live_thread_directory_item(
+            tenant,
+            state,
+            meta.channel_id,
+            meta.root_event_id.clone(),
+        );
+    }
+
+    // Metadata-update trigger, spec line 171. A stored kind:40009 changes the
+    // title, pin, or archive state of the root it names. It carries no thread
+    // metadata by design (it is excluded from `resolve_nip10_thread_meta` so it
+    // cannot move reply counters), so the block above never sees it and the
+    // target has to be read back off the event's own tags.
+    if kind_u32 == KIND_THREAD_DIRECTORY_STATE {
+        if let Some((channel_id, root_id)) = thread_directory_state_target(&event) {
+            crate::handlers::side_effects::emit_live_thread_directory_item(
+                tenant, state, channel_id, root_id,
+            );
+        }
     }
 
     let pubkey_hex = auth.pubkey().to_hex();
@@ -3038,6 +3233,7 @@ mod tests {
         for kind in [
             KIND_STREAM_MESSAGE,
             KIND_STREAM_MESSAGE_DIFF,
+            KIND_THREAD_DIRECTORY_STATE,
             KIND_CANVAS,
             KIND_FORUM_POST,
             KIND_FORUM_VOTE,
@@ -3048,6 +3244,88 @@ mod tests {
                 "kind {kind} should require h"
             );
         }
+    }
+
+    #[test]
+    fn thread_directory_state_requires_messages_write() {
+        assert_eq!(
+            required_scope_for_kind(KIND_THREAD_DIRECTORY_STATE, &make_dummy_event()),
+            Ok(Scope::MessagesWrite)
+        );
+        assert!(!is_global_only_kind(KIND_THREAD_DIRECTORY_STATE));
+    }
+
+    /// The directory fan-out reads a stored kind:40009's target back off its own
+    /// tags, because a 40009 is excluded from thread metadata by design and so
+    /// never reaches the reply-driven emit path. If this read-back is wrong the
+    /// sidebar silently stops updating on rename/pin/archive, with nothing
+    /// failing anywhere, so pin the shapes it must and must not accept.
+    #[test]
+    fn thread_directory_state_target_reads_back_the_channel_and_root() {
+        let channel_id = uuid::Uuid::new_v4();
+        let root = [7u8; 32];
+        let root_hex = hex::encode(root);
+
+        let event = make_event_with_tags(
+            KIND_THREAD_DIRECTORY_STATE,
+            r#"{"title":null,"pinned":false,"archived":false}"#,
+            &[
+                &["h", &channel_id.to_string()],
+                &["e", &root_hex, "", "root"],
+            ],
+        );
+        assert_eq!(
+            thread_directory_state_target(&event),
+            Some((channel_id, root.to_vec())),
+            "a well-formed state event must yield its channel and root"
+        );
+
+        // Every shape below is already rejected before storage by
+        // `validate_thread_directory_state`; the read-back must not invent a
+        // target for one anyway if it ever sees it.
+        let missing_h = make_event_with_tags(
+            KIND_THREAD_DIRECTORY_STATE,
+            "{}",
+            &[&["e", &root_hex, "", "root"]],
+        );
+        assert_eq!(thread_directory_state_target(&missing_h), None, "no h tag");
+
+        let missing_root = make_event_with_tags(
+            KIND_THREAD_DIRECTORY_STATE,
+            "{}",
+            &[&["h", &channel_id.to_string()]],
+        );
+        assert_eq!(
+            thread_directory_state_target(&missing_root),
+            None,
+            "no root e tag"
+        );
+
+        // A NIP-10 reply marker is not a root marker.
+        let reply_marker = make_event_with_tags(
+            KIND_THREAD_DIRECTORY_STATE,
+            "{}",
+            &[
+                &["h", &channel_id.to_string()],
+                &["e", &root_hex, "", "reply"],
+            ],
+        );
+        assert_eq!(
+            thread_directory_state_target(&reply_marker),
+            None,
+            "a reply-marked e tag must not be read as the directory root"
+        );
+
+        let short_root = make_event_with_tags(
+            KIND_THREAD_DIRECTORY_STATE,
+            "{}",
+            &[&["h", &channel_id.to_string()], &["e", "aabb", "", "root"]],
+        );
+        assert_eq!(
+            thread_directory_state_target(&short_root),
+            None,
+            "a root id that is not 32 bytes must be rejected"
+        );
     }
 
     #[test]

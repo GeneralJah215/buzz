@@ -12,7 +12,7 @@ use buzz_core::{
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_PROJECT,
-        KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_THREAD_DIRECTORY_STATE, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -235,6 +235,56 @@ pub fn build_message(
     }
     imeta_tags(media_tags, &mut tags)?;
     Ok(EventBuilder::new(Kind::Custom(9), content).tags(tags))
+}
+
+/// Build a full shared thread-directory state snapshot (kind:40009).
+pub fn build_thread_directory_update(
+    channel_id: Uuid,
+    root_event_id: nostr::EventId,
+    title: Option<&str>,
+    pinned: bool,
+    archived: bool,
+) -> Result<EventBuilder, SdkError> {
+    if pinned && archived {
+        return Err(SdkError::InvalidInput(
+            "thread directory state cannot be both pinned and archived".into(),
+        ));
+    }
+    let title = match title {
+        Some(value) => {
+            let value = value.trim();
+            if value.is_empty()
+                || value.chars().count() > 120
+                || value
+                    .chars()
+                    .any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}'))
+            {
+                return Err(SdkError::InvalidInput(
+                    "thread directory title must be a single-line 1-120 character string".into(),
+                ));
+            }
+            Some(value)
+        }
+        None => None,
+    };
+    let root = root_event_id.to_hex();
+    let tags = vec![
+        tag(&["h", &channel_id.to_string()])?,
+        tag(&["e", &root, "", "root"])?,
+    ];
+    #[derive(serde::Serialize)]
+    struct Snapshot<'a> {
+        title: Option<&'a str>,
+        pinned: bool,
+        archived: bool,
+    }
+    let content = serde_json::to_string(&Snapshot {
+        title,
+        pinned,
+        archived,
+    })
+    .map_err(|error| SdkError::InvalidInput(format!("invalid thread directory state: {error}")))?;
+    Ok(EventBuilder::new(Kind::Custom(KIND_THREAD_DIRECTORY_STATE as u16), content).tags(tags))
 }
 
 /// Build an encrypted agent observer frame (kind 24200).
@@ -2246,6 +2296,53 @@ mod tests {
         assert_eq!(ev.kind.as_u16(), 9);
         assert_eq!(ev.content, "hello");
         assert!(has_tag(&ev, "h", &cid.to_string()));
+    }
+
+    #[test]
+    fn thread_directory_update_is_a_canonical_full_snapshot() {
+        let channel_id = uuid();
+        let root_id = event_id();
+        let event = sign(
+            build_thread_directory_update(channel_id, root_id, Some(" Shared title "), true, false)
+                .unwrap(),
+        );
+        assert_eq!(event.kind.as_u16(), KIND_THREAD_DIRECTORY_STATE as u16);
+        assert_eq!(tag_values(&event, "h"), vec![channel_id.to_string()]);
+        let e_tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|tag| tag.as_slice().first().map(|value| value.as_str()) == Some("e"))
+            .collect();
+        assert_eq!(e_tags.len(), 1);
+        assert_eq!(e_tags[0].as_slice(), ["e", &root_id.to_hex(), "", "root"]);
+        assert_eq!(
+            event.content,
+            r#"{"title":"Shared title","pinned":true,"archived":false}"#
+        );
+    }
+
+    #[test]
+    fn thread_directory_update_rejects_invalid_titles_and_state() {
+        let channel_id = uuid();
+        let root_id = event_id();
+        for title in [
+            "",
+            "   ",
+            "line\nline",
+            "line\u{2028}line",
+            "line\u{2029}line",
+        ] {
+            assert!(
+                build_thread_directory_update(channel_id, root_id, Some(title), false, false)
+                    .is_err()
+            );
+        }
+        let overlong = "x".repeat(121);
+        assert!(
+            build_thread_directory_update(channel_id, root_id, Some(&overlong), false, false)
+                .is_err()
+        );
+        assert!(build_thread_directory_update(channel_id, root_id, None, true, true).is_err());
     }
 
     #[test]

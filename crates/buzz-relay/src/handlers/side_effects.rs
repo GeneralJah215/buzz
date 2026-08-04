@@ -11,7 +11,7 @@ use buzz_core::kind::{
     KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED,
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS,
     KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION,
-    KIND_THREAD_SUMMARY,
+    KIND_THREAD_DIRECTORY_ITEM, KIND_THREAD_DIRECTORY_STATE, KIND_THREAD_SUMMARY,
 };
 use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
@@ -892,6 +892,246 @@ pub fn emit_live_thread_summary(
     });
 }
 
+/// Sign and fan out a fresh relay-signed `kind:39007` thread-directory item
+/// overlay for `root_id` after a change that alters how the root appears in the
+/// sidebar directory.
+///
+/// Fan-out only — never stored, exactly like [`emit_live_thread_summary`]. The
+/// directory query in `api/bridge.rs` recomputes every item on each fetch, so a
+/// persisted copy would only add staleness. This live emit exists so a
+/// subscribed sidebar updates without refetching, and the spec explicitly calls
+/// a failed fan-out recoverable for that reason.
+///
+/// Tags match the query-path overlay in `api/bridge.rs`, and the generated
+/// title comes from the shared [`crate::api::bridge::generated_thread_title`]
+/// rather than a second copy. The content is **not** byte-identical: only this
+/// path emits the optional `present` field, because only this path can observe
+/// a root leaving the directory. Membership itself is decided with the shared
+/// [`buzz_db::thread::auto_active_cutoff`], so the two paths cannot disagree on
+/// the boundary.
+///
+/// **This is called on root deletion,** and that case is not symmetric with the
+/// 39005 summary next door: a depth-0 root has `thread_metadata.root_event_id =
+/// NULL`, so the callers fall back to the deletion target itself. The helper
+/// then reports the root absent via `present: false` rather than going silent,
+/// which is what stops a deleted thread from being merged back into a live
+/// sidebar.
+///
+/// Spawned: runs after the triggering write committed and must not add latency
+/// to the ingest acknowledgement.
+pub fn emit_live_thread_directory_item(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    root_id: Vec<u8>,
+) {
+    let tenant = tenant.clone();
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let root_hex = hex::encode(&root_id);
+
+        // The root supplies author, timestamp, and the fallback title. A
+        // soft-deleted root still has to be described, because the removal
+        // signal itself is a 39007 carrying `present: false` with best-effort
+        // last-known fields, so fall back to the including-deleted read rather
+        // than going silent. `StoredEvent` carries no `deleted_at`, so the
+        // difference between the two reads *is* the deletion signal.
+        let live = match state.db.get_event_by_id(tenant.community(), &root_id).await {
+            Ok(live) => live,
+            Err(e) => {
+                warn!(root = %root_hex, "live directory item root lookup failed: {e}");
+                return;
+            }
+        };
+        let root_deleted = live.is_none();
+        let root = match live {
+            Some(root) => root,
+            None => match state
+                .db
+                .get_event_by_id_including_deleted(tenant.community(), &root_id)
+                .await
+            {
+                Ok(Some(root)) => root,
+                // Never existed here: nothing to describe, not even a removal.
+                Ok(None) => return,
+                Err(e) => {
+                    warn!(root = %root_hex, "live directory item deleted-root lookup failed: {e}");
+                    return;
+                }
+            },
+        };
+        if root.channel_id != Some(channel_id) {
+            return;
+        }
+
+        // A root whose thread row is gone has no replies left to count. Zeroed
+        // counts are the correct last-known values for the removal overlay.
+        let summary = match state
+            .db
+            .get_thread_summary(tenant.community(), &root_id)
+            .await
+        {
+            Ok(summary) => summary,
+            Err(e) => {
+                warn!(root = %root_hex, "live directory item summary lookup failed: {e}");
+                return;
+            }
+        };
+        let (reply_count, descendant_count, last_reply_at, participants) = match &summary {
+            Some(summary) => (
+                summary.reply_count,
+                summary.descendant_count,
+                summary.last_reply_at,
+                summary.participants.clone(),
+            ),
+            None => (0, 0, None, Vec::new()),
+        };
+
+        // Reduced shared state: newest non-deleted authorized kind:40009.
+        // Absent is normal and means "no override, not pinned, not archived".
+        let shared = match state
+            .db
+            .get_latest_thread_directory_state(tenant.community(), channel_id, &root_id)
+            .await
+        {
+            Ok(shared) => shared,
+            Err(e) => {
+                warn!(root = %root_hex, "live directory item state lookup failed: {e}");
+                return;
+            }
+        };
+        let (title_override, pinned, archived, state_created_at, state_event_id) = match &shared {
+            Some(record) => {
+                let parsed: serde_json::Value = match serde_json::from_str(&record.content) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        warn!(root = %root_hex, "live directory item state parse failed: {e}");
+                        return;
+                    }
+                };
+                (
+                    parsed
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    parsed
+                        .get("pinned")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    parsed
+                        .get("archived")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    record.created_at.timestamp(),
+                    Some(hex::encode(&record.event_id)),
+                )
+            }
+            None => (None, false, false, 0, None),
+        };
+
+        let title = title_override
+            .clone()
+            .unwrap_or_else(|| crate::api::bridge::generated_thread_title(&root.event.content));
+        let root_author = crate::handlers::ingest::effective_message_author(
+            &root.event,
+            &state.relay_keypair.public_key(),
+        );
+
+        // Directory membership, mirroring the SQL predicates in
+        // `get_thread_directory`: archived membership is `archived = true`;
+        // active membership additionally requires an override, a pin, or three
+        // descendants with recent activity. Outside both is `present: false`.
+        //
+        // Aging out is deliberately not swept on a timer (Cody's ruling); this
+        // only ever evaluates on a real trigger, and a trigger that finds a
+        // root already aged out correctly reports it as absent.
+        //
+        // The bound comes from `buzz_db::thread::auto_active_cutoff` rather
+        // than being recomputed here. Writing the arithmetic out a second time
+        // is exactly how this path drifted from the SQL one before (BUG-013):
+        // the query floors to a whole second and this did not, so a root on the
+        // boundary was live-absent and query-present at the same moment.
+        let activity_at = last_reply_at.or_else(|| {
+            chrono::DateTime::from_timestamp(root.event.created_at.as_secs() as i64, 0)
+        });
+        let cutoff = buzz_db::thread::auto_active_cutoff();
+        let recently_active = activity_at.is_some_and(|activity_at| activity_at >= cutoff);
+        let qualifies_active = title_override.is_some()
+            || pinned
+            || (descendant_count >= 3 && recently_active);
+        let present = !root_deleted
+            && descendant_count > 0
+            && (archived || qualifies_active);
+
+        let content = serde_json::json!({
+            "title": title,
+            "title_override": title_override,
+            "root_author": hex::encode(root_author),
+            "root_created_at": root.event.created_at.as_secs(),
+            "reply_count": reply_count,
+            "descendant_count": descendant_count,
+            "last_reply_at": last_reply_at.map(|t| t.timestamp()).unwrap_or(0),
+            "participants": participants.iter().map(hex::encode).collect::<Vec<_>>(),
+            "pinned": pinned,
+            "archived": archived,
+            "present": present,
+            "state_created_at": state_created_at,
+            "state_event_id": state_event_id,
+        });
+
+        let tags = [
+            Tag::parse(["e", &root_hex]),
+            Tag::parse(["d", &root_hex]),
+            Tag::parse(["h", &channel_id.to_string()]),
+        ];
+        let mut parsed = Vec::with_capacity(tags.len());
+        for tag in tags {
+            match tag {
+                Ok(tag) => parsed.push(tag),
+                Err(e) => {
+                    warn!(root = %root_hex, "live directory item tag failed: {e}");
+                    return;
+                }
+            }
+        }
+
+        let event = match EventBuilder::new(
+            Kind::Custom(KIND_THREAD_DIRECTORY_ITEM as u16),
+            content.to_string(),
+        )
+        .tags(parsed)
+        .sign_with_keys(&state.relay_keypair)
+        {
+            Ok(event) => event,
+            Err(e) => {
+                warn!(root = %root_hex, "live directory item sign failed: {e}");
+                return;
+            }
+        };
+
+        // Redis before local fan-out so subscribers on other relay pods receive
+        // it too, matching `emit_live_thread_summary`.
+        state.mark_local_event(tenant.community(), &event.id);
+        if let Err(e) = state
+            .pubsub
+            .publish_event(&tenant, EventTopic::Channel(channel_id), &event)
+            .await
+        {
+            state
+                .local_event_ids
+                .invalidate(&(tenant.community(), event.id.to_bytes()));
+            warn!(root = %root_hex, "live directory item Redis publish failed: {e}");
+        }
+        let stored = StoredEvent::new(event, Some(channel_id));
+        crate::handlers::event::fan_out_event_to_local_subscribers(
+            &state,
+            tenant.community(),
+            &stored,
+        )
+        .await;
+    });
+}
+
 /// Emit a relay-signed membership notification event stored globally (channel_id = None).
 ///
 /// kind:44100 = member added, kind:44101 = member removed.
@@ -1733,8 +1973,44 @@ async fn handle_delete_event_side_effect(
 
     // Thread counters were decremented in the same transaction — push a fresh
     // relay-signed 39005 so live badge counts also count *down*.
-    if let Some(root_id) = root_id {
+    if let Some(root_id) = root_id.clone() {
         emit_live_thread_summary(tenant, state, channel_id, root_id);
+    }
+
+    // Directory fan-out, spec lines 171-173. Two distinct cases, and the 39005
+    // guard above only covers the first:
+    //   - a reply was deleted -> its root's row changed, and dropping below
+    //     three descendants disqualifies it (`present: false`).
+    //   - the *root itself* was deleted -> `thread_metadata.root_event_id` is
+    //     NULL for a root, so `root_id` is None here and the 39005 emit above
+    //     is skipped entirely. The directory still has to hear about it, so
+    //     address the target directly and let the helper report it absent.
+    let directory_root = root_id.or_else(|| {
+        meta.as_ref()
+            .filter(|meta| meta.depth == 0)
+            .map(|_| target_id.clone())
+    });
+    if let Some(directory_root) = directory_root {
+        emit_live_thread_directory_item(tenant, state, channel_id, directory_root);
+    }
+
+    // Metadata-event-deletion trigger, spec line 171. Deleting a kind:40009
+    // exposes the next-newest state for that root (or none at all), so the row
+    // has to be recomputed. The deleted event names its own target.
+    if let Some(target_event) = state
+        .db
+        .get_event_by_id_including_deleted(tenant.community(), &target_id)
+        .await
+        .ok()
+        .flatten()
+    {
+        if u32::from(target_event.event.kind.as_u16()) == KIND_THREAD_DIRECTORY_STATE {
+            if let Some((state_channel_id, root_id)) =
+                crate::handlers::ingest::thread_directory_state_target(&target_event.event)
+            {
+                emit_live_thread_directory_item(tenant, state, state_channel_id, root_id);
+            }
+        }
     }
 
     let actor_hex = hex::encode(event.pubkey.to_bytes());
@@ -2264,8 +2540,33 @@ async fn handle_standard_deletion_event(
 
         // Thread counters were decremented in the same transaction — push a
         // fresh relay-signed 39005 so live badge counts also count *down*.
-        if let (Some(root_id), Some(channel_id)) = (root_id, target_event.channel_id) {
+        if let (Some(root_id), Some(channel_id)) = (root_id.clone(), target_event.channel_id) {
             emit_live_thread_summary(tenant, state, channel_id, root_id);
+        }
+
+        // Directory fan-out. As in the single-delete path above, a deleted root
+        // carries no `root_event_id`, so address the target itself and let the
+        // helper report it absent. Spec lines 171-173.
+        if let Some(channel_id) = target_event.channel_id {
+            let directory_root = root_id.or_else(|| {
+                meta.as_ref()
+                    .filter(|meta| meta.depth == 0)
+                    .map(|_| target_id.clone())
+            });
+            if let Some(directory_root) = directory_root {
+                emit_live_thread_directory_item(tenant, state, channel_id, directory_root);
+            }
+        }
+
+        // Metadata-event-deletion trigger, spec line 171. Deleting a kind:40009
+        // exposes the next-newest state for that root, so recompute its row.
+        // `target_event` is already in hand here, unlike the single-delete path.
+        if u32::from(target_event.event.kind.as_u16()) == KIND_THREAD_DIRECTORY_STATE {
+            if let Some((state_channel_id, root_id)) =
+                crate::handlers::ingest::thread_directory_state_target(&target_event.event)
+            {
+                emit_live_thread_directory_item(tenant, state, state_channel_id, root_id);
+            }
         }
 
         if u32::from(target_event.event.kind.as_u16()) == KIND_REACTION {

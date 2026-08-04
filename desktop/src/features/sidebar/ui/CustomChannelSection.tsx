@@ -42,6 +42,7 @@ import {
   SidebarMenuItem,
 } from "@/shared/ui/sidebar";
 import { ChannelMenuButton } from "@/features/sidebar/ui/SidebarSection";
+import { SidebarThreadDisclosure } from "@/features/sidebar/ui/SidebarThreadList";
 import { ChannelContextMenuItems } from "@/features/sidebar/ui/ChannelContextMenu";
 import { deferMenuAction } from "@/features/sidebar/ui/sidebarMenuHelpers";
 import {
@@ -461,6 +462,7 @@ export function ChannelGroupSection({
                     onSelectChannel={onSelectChannel}
                   />
                 )}
+                <SidebarThreadDisclosure channel={channel} />
               </SidebarMenuItem>
             </ContextMenuTrigger>
             <ContextMenuContent>
@@ -754,6 +756,7 @@ export function CustomChannelSection({
                                 onSelectChannel={onSelectChannel}
                               />
                             </DraggableChannelRow>
+                            <SidebarThreadDisclosure channel={channel} />
                           </SidebarMenuItem>
                         </ContextMenuTrigger>
                         <ContextMenuContent>
