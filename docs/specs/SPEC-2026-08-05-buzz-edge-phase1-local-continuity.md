@@ -1,11 +1,15 @@
 # SPEC-2026-08-05 — buzz-edge Phase 1: Local Continuity
 
-Status: APPROVED build (option 3, James, 2026-08-05); spec revision 5 answering
+Status: APPROVED build (option 3, James, 2026-08-05); spec revision 7 answering
 Ava FAIL verdicts on `d5382d11e` (rev-1, event `28d54430…`), `5b96643d8`
 (rev-2 R1–R6, event `d3aa9d73…`), `951eece30` (rev-3 findings 1–3, event
 `8f242013…`; finding 3's lease duration is an owner decision, recorded in §7),
-and `48cbd7c4d` (rev-4 finding 1 — roster freshness, event `39657457…`; the
-residual author-revocation risk is an owner decision, recorded in §7).
+`48cbd7c4d` (rev-4 finding 1 — roster freshness, event `39657457…`; the
+residual author-revocation risk is an owner decision, recorded in §7),
+`10d2fb9c4` (rev-5, reduced verdict event `ab0851ca…`; detailed finding
+withheld by the reviewer's publication control — superseded by the rev-6
+carrier correction, independently derived), and `d90e995af` (rev-6, event
+`0fe88096…` — §7 citations re-derived against the pinned base below).
 Spec owner: Cody. Builder: Forge. Reviewer: Ava (this document is the single review artifact).
 Base: `44337aa4f54ee17a7eb85c708ccc8fccc3bae5bb` (fork checkout `restart-patch-on-desktop-v0.5.5`).
 
@@ -198,9 +202,9 @@ Edge identity provisioning (answers F1):
    NIP-43 relay membership — label corrected per rev-4 review). The pinned
    relay commits a membership mutation first, then publishes the updated
    kind-39002 **best-effort**: emission failure is swallowed with a warning
-   (`crates/buzz-relay/src/handlers/side_effects.rs:1624-1666` —
-   `remove_member` commits at `:1624-1627`, discovery-emission failure
-   warned at `:1651-1653`; same shape on self-leave at `:2307-2329`), and
+   (`crates/buzz-relay/src/handlers/side_effects.rs:1360-1429` —
+   `remove_member` commits at `:1384-1387`, discovery-emission failure
+   warned at `:1411-1413`; same shape on self-leave at `:2031-2053`), and
    production runs no reconciliation that repairs a stale projection (the
    only reconciler is dev/CI-gated behind `BUZZ_RECONCILE_CHANNELS`,
    `crates/buzz-relay/src/main.rs:572-576`, and repairs only missing
@@ -220,9 +224,9 @@ Edge identity provisioning (answers F1):
      carriers, both readable for its selected channels: (1) a changed
      kind-39002; (2) the kind-40099 channel system message with type
      `member_removed` / `member_left` emitted by every removal handler
-     (`side_effects.rs:759-779` definition; emitted at `:1639-1649` and
-     `:2316-2325`) — kind 40099 is channel-scoped and appears in no gated
-     kind list (`crates/buzz-core/src/kind.rs:495`; not in
+     (`side_effects.rs:759-779` definition; emitted at `:1399-1409` and
+     `:2040-2049`) — kind 40099 is channel-scoped and appears in no gated
+     kind list (`crates/buzz-core/src/kind.rs:484`; not in
      `P_GATED_KINDS`/`RESULT_GATED_KINDS`/`AUTHOR_ONLY_KINDS`/
      `SHARED_GATED_KINDS`, `kind.rs:120-202`), so the §8 mirror receives it
      live and in reconnect catch-up. The kind-44100/44101 global membership
