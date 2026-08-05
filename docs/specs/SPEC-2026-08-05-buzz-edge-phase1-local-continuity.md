@@ -1,8 +1,9 @@
 # SPEC-2026-08-05 — buzz-edge Phase 1: Local Continuity
 
-Status: APPROVED build (option 3, James, 2026-08-05); spec revision 3 answering
-Ava FAIL verdicts on `d5382d11e` (rev-1 findings, event `28d54430…`) and
-`5b96643d8` (rev-2 findings R1–R6, event `d3aa9d73…`).
+Status: APPROVED build (option 3, James, 2026-08-05); spec revision 4 answering
+Ava FAIL verdicts on `d5382d11e` (rev-1, event `28d54430…`), `5b96643d8`
+(rev-2 R1–R6, event `d3aa9d73…`), and `951eece30` (rev-3 findings 1–3, event
+`8f242013…`; finding 3's lease duration is an owner decision, recorded in §7).
 Spec owner: Cody. Builder: Forge. Reviewer: Ava (this document is the single review artifact).
 Base: `44337aa4f54ee17a7eb85c708ccc8fccc3bae5bb` (fork checkout `restart-patch-on-desktop-v0.5.5`).
 
@@ -154,31 +155,61 @@ Edge identity provisioning (answers F1):
    (`crates/buzz-relay/src/handlers/ingest.rs:1878-1881`) — so mirroring
    private selected channels and ingesting edge-signed digests both require
    real membership.
-   Revocation semantics, stated exactly: removing the edge identity's
-   **relay membership** revokes upstream admission itself and is the
-   upstream-enforced kill path (proven by the direct-to-upstream
-   post-revocation gate in the Test list — the kill-switch claim stands only
-   as far as that gate proves it). Removing a **channel membership** revokes
-   that channel. Residual risk documented: while the edge identity remains a
-   relay member, open channels stay readable to it, because open visibility
-   itself grants access; full removal requires the relay-membership path.
+   Revocation semantics, stated exactly (corrected per rev-3 review): relay
+   membership is evaluated when AUTH succeeds
+   (`crates/buzz-relay/src/handlers/auth.rs:216-238`); the removal handler
+   deletes the membership row and publishes NIP-43 state but does **not**
+   invalidate or disconnect an already-authenticated connection
+   (`crates/buzz-relay/src/handlers/relay_admin.rs:362-419`). Therefore
+   removing the edge identity's **relay membership blocks its next
+   authentication only** — it is not an immediate kill of a live session,
+   and this spec makes no immediate-kill claim. Removing a **selected
+   private-channel membership** is the per-operation revocation lever, since
+   channel access is resolved per read/ingest operation. Phase 1 changes no
+   hosted-relay code, so a true immediate kill (server-side disconnect or
+   per-operation membership recheck on live sessions) is explicitly out of
+   scope; it is a candidate for the option-1 upstream lane. Local
+   mitigation: while online, the sidecar tears down and re-authenticates its
+   upstream session at every authorization-snapshot refresh (§7), bounding
+   how long a removed edge identity's live session can persist through the
+   sidecar's own behavior. Residual risk documented: while the edge identity
+   remains a relay member, open channels stay readable to it, because open
+   visibility itself grants access.
 7. A channel is **eligible for edge routing only if the edge identity's
    membership in it is confirmed or covered by a valid authorization lease**
-   (answers rev-2 R1). On every successful upstream membership verification
-   the sidecar persists an **authorization snapshot** in SQLite — the
-   eligible channel set, the community binding, and `verified_at` — signed by
-   the edge key and verified on load. Startup rules, exactly: if upstream is
-   reachable, verify fresh before serving. If upstream is unreachable, serve
-   from the snapshot only while `now − verified_at ≤ 72 hours` (the lease);
-   past the lease, fail closed to canonical-only (which, offline, means
-   messaging halts — disclosed, not hidden). Trade-off stated: within the
-   lease, a revocation performed upstream during a total outage is enforced
-   locally only at the next successful verification (revocation lag ≤ lease
-   length); this is accepted for a single-owner PC and bounded at 72 hours.
-   On reconnect the sidecar refreshes the snapshot first; channels revoked
-   while offline drop immediately — no local ingress, no mirroring, cached
-   rows retained read-only, their queued events follow the §12 revocation
-   rule, and clients transparently fall back to canonical.
+   (answers rev-2 R1; contents extended per rev-3 review). On every
+   successful upstream verification the sidecar persists an **authorization
+   snapshot** in SQLite as one atomic signed record — verified by the edge
+   key on load — containing: the community binding; the eligible channel
+   set; **the complete per-channel active-author roster**, taken from the
+   relay-signed membership state (NIP-43 kind-39002 list) together with its
+   source event ID and the upstream cursor; and `verified_at`. Local ingress
+   (§2) authorizes submitting principals against exactly this roster —
+   author authorization and edge eligibility therefore share one
+   `verified_at` and one lease bound; no separately-aging member cache
+   exists. The snapshot is only ever replaced whole, never partially
+   updated. Refresh cadence: on every reconnect, and at least every 6 hours
+   while online, each refresh preceded by a full upstream session recycle
+   (§6). Startup rules, exactly: if upstream is reachable, verify fresh
+   before serving. If upstream is unreachable, serve from the snapshot only
+   while `now − verified_at ≤ LEASE` (LEASE = owner-selected duration; see
+   the owner-decision record below); past the lease, fail closed to
+   canonical-only (which, offline, means messaging halts — disclosed, not
+   hidden). Trade-off stated: within the lease, a revocation performed
+   upstream during a total outage — of the edge identity or of any local
+   author — is enforced locally only at the next successful verification
+   (revocation lag ≤ LEASE). On reconnect the sidecar refreshes the snapshot
+   first, before any drain; channels or authors revoked while offline drop
+   immediately — no local ingress, no mirroring, cached rows retained
+   read-only, their queued events follow the §12 revocation rule, and
+   clients transparently fall back to canonical.
+   **Owner-decision record (LEASE):** requested from James 2026-08-05
+   (buzz-infra event `4e7c5563…`; options 24 h / 72 h / 7 d, recommendation
+   72 h). DECIDED 2026-08-05: **LEASE = 7 days (168 hours)**, chosen by
+   James over the 72 h recommendation, accepting the longer revocation lag
+   for maximum offline uptime. Reply event
+   `39ddb3b33a0d1a0657cc2451aeb67059e8f8a994687751ca328e31e488118e5d`
+   (Projects Hub, 2026-08-05T18:50:43Z, verbatim: "7 days").
 8. Using the edge identity, the sidecar subscribes upstream to the selected
    channels and mirrors received events and member state into SQLite, so
    local reads are served from loopback even when upstream is merely slow.
@@ -327,18 +358,30 @@ not summaries):
    authorization, and lands a digest via ordinary ingest; then revoke its
    channel membership and prove fail-closed behavior (no ingress, no mirror,
    clean canonical fallback, digest rejected upstream).
-6. **Direct-to-upstream post-revocation gate** (rev-2 R5): after the owner
-   removes the edge identity's **relay membership**, prove by direct upstream
-   connection — bypassing the sidecar — that admission itself is refused
-   (reads and ingest both). The "remote kill switch" claim in this spec is
-   valid only if this gate passes.
-7. **Authorization-lease gates** (rev-2 R1): (a) offline sidecar restart with
-   a valid lease → local messaging continues from the snapshot; (b) offline
-   restart with an expired lease → fail closed, canonical-only, clearly
-   surfaced; (c) revocation performed upstream while offline → enforced at
-   reconnect refresh before any queued submission, affected rows follow the
-   §12 revocation rule; (d) reconnect always refreshes the snapshot before
-   drain begins.
+6. **Direct-to-upstream post-revocation gate** (rev-2 R5, extended per rev-3
+   review): two parts, both bypassing the sidecar. (a) Fresh-connection:
+   after the owner removes the edge identity's relay membership, a new
+   direct upstream connection must be refused admission (reads and ingest
+   both). (b) Live-connection: authenticate a direct upstream connection
+   first, remove relay membership second, then attempt REQ and ingest over
+   that same live connection — the observed behavior must match the §6
+   boundary statement (removal blocks next authentication only; the live
+   session is expected to retain access until it disconnects). This gate
+   documents the real boundary; the spec claims nothing stronger.
+7. **Authorization-lease gates** (rev-2 R1; roster gates added per rev-3
+   review): (a) offline sidecar restart with a valid lease → local messaging
+   continues from the snapshot; (b) offline restart with an expired lease →
+   fail closed, canonical-only, clearly surfaced; (c) revocation performed
+   upstream while offline → enforced at reconnect refresh before any queued
+   submission, affected rows follow the §12 revocation rule; (d) reconnect
+   always refreshes the snapshot before drain begins; (e) **local author
+   removed from a channel while offline** → within the lease their local
+   ingress continues (disclosed lag), and it stops at the reconnect refresh
+   — the stated boundary; (f) **local author removed while online** → their
+   local ingress stops at the next snapshot refresh, within the 6-hour
+   cadence; (g) **local author added to a channel while offline** → they
+   cannot write through the edge until a refreshed roster authorizes them
+   (canonical-only in the meantime, once online).
 8. **Mixed-age thread gate** (rev-2 R2): author A posts a thread root at
    T−16 minutes, author B replies at T−5 minutes, reconnect at T. Prove the
    root and the reply both go to the digest path, in order; no orphan
@@ -406,16 +449,20 @@ Failure-mode and protocol tests:
   (plus open channels, which any relay member can read) and the ability to
   post digests as itself — not the ability to impersonate anyone.
   Mitigation: DPAPI storage, loopback-only exposure, and two upstream-side
-  revocation levers with honestly different strengths (rev-2 R5): relay
-  membership removal revokes admission entirely (proven by the
-  direct-to-upstream post-revocation gate); channel membership removal
-  revokes one channel but leaves open-channel access while relay membership
-  stands.
-- **Bounded revocation lag offline** (rev-2 R1): within the 72-hour
-  authorization lease, a revocation issued during a total outage takes local
-  effect only at the next successful upstream verification. This window is a
-  stated design trade-off, not an oversight; reconnect enforces revocation
-  before any queued submission drains.
+  revocation levers with honestly different strengths (rev-2 R5, boundary
+  corrected per rev-3 review): relay membership removal blocks the edge
+  identity's **next authentication** — live sessions are not disconnected by
+  the pinned relay, so this is not an immediate kill (both halves proven by
+  the two-part post-revocation gate); selected private-channel membership
+  removal is the per-operation lever. The sidecar's 6-hour online session
+  recycle bounds its own live-session exposure.
+- **Bounded revocation lag offline** (rev-2 R1): within the owner-selected
+  authorization lease, a revocation issued during a total outage — of the
+  edge identity or of any local author, since the author roster lives inside
+  the same signed snapshot — takes local effect only at the next successful
+  upstream verification. This window is a stated design trade-off chosen by
+  the owner, not an oversight; reconnect enforces revocation before any
+  queued submission drains.
 - **Loopback only.** The sidecar binds to localhost exclusively. No LAN or
   remote exposure; no new open ports beyond loopback.
 - **Canonical relay untouched.** No server-side code ships or deploys in this
@@ -461,12 +508,12 @@ Failure-mode and protocol tests:
   scheduled task. Every client reverts to today's canonical-only routing; the
   sidecar is inert. This is the first-line rollback at any milestone.
 - **Identity:** the owner removes the edge-device pubkey's **relay
-  membership** — the upstream-enforced kill path, refusing admission itself
-  regardless of what runs on the PC (valid only as far as the
-  direct-to-upstream post-revocation gate proves it) — and its channel
-  memberships. The sidecar's own lease-bounded fail-closed check (§7)
-  additionally shuts the local side down at the next verification, with
-  revocation lag bounded by the 72-hour lease if the PC is fully offline.
+  membership** and its channel memberships. Honest boundary (§6): this
+  blocks the edge identity's next authentication and its per-operation
+  channel access; it does not sever an already-live session — the pinned
+  relay has no disconnect-on-removal. Local enforcement follows at the next
+  snapshot verification: within the 6-hour recycle while online, or bounded
+  by the owner-selected lease if the PC is fully offline.
 - **Data:** SQLite files are additive and local. Before deleting them, export
   any queued-but-unsynced events to a plain-text digest file so no authored
   content is silently lost; then archive or delete the database.
