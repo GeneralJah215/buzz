@@ -73,11 +73,15 @@ Desktop bridge and shared API:
   the bridge filter without introducing a new HTTP endpoint.
 - `desktop/src-tauri/src/commands/mod.rs` and `desktop/src-tauri/src/lib.rs`:
   register the new command.
+- `desktop/src-tauri/src/initial_window.rs` (new): hold the existing startup
+  reveal helper extracted from `lib.rs` to preserve the file-size ratchet.
 - `desktop/src/shared/api/threadDirectory.ts` (new): parse the flat event
   response and publish kind:40009 full-state updates.
 - `desktop/src/shared/constants/kinds.ts`: mirror all three kind constants.
-- `desktop/src/shared/api/relayClientSession.ts`: subscribe to live 39007
-  overlays without treating them as timeline rows.
+- `desktop/src/shared/api/relayClientSession.ts` and
+  `desktop/src/shared/api/relayLiveSubscriptionFilters.ts` (new): subscribe to
+  live 39007 overlays without treating them as timeline rows while preserving
+  the session file-size ratchet.
 
 Desktop state and UI:
 
