@@ -215,20 +215,30 @@ Edge identity provisioning (answers F1):
      same event ID advances no freshness field. Roster state advances only
      when a kind-39002 with a different event ID is fetched, and then only
      by whole-record replacement.
-   - **Removal signals force immediate local revocation.** The sidecar
-     consumes three independent relay-signed carriers of a removal, all
-     available for its selected channels: (1) a changed kind-39002; (2) the
-     kind-40099 channel system message with type `member_removed` /
-     `member_left` emitted by every removal handler
+   - **Removal signals force immediate local revocation.** For removals of
+     **other authors**, the sidecar consumes two independent relay-signed
+     carriers, both readable for its selected channels: (1) a changed
+     kind-39002; (2) the kind-40099 channel system message with type
+     `member_removed` / `member_left` emitted by every removal handler
      (`side_effects.rs:759-779` definition; emitted at `:1639-1649` and
-     `:2316-2325`) — channel-scoped, so the §8 mirror receives it live and
-     in reconnect catch-up; (3) the kind-44100/44101 global membership
-     notifications (`side_effects.rs:1140-1196`), the same stream the ACP
-     harness already consumes (`crates/buzz-acp/src/relay.rs:3238-3250`).
-     On any removal signal for (channel, author), that author leaves the
-     working roster immediately — local ingress fails closed for them — and
-     is re-authorized only by a subsequently fetched kind-39002 with a
-     different event ID that lists them.
+     `:2316-2325`) — kind 40099 is channel-scoped and appears in no gated
+     kind list (`crates/buzz-core/src/kind.rs:495`; not in
+     `P_GATED_KINDS`/`RESULT_GATED_KINDS`/`AUTHOR_ONLY_KINDS`/
+     `SHARED_GATED_KINDS`, `kind.rs:120-202`), so the §8 mirror receives it
+     live and in reconnect catch-up. The kind-44100/44101 global membership
+     notifications are explicitly **not** an other-author carrier: they are
+     `#p`-gated — a global REQ for them is closed unless the filter's `#p`
+     equals the reader's own pubkey (`P_GATED_KINDS`,
+     `crates/buzz-core/src/kind.rs:146-156`; enforced at
+     `crates/buzz-relay/src/handlers/req.rs:181-189`) — so the edge can
+     subscribe only to notifications targeting the edge identity itself,
+     and uses them solely as an extra §6 eligibility signal (its own
+     add/remove), the same self-scoped stream the ACP harness consumes
+     (`crates/buzz-acp/src/relay.rs:3238-3250`). On any removal signal for
+     (channel, author), that author leaves the working roster immediately —
+     local ingress fails closed for them — and is re-authorized only by a
+     subsequently fetched kind-39002 with a different event ID that lists
+     them.
    - **A canonical rejection is authoritative.** If an author's drain
      submission is rejected upstream for membership, the sidecar marks that
      (channel, author) revoked exactly as if a removal signal had arrived.
@@ -236,9 +246,10 @@ Edge identity provisioning (answers F1):
      revocation is signal-driven: it takes local effect on receipt of any
      carrier, ordinarily within seconds, and never later than the next
      refresh that observes a changed kind-39002. It is **not guaranteed
-     bounded**: every carrier is best-effort in the pinned relay, so if the
-     kind-39002 republication, the kind-40099 system message, and the
-     kind-44101 notification are all lost, a removed author retains
+     bounded**: both carriers are best-effort in the pinned relay
+     (kind-40099 insert failure is warned and dropped,
+     `side_effects.rs:773-779`), so if the kind-39002 republication and the
+     kind-40099 system message are both lost, a removed author retains
      **local-only** ingress on this one PC until a later signal, roster
      change, or canonical rejection arrives. Canonical history is never
      exposed — the canonical relay re-checks membership at ingest and
@@ -291,10 +302,12 @@ Edge identity provisioning (answers F1):
 8. Using the edge identity, the sidecar subscribes upstream to the selected
    channels and mirrors received events and member state into SQLite, so
    local reads are served from loopback even when upstream is merely slow.
-   The mirror explicitly includes the §7 removal-signal kinds — kind-40099
-   channel system messages and kind-44100/44101 membership notifications —
-   consumed live while connected and as backlog during reconnect catch-up,
-   feeding the working-roster rules of §7.
+   The mirror explicitly includes the §7 removal-signal kinds: kind-40099
+   channel system messages for its selected channels, and kind-44100/44101
+   membership notifications **targeting the edge identity's own pubkey
+   only** (they are `#p`-gated; §7) — consumed live while connected and as
+   backlog during reconnect catch-up, feeding the working-roster and
+   eligibility rules of §7.
 
 Reconnect synchronization — durable outbox:
 
@@ -472,11 +485,12 @@ not summaries):
    least two refresh cycles (compressed clock). Prove three things: the
    unchanged kind-39002 re-fetch advances no freshness field of the stored
    snapshot; the removed author is blocked from local ingress from the
-   moment the mirrored kind-40099/kind-44101 signal arrives; and in the
-   variant with all three carriers suppressed, the removed author's
-   local-only ingress persists exactly as the §7 residual discloses, their
-   drain submission is rejected by canonical ingest, and that rejection then
-   revokes them locally — the contract's stated boundary, nothing stronger.
+   moment the mirrored kind-40099 system message arrives; and in the
+   variant with both carriers suppressed (kind-39002 republication and the
+   kind-40099 system message), the removed author's local-only ingress
+   persists exactly as the §7 residual discloses, their drain submission is
+   rejected by canonical ingest, and that rejection then revokes them
+   locally — the contract's stated boundary, nothing stronger.
 8. **Mixed-age thread gate** (rev-2 R2): author A posts a thread root at
    T−16 minutes, author B replies at T−5 minutes, reconnect at T. Prove the
    root and the reply both go to the digest path, in order; no orphan
