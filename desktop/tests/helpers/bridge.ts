@@ -1,4 +1,4 @@
-import type { Page } from "@playwright/test";
+import { expect, type Page } from "@playwright/test";
 import type { ChannelTemplate, RelayEvent } from "../../src/shared/api/types";
 import type { MockManagedAgentSeed } from "../../src/testing/e2eBridge";
 import { FEATURE_OVERRIDES_STORAGE_KEY, PREVIEW_FEATURE_IDS } from "./features";
@@ -283,6 +283,12 @@ type MockBridgeOptions = {
   /** Delay (ms) after snapshotting a thread-replies page so E2E tests can
    * deliver live reply/aux events while an older response is in flight. */
   threadRepliesDelayMs?: number;
+  /**
+   * Preserve mock channel events and thread-directory updates in sessionStorage
+   * across `page.reload()` for restart acceptance tests. Disabled by default
+   * so existing mock specs continue to receive a clean in-memory relay.
+   */
+  persistThreadDirectorySession?: boolean;
   usersBatchDelayMs?: number;
   /** Delay (ms) for older-history fetches; see e2eBridge mock config. */
   channelWindowDelayMs?: number;
@@ -896,6 +902,23 @@ export async function installMockBridge(
     skipCommunitySeed: options?.skipCommunitySeed,
     seedPreviewFeatures: options?.seedPreviewFeatures,
   });
+}
+
+export async function waitForMockLiveSubscription(
+  page: Page,
+  channelName: string,
+) {
+  await expect
+    .poll(async () =>
+      page.evaluate(
+        ({ name }) =>
+          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+            channelName: name,
+          }) ?? false,
+        { name: channelName },
+      ),
+    )
+    .toBe(true);
 }
 
 export async function installRelayBridge(

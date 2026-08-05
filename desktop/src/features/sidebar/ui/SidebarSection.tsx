@@ -16,6 +16,7 @@ import {
 } from "@/shared/ui/context-menu";
 
 import { ChannelContextMenuItems } from "@/features/sidebar/ui/ChannelContextMenu";
+import { SidebarThreadDisclosure } from "@/features/sidebar/ui/SidebarThreadList";
 import type { ActiveChannelTurnSummary } from "@/features/agents/activeAgentTurnsStore";
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
 import { getEphemeralChannelDisplay } from "@/features/channels/lib/ephemeralChannel";
@@ -486,6 +487,7 @@ export function SidebarSection({
                       presenceStatus={presenceByChannelId?.[channel.id]}
                       onSelectChannel={onSelectChannel}
                     />
+                    <SidebarThreadDisclosure channel={channel} />
                     {channel.channelType === "dm" &&
                     unreadChannelIds.has(channel.id) &&
                     !(isActiveChannel && selectedChannelId === channel.id) ? (

@@ -1244,15 +1244,21 @@ async fn insert_event_with_thread_metadata_tx(
                         }
                     }
 
+                    // Activity is event time, not ingest time (see the inline
+                    // path in `thread::insert_thread_metadata`): late-arriving
+                    // replies age against created_at and never move activity
+                    // backward.
                     sqlx::query(
                         r#"
                         UPDATE thread_metadata
-                        SET reply_count = reply_count + 1, last_reply_at = NOW()
+                        SET reply_count = reply_count + 1,
+                            last_reply_at = GREATEST(COALESCE(last_reply_at, to_timestamp(0)), $3)
                         WHERE community_id = $1 AND event_id = $2
                         "#,
                     )
                     .bind(community_id.as_uuid())
                     .bind(pid)
+                    .bind(meta.event_created_at)
                     .execute(&mut **tx)
                     .await?;
 

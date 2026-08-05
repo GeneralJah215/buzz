@@ -2798,6 +2798,38 @@ impl Db {
             .map(|(window, _session)| window)
     }
 
+    /// Fetch an authoritative channel-scoped thread-directory page.
+    ///
+    /// Directory head reads stay on the writer so a metadata update followed
+    /// by an immediate sidebar refresh observes its own write.
+    pub async fn get_thread_directory(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        state: thread::ThreadDirectoryState,
+        limit: u32,
+        cursor: Option<thread::ThreadDirectoryCursor>,
+    ) -> Result<thread::ThreadDirectoryPage> {
+        thread::get_thread_directory(&self.pool, community_id, channel_id, state, limit, cursor)
+            .await
+    }
+
+    /// Reduce the latest shared directory state for one channel/root pair.
+    pub async fn get_latest_thread_directory_state(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        root_event_id: &[u8],
+    ) -> Result<Option<thread::ThreadDirectoryStateRecord>> {
+        thread::get_latest_thread_directory_state(
+            &self.pool,
+            community_id,
+            channel_id,
+            root_event_id,
+        )
+        .await
+    }
+
     /// [`Db::get_channel_window`], additionally returning the session that
     /// served the page so request-scoped follow-ups (the aux closure) run on
     /// the same proved connection.
@@ -6110,8 +6142,8 @@ mod tests {
         let db = setup_db().await;
         let owner = format!("{:064x}", Uuid::new_v4().as_u128());
 
-        // Create 3 communities for this owner (the max).
-        for i in 0..3 {
+        // Create the maximum number of communities for this owner.
+        for i in 0..crate::relay_members::max_communities_per_owner() {
             let host = format!("limit-test-{}-{}.example", i, Uuid::new_v4().simple());
             assert!(matches!(
                 db.create_community_with_owner(&host, &owner)

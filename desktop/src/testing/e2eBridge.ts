@@ -323,6 +323,12 @@ type E2eConfig = {
     /** Delay (ms) after snapshotting a thread-replies page so E2E tests can
      *  deliver live reply/aux events while an older response is in flight. */
     threadRepliesDelayMs?: number;
+    /**
+     * Preserve mock channel events and thread-directory updates in
+     * sessionStorage across a browser reload. This is opt-in so ordinary mock
+     * specs retain their clean in-memory relay fixture.
+     */
+    persistThreadDirectorySession?: boolean;
     usersBatchDelayMs?: number;
     /** Delay (ms) applied to continuation channel-window requests so e2e
      *  tests can observe the in-flight prepend window. 0/undefined = instant. */
@@ -945,6 +951,9 @@ type MockFilter = {
   authors?: string[];
   ids?: string[];
   kinds?: number[];
+  directory_cursor?: string | null;
+  directory_state?: "active" | "archived";
+  thread_index?: boolean;
   limit?: number;
   since?: number;
   until?: number;
@@ -2950,6 +2959,23 @@ const mockChannels: MockChannel[] = [
   }),
 ];
 
+// Thread-directory E2E relay model. Keep the protocol kinds local: this mock
+// must be able to exercise the desktop contract while the shared constants are
+// introduced by the production implementation lane.
+const KIND_THREAD_DIRECTORY_ITEM = 39007;
+const KIND_THREAD_DIRECTORY_BOUNDS = 39008;
+const KIND_THREAD_DIRECTORY_STATE = 40009;
+const MOCK_THREAD_DIRECTORY_SESSION_STORAGE_KEY =
+  "buzz.e2e.mock-thread-directory.v1";
+
+type MockThreadDirectoryState = {
+  archived: boolean;
+  pinned: boolean;
+  title: string | null;
+};
+
+const mockThreadDirectoryStateEvents: RelayEvent[] = [];
+
 const mockMessages = new Map<string, RelayEvent[]>();
 const mockUserStatuses: RelayEvent[] = [];
 const mockReminderEvents: RelayEvent[] = [];
@@ -4070,6 +4096,314 @@ function getMockMessageStore(channelId: string): RelayEvent[] {
   return seeded;
 }
 
+function cloneMockRelayEvent(event: RelayEvent): RelayEvent {
+  return { ...event, tags: event.tags.map((tag) => [...tag]) };
+}
+
+function persistMockThreadDirectorySession() {
+  if (!getConfig()?.mock?.persistThreadDirectorySession) return;
+  window.sessionStorage.setItem(
+    MOCK_THREAD_DIRECTORY_SESSION_STORAGE_KEY,
+    JSON.stringify({
+      messages: [...mockMessages.entries()],
+      stateEvents: mockThreadDirectoryStateEvents,
+    }),
+  );
+}
+
+function resetMockThreadDirectorySession(config: E2eConfig | undefined) {
+  mockMessages.clear();
+  mockThreadDirectoryStateEvents.length = 0;
+  if (!config?.mock?.persistThreadDirectorySession) {
+    window.sessionStorage.removeItem(MOCK_THREAD_DIRECTORY_SESSION_STORAGE_KEY);
+    return;
+  }
+
+  try {
+    const stored = window.sessionStorage.getItem(
+      MOCK_THREAD_DIRECTORY_SESSION_STORAGE_KEY,
+    );
+    if (!stored) return;
+    const parsed = JSON.parse(stored) as {
+      messages?: Array<[string, RelayEvent[]]>;
+      stateEvents?: RelayEvent[];
+    };
+    for (const [channelId, events] of parsed.messages ?? []) {
+      if (typeof channelId !== "string" || !Array.isArray(events)) continue;
+      mockMessages.set(channelId, events.map(cloneMockRelayEvent));
+    }
+    for (const event of parsed.stateEvents ?? []) {
+      mockThreadDirectoryStateEvents.push(cloneMockRelayEvent(event));
+    }
+  } catch {
+    window.sessionStorage.removeItem(MOCK_THREAD_DIRECTORY_SESSION_STORAGE_KEY);
+  }
+}
+
+function parseMockThreadDirectoryState(
+  event: RelayEvent,
+): MockThreadDirectoryState | null {
+  try {
+    const state: unknown = JSON.parse(event.content);
+    if (
+      typeof state !== "object" ||
+      state === null ||
+      typeof (state as Record<string, unknown>).pinned !== "boolean" ||
+      typeof (state as Record<string, unknown>).archived !== "boolean"
+    ) {
+      return null;
+    }
+    const title = (state as Record<string, unknown>).title;
+    if (title !== null && typeof title !== "string") return null;
+    return {
+      archived: (state as Record<string, unknown>).archived as boolean,
+      pinned: (state as Record<string, unknown>).pinned as boolean,
+      title,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getMockThreadDirectoryState(
+  channelId: string,
+  rootId: string,
+): { event: RelayEvent; state: MockThreadDirectoryState } | null {
+  const matching = mockThreadDirectoryStateEvents
+    .filter(
+      (event) =>
+        event.tags.some((tag) => tag[0] === "h" && tag[1] === channelId) &&
+        event.tags.some(
+          (tag) => tag[0] === "e" && tag[1] === rootId && tag[3] === "root",
+        ),
+    )
+    .map((event) => ({ event, state: parseMockThreadDirectoryState(event) }))
+    .filter(
+      (
+        candidate,
+      ): candidate is {
+        event: RelayEvent;
+        state: MockThreadDirectoryState;
+      } => candidate.state !== null,
+    )
+    .sort(
+      (left, right) =>
+        right.event.created_at - left.event.created_at ||
+        left.event.id.localeCompare(right.event.id),
+    );
+  return matching[0] ?? null;
+}
+
+function mockThreadDirectoryTitle(content: string): string {
+  const line = content
+    .split("\n")
+    .find((candidate) => candidate.trim().length > 0)
+    ?.trim();
+  if (!line) return "Untitled thread";
+  let candidate = line;
+  while (true) {
+    const before = candidate;
+    candidate = candidate
+      .replace(/^>\s*/, "")
+      .replace(/^[-*+]\s+/, "")
+      .replace(/^#+\s+/, "")
+      .replace(/^\d+[.)]\s+/, "")
+      .trimStart();
+    if (candidate === before) break;
+  }
+  const collapsed = candidate.trim().replace(/\s+/g, " ");
+  if (!collapsed) return "Untitled thread";
+  const chars = Array.from(collapsed);
+  return chars.length > 80 ? `${chars.slice(0, 79).join("")}…` : collapsed;
+}
+
+function buildMockThreadDirectoryItem(
+  channelId: string,
+  root: RelayEvent,
+): { activityAt: number; event: RelayEvent; pinned: boolean } | null {
+  const events = getMockMessageStore(channelId);
+  const replies = events.filter(
+    (event) => getThreadReferenceFromTags(event.tags).rootEventId === root.id,
+  );
+  if (replies.length === 0) return null;
+
+  const directReplies = replies.filter(
+    (event) => getThreadReferenceFromTags(event.tags).parentEventId === root.id,
+  );
+  const lastReplyAt = Math.max(...replies.map((event) => event.created_at));
+  const resolved = getMockThreadDirectoryState(channelId, root.id);
+  const state = resolved?.state ?? {
+    archived: false,
+    pinned: false,
+    title: null,
+  };
+  const activityAt = lastReplyAt || root.created_at;
+  const active =
+    !state.archived &&
+    (state.title !== null ||
+      state.pinned ||
+      (replies.length >= 3 &&
+        activityAt >= Math.floor(Date.now() / 1000) - 30 * 86400));
+  if (!active && !state.archived) return null;
+
+  const participants = [...replies]
+    .sort(
+      (left, right) =>
+        right.created_at - left.created_at || left.id.localeCompare(right.id),
+    )
+    .map((event) => event.pubkey)
+    .filter((pubkey, index, all) => all.indexOf(pubkey) === index)
+    .slice(0, 10);
+  return {
+    activityAt,
+    pinned: state.pinned,
+    event: createMockEvent(
+      KIND_THREAD_DIRECTORY_ITEM,
+      JSON.stringify({
+        title: state.title ?? mockThreadDirectoryTitle(root.content),
+        title_override: state.title,
+        root_author: root.pubkey,
+        root_created_at: root.created_at,
+        reply_count: directReplies.length,
+        descendant_count: replies.length,
+        last_reply_at: lastReplyAt,
+        participants,
+        pinned: state.pinned,
+        archived: state.archived,
+        state_created_at: resolved?.event.created_at ?? 0,
+        state_event_id: resolved?.event.id ?? null,
+      }),
+      [
+        ["e", root.id],
+        ["d", root.id],
+        ["h", channelId],
+      ],
+      "f".repeat(64),
+    ),
+  };
+}
+
+function getMockThreadDirectoryEvents(args: {
+  channelId: string;
+  directoryCursor?: string | null;
+  directoryState?: "active" | "archived";
+  limit?: number | null;
+}): RelayEvent[] {
+  const directoryState = args.directoryState ?? "active";
+  const match = args.directoryCursor?.match(
+    /^mock-thread-directory:(active|archived):(\d+)$/,
+  );
+  if (args.directoryCursor && (!match || match[1] !== directoryState)) {
+    throw new Error("mock thread directory cursor is malformed");
+  }
+  const offset = match ? Number(match[2]) : 0;
+  const entries = getMockMessageStore(args.channelId)
+    .filter(
+      (event) =>
+        event.kind === 9 &&
+        getThreadReferenceFromTags(event.tags).rootEventId === null,
+    )
+    .flatMap((root) => {
+      const item = buildMockThreadDirectoryItem(args.channelId, root);
+      if (!item) return [];
+      const archived = JSON.parse(item.event.content).archived === true;
+      return archived === (directoryState === "archived") ? [item] : [];
+    })
+    .sort(
+      (left, right) =>
+        (directoryState === "active"
+          ? Number(right.pinned) - Number(left.pinned)
+          : 0) ||
+        right.activityAt - left.activityAt ||
+        left.event.tags[0][1].localeCompare(right.event.tags[0][1]),
+    );
+  const cap = Math.max(1, Math.min(args.limit ?? 25, 100));
+  const page = entries.slice(offset, offset + cap);
+  const hasMore = offset + page.length < entries.length;
+  const nextCursor = hasMore
+    ? `mock-thread-directory:${directoryState}:${offset + page.length}`
+    : null;
+  const boundsKey = `${args.channelId}:${directoryState}:${args.directoryCursor ?? "head"}`;
+  return [
+    ...page.map((entry) => entry.event),
+    createMockEvent(
+      KIND_THREAD_DIRECTORY_BOUNDS,
+      JSON.stringify({ has_more: hasMore, next_cursor: nextCursor }),
+      [
+        ["d", boundsKey],
+        ["h", args.channelId],
+      ],
+      "f".repeat(64),
+    ),
+  ];
+}
+
+async function handleGetThreadDirectory(
+  args: {
+    channelId: string;
+    cursor?: string | null;
+    directoryState?: "active" | "archived";
+    limitRows?: number | null;
+  },
+  config: E2eConfig | undefined,
+): Promise<RelayEvent[]> {
+  if (!getIdentity(config)) {
+    return getMockThreadDirectoryEvents({
+      channelId: args.channelId,
+      directoryCursor: args.cursor,
+      directoryState: args.directoryState,
+      limit: args.limitRows,
+    });
+  }
+  const filter: MockFilter = {
+    "#h": [args.channelId],
+    directory_cursor: args.cursor ?? null,
+    directory_state: args.directoryState ?? "active",
+    kinds: [KIND_THREAD_DIRECTORY_ITEM, KIND_THREAD_DIRECTORY_BOUNDS],
+    limit: Math.max(1, Math.min(args.limitRows ?? 25, 100)),
+    thread_index: true,
+  };
+  return relayQuery(config, [filter]);
+}
+
+function emitMockThreadDirectoryOverlay(channelId: string, rootId: string) {
+  const root = getMockMessageStore(channelId).find(
+    (event) => event.id === rootId,
+  );
+  if (!root) return;
+  const item = buildMockThreadDirectoryItem(channelId, root);
+  if (item) emitMockLiveEvent(channelId, item.event);
+}
+
+function storeMockThreadDirectoryState(event: RelayEvent): string | null {
+  const channelId = getChannelIdFromTags(event.tags);
+  const rootId = event.tags.find(
+    (tag) => tag[0] === "e" && tag[3] === "root",
+  )?.[1];
+  const state = parseMockThreadDirectoryState(event);
+  if (!channelId || !rootId || !state || (state.pinned && state.archived)) {
+    return "invalid thread directory state";
+  }
+  const root = getMockMessageStore(channelId).find(
+    (candidate) => candidate.id === rootId,
+  );
+  if (!root || getThreadReferenceFromTags(root.tags).rootEventId !== null) {
+    return "thread directory root was not found";
+  }
+  if (
+    !getMockMessageStore(channelId).some(
+      (candidate) =>
+        getThreadReferenceFromTags(candidate.tags).rootEventId === rootId,
+    )
+  ) {
+    return "thread directory root has no descendants";
+  }
+  mockThreadDirectoryStateEvents.push(cloneMockRelayEvent(event));
+  persistMockThreadDirectorySession();
+  emitMockThreadDirectoryOverlay(channelId, rootId);
+  return null;
+}
+
 function prependMockHistory(input: {
   channelName: string;
   count: number;
@@ -4247,12 +4581,15 @@ function recordMockMessage(channelId: string, event: RelayEvent) {
   history.push(event);
 
   const channel = mockChannels.find((candidate) => candidate.id === channelId);
-  if (!channel) {
-    return;
+  if (channel) {
+    channel.last_message_at = new Date(event.created_at * 1_000).toISOString();
+    touchMockChannel(channel);
   }
 
-  channel.last_message_at = new Date(event.created_at * 1_000).toISOString();
-  touchMockChannel(channel);
+  persistMockThreadDirectorySession();
+  const reference = getThreadReferenceFromTags(event.tags);
+  const rootId = reference.rootEventId ?? event.id;
+  emitMockThreadDirectoryOverlay(channelId, rootId);
 }
 
 function resetMockUserStatuses() {
@@ -9651,6 +9988,28 @@ function sendToMockSocket(args: {
       return;
     }
 
+    if (filter.thread_index) {
+      const channelId = filter["#h"]?.[0];
+      if (!channelId) {
+        sendWsText(socket.handler, [
+          "CLOSED",
+          subId,
+          "missing thread directory channel",
+        ]);
+        return;
+      }
+      for (const event of getMockThreadDirectoryEvents({
+        channelId,
+        directoryCursor: filter.directory_cursor,
+        directoryState: filter.directory_state,
+        limit: filter.limit,
+      })) {
+        sendWsText(socket.handler, ["EVENT", subId, event]);
+      }
+      sendWsText(socket.handler, ["EOSE", subId]);
+      return;
+    }
+
     const channelId = filter["#h"]?.[0];
     if (!channelId) {
       // Aux-backfill filters (reactions/deletions) are `#e`-keyed with no
@@ -9708,6 +10067,12 @@ function sendToMockSocket(args: {
 
     if (event.kind === 30078) {
       sendWsText(socket.handler, ["OK", event.id, true, ""]);
+      return;
+    }
+
+    if (event.kind === KIND_THREAD_DIRECTORY_STATE) {
+      const error = storeMockThreadDirectoryState(event);
+      sendWsText(socket.handler, ["OK", event.id, error === null, error ?? ""]);
       return;
     }
 
@@ -9917,6 +10282,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockPersonaCatalogEvents(config);
   resetMockSaveSubscriptions(config);
   resetMockPendingCommunityDeepLinks(config);
+  resetMockThreadDirectorySession(config);
   initializeMockHuddle(config.mock?.huddle, config);
   mockWebsocketSendMutexWedged = false;
   if (config.mock?.windowLabel) {
@@ -12398,6 +12764,11 @@ export function maybeInstallE2eTauriMocks() {
       case "get_channel_window":
         return handleGetChannelWindow(
           payload as Parameters<typeof handleGetChannelWindow>[0],
+          activeConfig,
+        );
+      case "get_thread_directory":
+        return handleGetThreadDirectory(
+          payload as Parameters<typeof handleGetThreadDirectory>[0],
           activeConfig,
         );
       case "send_channel_message":

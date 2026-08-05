@@ -121,6 +121,26 @@ export function markAllReadSources({
   }
 }
 
+export function getThreadReadAtWithChannelFallback({
+  rootId,
+  channelId,
+  getOwnReadAt,
+  getChannelReadAt,
+}: {
+  rootId: string;
+  channelId?: string | null;
+  getOwnReadAt: (contextId: string) => number | null;
+  getChannelReadAt: (channelId: string) => number | null;
+}): number | null {
+  const threadReadAt = getOwnReadAt(`thread:${rootId}`);
+  if (!channelId) return threadReadAt;
+
+  const channelReadAt = getChannelReadAt(channelId);
+  if (threadReadAt === null) return channelReadAt;
+  if (channelReadAt === null) return threadReadAt;
+  return Math.max(threadReadAt, channelReadAt);
+}
+
 export function toSearchHit(
   target: DesktopNotificationTarget,
 ): SearchHit | null {

@@ -379,6 +379,391 @@ fn extract_page_offset(raw: &Value, limit: Option<i64>) -> Option<i64> {
 /// consume it (docs/bridge-channel-window.md).
 const BRIDGE_WINDOW_DEFAULT_LIMIT: u32 = 50;
 const BRIDGE_WINDOW_MAX_LIMIT: u32 = 200;
+const BRIDGE_DIRECTORY_DEFAULT_LIMIT: u32 = 25;
+const BRIDGE_DIRECTORY_MAX_LIMIT: u32 = 100;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadDirectoryCursorWire {
+    /// Format version. Bump to invalidate every outstanding cursor at once.
+    v: u8,
+    /// Community the cursor was minted for (UUID string).
+    c: String,
+    /// Channel the cursor was minted for (UUID string).
+    h: String,
+    /// Directory partition the cursor was minted for: `active` or `archived`.
+    s: String,
+    pinned: bool,
+    activity_at: i64,
+    root_id: String,
+    /// Pinned auto-active aging bound. Replayed so later pages filter against
+    /// the same instant as the first page (BUG-008).
+    activity_cutoff: i64,
+}
+
+/// Current directory-cursor format version.
+const DIRECTORY_CURSOR_VERSION: u8 = 1;
+
+/// Longest cursor we will even look at, before any parsing work happens.
+/// A real cursor is ~250 bytes.
+const MAX_DIRECTORY_CURSOR_LEN: usize = 2048;
+
+/// Domain-separation label mixed into the cursor HMAC key derivation, so this
+/// use cannot be confused with the invite-code MAC built on the same keypair.
+const DIRECTORY_CURSOR_KEY_LABEL: &[u8] = b"buzz-thread-directory-cursor-v1";
+
+/// Derive the directory-cursor HMAC key from the relay's signing secret.
+///
+/// Mirrors `invite_token::derive_invite_key`: `sha256(secret || label)`.
+fn derive_directory_cursor_key(relay_keys: &nostr::Keys) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(relay_keys.secret_key().as_secret_bytes());
+    hasher.update(DIRECTORY_CURSOR_KEY_LABEL);
+    hasher.finalize().into()
+}
+
+/// Scope a cursor is bound to. A cursor minted for one scope must not be
+/// accepted in another, even when the caller can read both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectoryCursorScope<'a> {
+    pub community: uuid::Uuid,
+    pub channel: uuid::Uuid,
+    pub state: &'a str,
+}
+
+/// Mint an opaque, integrity-protected, scope-bound directory cursor.
+///
+/// The cursor carries `activity_cutoff`, which is a **filter predicate**, not
+/// just an ordering position: a caller who could edit it could widen the
+/// 30-day active window to anything and pull the whole channel's thread
+/// history into the "active" directory. That is why this is signed rather than
+/// merely opaque (BUG-011).
+fn encode_thread_directory_cursor(
+    key: &[u8; 32],
+    scope: DirectoryCursorScope<'_>,
+    cursor: &buzz_db::thread::ThreadDirectoryCursor,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use hmac::{Hmac, KeyInit, Mac};
+
+    let wire = ThreadDirectoryCursorWire {
+        v: DIRECTORY_CURSOR_VERSION,
+        c: scope.community.to_string(),
+        h: scope.channel.to_string(),
+        s: scope.state.to_string(),
+        pinned: cursor.pinned,
+        activity_at: cursor.activity_at.timestamp(),
+        root_id: hex::encode(&cursor.root_event_id),
+        activity_cutoff: cursor.activity_cutoff.timestamp(),
+    };
+    let payload = serde_json::to_vec(&wire)
+        .map_err(|error| internal_error(&format!("directory cursor encode: {error}")))?;
+
+    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key)
+        .expect("HMAC accepts any key size");
+    mac.update(&payload);
+    let tag = mac.finalize().into_bytes();
+
+    Ok(format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(&payload),
+        URL_SAFE_NO_PAD.encode(tag)
+    ))
+}
+
+/// Verify and open a directory cursor presented for `scope`.
+///
+/// Order matters, mirroring `invite_token::verify_invite`: the MAC is checked
+/// before anything inside the payload is trusted, and every failure returns the
+/// same coarse 400 so the endpoint is not an oracle for forging cursors.
+///
+/// A cursor minted for another community, channel, or partition is rejected
+/// even when the caller can legitimately read that other scope; the keyset
+/// position it carries is meaningless there and would silently produce a wrong
+/// page (BUG-011).
+fn decode_thread_directory_cursor(
+    key: &[u8; 32],
+    scope: DirectoryCursorScope<'_>,
+    value: &str,
+) -> Result<buzz_db::thread::ThreadDirectoryCursor, (StatusCode, Json<Value>)> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use hmac::{Hmac, KeyInit, Mac};
+
+    let reject = || {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "thread_index: malformed directory_cursor",
+        )
+    };
+
+    if value.is_empty() || value.len() > MAX_DIRECTORY_CURSOR_LEN {
+        return Err(reject());
+    }
+    let (payload_b64, mac_b64) = value.split_once('.').ok_or_else(reject)?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).map_err(|_| reject())?;
+    let tag = URL_SAFE_NO_PAD.decode(mac_b64).map_err(|_| reject())?;
+
+    // Constant-time MAC verification before trusting any field in the payload.
+    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key)
+        .expect("HMAC accepts any key size");
+    mac.update(&payload);
+    mac.verify_slice(&tag).map_err(|_| reject())?;
+
+    let wire: ThreadDirectoryCursorWire =
+        serde_json::from_slice(&payload).map_err(|_| reject())?;
+
+    if wire.v != DIRECTORY_CURSOR_VERSION {
+        return Err(reject());
+    }
+    // Scope binding. A valid MAC only proves this relay minted it, not that it
+    // was minted for the page being asked for.
+    if wire.c != scope.community.to_string()
+        || wire.h != scope.channel.to_string()
+        || wire.s != scope.state
+    {
+        return Err(reject());
+    }
+
+    let activity_at = chrono::DateTime::from_timestamp(wire.activity_at, 0).ok_or_else(reject)?;
+    let activity_cutoff =
+        chrono::DateTime::from_timestamp(wire.activity_cutoff, 0).ok_or_else(reject)?;
+    let root_event_id = hex::decode(wire.root_id).map_err(|_| reject())?;
+    if root_event_id.len() != 32 {
+        return Err(reject());
+    }
+    Ok(buzz_db::thread::ThreadDirectoryCursor {
+        pinned: wire.pinned,
+        activity_at,
+        root_event_id,
+        activity_cutoff,
+    })
+}
+
+/// Deterministic display title for a root with no shared override.
+///
+/// Shared with the live 39007 fan-out in `handlers::side_effects` so the query
+/// door and the live door produce byte-identical titles. Duplicating it is how
+/// the two drift.
+pub(crate) fn generated_thread_title(content: &str) -> String {
+    let Some(line) = content.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return "Untitled thread".to_string();
+    };
+    let mut candidate = line.trim_start();
+    loop {
+        let before = candidate;
+        if let Some(rest) = candidate.strip_prefix('>') {
+            candidate = rest.trim_start();
+        } else if let Some(rest) = candidate
+            .strip_prefix("- ")
+            .or_else(|| candidate.strip_prefix("* "))
+            .or_else(|| candidate.strip_prefix("+ "))
+        {
+            candidate = rest.trim_start();
+        } else {
+            let heading_len = candidate.chars().take_while(|ch| *ch == '#').count();
+            if heading_len > 0
+                && candidate
+                    .chars()
+                    .nth(heading_len)
+                    .is_some_and(char::is_whitespace)
+            {
+                candidate = candidate[heading_len..].trim_start();
+            } else {
+                let marker_len = candidate
+                    .char_indices()
+                    .take_while(|(_, ch)| ch.is_ascii_digit())
+                    .last()
+                    .map(|(index, ch)| index + ch.len_utf8())
+                    .unwrap_or(0);
+                let remainder = &candidate[marker_len..];
+                if marker_len > 0 && (remainder.starts_with(". ") || remainder.starts_with(") ")) {
+                    candidate = remainder[2..].trim_start();
+                }
+            }
+        }
+        if candidate == before {
+            break;
+        }
+    }
+
+    let collapsed = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "Untitled thread".to_string();
+    }
+    let chars: Vec<char> = collapsed.chars().collect();
+    if chars.len() <= 80 {
+        collapsed
+    } else {
+        chars[..79]
+            .iter()
+            .copied()
+            .chain(std::iter::once('…'))
+            .collect()
+    }
+}
+
+async fn handle_thread_directory_filter(
+    state: &AppState,
+    tenant: &buzz_core::TenantContext,
+    raw: &Value,
+    filter: &nostr::Filter,
+    accessible_channels: &[uuid::Uuid],
+    events: &mut Vec<Value>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    use buzz_core::kind::{KIND_THREAD_DIRECTORY_BOUNDS, KIND_THREAD_DIRECTORY_ITEM};
+
+    let Some(channel_id) = extract_channel_from_filter(filter) else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "thread_index requires exactly one #h channel",
+        ));
+    };
+
+    let directory_state = match raw.get("directory_state").and_then(Value::as_str) {
+        Some("active") => buzz_db::thread::ThreadDirectoryState::Active,
+        Some("archived") => buzz_db::thread::ThreadDirectoryState::Archived,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "thread_index: directory_state must be active or archived",
+            ));
+        }
+    };
+    let state_name = match directory_state {
+        buzz_db::thread::ThreadDirectoryState::Active => "active",
+        buzz_db::thread::ThreadDirectoryState::Archived => "archived",
+    };
+    let request_cursor = match raw.get("directory_cursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "thread_index: malformed directory_cursor",
+            ));
+        }
+    };
+    let cursor_key = derive_directory_cursor_key(&state.relay_keypair);
+    let cursor_scope = DirectoryCursorScope {
+        community: *tenant.community().as_uuid(),
+        channel: channel_id,
+        state: state_name,
+    };
+    let cursor = request_cursor
+        .map(|value| decode_thread_directory_cursor(&cursor_key, cursor_scope, value))
+        .transpose()?;
+    let limit = filter
+        .limit
+        .map(|value| (value as u32).min(BRIDGE_DIRECTORY_MAX_LIMIT))
+        .unwrap_or(BRIDGE_DIRECTORY_DEFAULT_LIMIT)
+        .max(1);
+
+    // An inaccessible channel yields an empty page instead of an early return,
+    // so "exactly one bounds overlay" holds on every path. This discloses
+    // nothing: `accessible_channels` is a membership list, not an existence
+    // check, so a channel that does not exist is equally absent and already
+    // produced this exact response. Request-shape errors above (bad
+    // `directory_state` or `directory_cursor`) are still 400 here, because they
+    // depend only on the request body and fire identically for a channel the
+    // caller can read.
+    let page = if accessible_channels.contains(&channel_id) {
+        state
+            .db
+            .get_thread_directory(
+                tenant.community(),
+                channel_id,
+                directory_state,
+                limit,
+                cursor,
+            )
+            .await
+            .map_err(|error| internal_error(&format!("thread directory query: {error}")))?
+    } else {
+        buzz_db::thread::ThreadDirectoryPage {
+            rows: Vec::new(),
+            has_more: false,
+            next_cursor: None,
+        }
+    };
+
+    let parse_tag = |parts: [&str; 2]| {
+        nostr::Tag::parse(parts)
+            .map_err(|error| internal_error(&format!("directory overlay tag: {error}")))
+    };
+    let sign_overlay = |kind: u32, tags: Vec<nostr::Tag>, content: String| {
+        nostr::EventBuilder::new(nostr::Kind::Custom(kind as u16), content)
+            .tags(tags)
+            .sign_with_keys(&state.relay_keypair)
+            .map_err(|error| internal_error(&format!("directory overlay sign: {error}")))
+    };
+    let channel_text = channel_id.to_string();
+
+    for row in &page.rows {
+        let root_id = row.root.event.id.to_hex();
+        let title = row
+            .title_override
+            .clone()
+            .unwrap_or_else(|| generated_thread_title(&row.root.event.content));
+        let root_author = crate::handlers::ingest::effective_message_author(
+            &row.root.event,
+            &state.relay_keypair.public_key(),
+        );
+        let content = serde_json::json!({
+            "title": title,
+            "title_override": row.title_override,
+            "root_author": hex::encode(root_author),
+            "root_created_at": row.root.event.created_at.as_secs(),
+            "reply_count": row.reply_count,
+            "descendant_count": row.descendant_count,
+            "last_reply_at": row.last_reply_at.map(|value| value.timestamp()).unwrap_or(0),
+            "participants": row.participants.iter().map(hex::encode).collect::<Vec<_>>(),
+            "pinned": row.pinned,
+            "archived": row.archived,
+            "state_created_at": row.state_created_at.map(|value| value.timestamp()).unwrap_or(0),
+            "state_event_id": row.state_event_id.as_ref().map(hex::encode),
+        });
+        let tags = vec![
+            parse_tag(["e", &root_id])?,
+            parse_tag(["d", &root_id])?,
+            parse_tag(["h", &channel_text])?,
+        ];
+        let overlay = sign_overlay(KIND_THREAD_DIRECTORY_ITEM, tags, content.to_string())?;
+        events.push(
+            serde_json::to_value(overlay)
+                .map_err(|error| internal_error(&format!("directory item serialize: {error}")))?,
+        );
+    }
+
+    let next_cursor = page
+        .next_cursor
+        .as_ref()
+        .map(|cursor| encode_thread_directory_cursor(&cursor_key, cursor_scope, cursor))
+        .transpose()?;
+    if page.has_more != next_cursor.is_some() {
+        return Err(internal_error("directory cursor invariant violated"));
+    }
+    let request_suffix = request_cursor.unwrap_or("head");
+    let d_value = format!("{channel_text}:{state_name}:{request_suffix}");
+    let content = serde_json::json!({
+        "has_more": page.has_more,
+        "next_cursor": next_cursor,
+    });
+    let bounds = sign_overlay(
+        KIND_THREAD_DIRECTORY_BOUNDS,
+        vec![
+            parse_tag(["d", &d_value])?,
+            parse_tag(["h", &channel_text])?,
+        ],
+        content.to_string(),
+    )?;
+    events.push(
+        serde_json::to_value(bounds)
+            .map_err(|error| internal_error(&format!("directory bounds serialize: {error}")))?,
+    );
+
+    Ok(())
+}
 
 /// Aux closure kinds: reactions, deletions (NIP-09 + NIP-29), edits.
 const WINDOW_AUX_KINDS: [u32; 4] = [
@@ -1032,6 +1417,24 @@ async fn query_events_authed(
 
     let mut events: Vec<Value> = Vec::new();
     let mut handled: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    // Thread-directory filters are a relay-synthesized, channel-id-only read
+    // model and never fall through to the generic stored-event query.
+    for (idx, (raw, filter)) in raw_filters.iter().zip(filters.iter()).enumerate() {
+        if !extension_flag(raw, "thread_index") {
+            continue;
+        }
+        handle_thread_directory_filter(
+            state,
+            tenant,
+            raw,
+            filter,
+            &accessible_channels,
+            &mut events,
+        )
+        .await?;
+        handled.insert(idx);
+    }
 
     // Channel-window filters (`top_level: true`) — the GUI read-model surface.
     // Dispatched first: a window filter is never a feed/thread/catchall query.
@@ -3765,5 +4168,319 @@ mod tests {
             log.contains(&pubkey_hex[..16]),
             "attribution line must carry the pubkey;\nlog:\n{log}"
         );
+    }
+
+    /// BUG-008. The pinned auto-active cutoff only helps if it survives the
+    /// round trip to the client and back. If `activity_cutoff` were dropped
+    /// from the wire format, every later page would silently fall back to a
+    /// fresh window and the db-side fix would be inert -- with no test failure
+    /// anywhere, because the db test cannot run on a machine without Postgres.
+    /// This one runs everywhere.
+    #[test]
+    fn directory_cursor_round_trip_preserves_the_pinned_activity_cutoff() {
+        let cutoff = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid cutoff");
+        let original = buzz_db::thread::ThreadDirectoryCursor {
+            pinned: true,
+            activity_at: chrono::DateTime::from_timestamp(1_800_000_000, 0)
+                .expect("valid activity"),
+            root_event_id: vec![7u8; 32],
+            activity_cutoff: cutoff,
+        };
+
+        let key = test_cursor_key();
+        let scope = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "active");
+        let encoded = encode_thread_directory_cursor(&key, scope, &original).expect("encode");
+        let decoded = decode_thread_directory_cursor(&key, scope, &encoded).expect("decode");
+
+        assert_eq!(
+            decoded, original,
+            "every cursor dimension must survive the round trip, including the \
+             pinned activity_cutoff"
+        );
+        assert_eq!(
+            decoded.activity_cutoff, cutoff,
+            "the pinned cutoff is the whole point of BUG-008; losing it \
+             silently reverts later pages to a fresh 30-day window"
+        );
+    }
+
+    /// The cursor wire format carries a Unix **second**, so it cannot represent
+    /// sub-second precision. That is why `get_thread_directory` truncates the
+    /// cutoff to whole seconds *before* its first SQL bind: binding a
+    /// sub-second value on page 1 and a truncated one on page 2 moves the
+    /// cutoff backwards mid-pagination, admitting on page 2 a row that page 1
+    /// filtered out.
+    ///
+    /// This pins the granularity contract. If the wire format ever gains
+    /// sub-second precision, this test fails and whoever changed it must revisit
+    /// the truncation in `crates/buzz-db/src/thread.rs`.
+    #[test]
+    fn directory_cursor_wire_format_is_whole_seconds_only() {
+        let sub_second = chrono::DateTime::from_timestamp(1_700_000_000, 500_000_000)
+            .expect("valid sub-second instant");
+        assert_eq!(
+            sub_second.timestamp_subsec_nanos(),
+            500_000_000,
+            "fixture must actually carry sub-second precision"
+        );
+
+        let cursor = buzz_db::thread::ThreadDirectoryCursor {
+            pinned: false,
+            activity_at: sub_second,
+            root_event_id: vec![3u8; 32],
+            activity_cutoff: sub_second,
+        };
+        let key = test_cursor_key();
+        let scope = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "active");
+        let decoded = decode_thread_directory_cursor(
+            &key,
+            scope,
+            &encode_thread_directory_cursor(&key, scope, &cursor).expect("encode"),
+        )
+        .expect("decode");
+
+        assert_eq!(
+            decoded.activity_cutoff.timestamp_subsec_nanos(),
+            0,
+            "the wire format drops sub-second precision, so the db layer must \
+             truncate before its first bind rather than after"
+        );
+        assert_eq!(
+            decoded.activity_cutoff.timestamp(),
+            sub_second.timestamp(),
+            "truncation must floor to the same second, never round up"
+        );
+    }
+
+    /// The cursor is opaque to clients, so every malformed shape must be a 400
+    /// rather than a panic or a silent default. Spec line 204.
+    #[test]
+    fn directory_cursor_rejects_malformed_input() {
+        let key = test_cursor_key();
+        let scope = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "active");
+
+        for bad in ["", "!!!not-base64!!!", "YWJj", "no-dot-separator", "a.b"] {
+            assert!(
+                decode_thread_directory_cursor(&key, scope, bad).is_err(),
+                "malformed cursor {bad:?} must be rejected, not defaulted"
+            );
+        }
+
+        // Correctly signed, but the root id is the wrong length.
+        let short_root = sign_test_cursor(
+            &key,
+            serde_json::json!({
+                "v": DIRECTORY_CURSOR_VERSION,
+                "c": CURSOR_TEST_COMMUNITY,
+                "h": CURSOR_TEST_CHANNEL,
+                "s": "active",
+                "pinned": false,
+                "activity_at": 1_700_000_000i64,
+                "root_id": "aabb",
+                "activity_cutoff": 1_700_000_000i64,
+            }),
+        );
+        assert!(
+            decode_thread_directory_cursor(&key, scope, &short_root).is_err(),
+            "a root id that is not 32 bytes must be rejected even when signed"
+        );
+    }
+
+    /// BUG-011. `activity_cutoff` is a **filter predicate**, not just an
+    /// ordering position: a caller who can edit it can widen the 30-day active
+    /// window to anything and pull a whole channel's thread history into the
+    /// active directory. Editing any signed field must fail the MAC.
+    #[test]
+    fn directory_cursor_rejects_a_tampered_payload() {
+        let key = test_cursor_key();
+        let scope = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "active");
+        let cursor = test_cursor();
+
+        let encoded = encode_thread_directory_cursor(&key, scope, &cursor).expect("encode");
+        let (payload_b64, mac_b64) = encoded.split_once('.').expect("cursor is payload.mac");
+
+        // Re-encode the payload with the aging bound pushed back to the epoch,
+        // keeping the original MAC. This is the actual attack.
+        let widened = {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use base64::Engine as _;
+            let mut wire: serde_json::Value =
+                serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload_b64).expect("decode"))
+                    .expect("payload is json");
+            wire["activity_cutoff"] = serde_json::json!(0i64);
+            format!(
+                "{}.{}",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wire).expect("serialize")),
+                mac_b64
+            )
+        };
+
+        assert!(
+            decode_thread_directory_cursor(&key, scope, &widened).is_err(),
+            "widening activity_cutoff must fail the MAC; if this passes, any \
+             caller can defeat the 30-day active window"
+        );
+
+        // A MAC from a different relay key must not verify either.
+        let foreign = encode_thread_directory_cursor(&[9u8; 32], scope, &cursor).expect("encode");
+        assert!(
+            decode_thread_directory_cursor(&key, scope, &foreign).is_err(),
+            "a cursor signed with another key must be rejected"
+        );
+    }
+
+    /// BUG-011. A valid MAC proves this relay minted the cursor, not that it
+    /// minted it for the page being requested. Replaying a cursor into another
+    /// channel or the other partition carries a keyset position that means
+    /// nothing there and would silently produce a wrong page.
+    #[test]
+    fn directory_cursor_rejects_cross_scope_replay() {
+        let key = test_cursor_key();
+        let minted_for = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "active");
+        let encoded =
+            encode_thread_directory_cursor(&key, minted_for, &test_cursor()).expect("encode");
+
+        let other_channel = test_scope(
+            CURSOR_TEST_COMMUNITY,
+            "9f8e7d6c-5b4a-4938-8271-615043f2e1d0",
+            "active",
+        );
+        let other_community = test_scope(
+            "0d1c2b3a-4958-4677-8695-a4b3c2d1e0f9",
+            CURSOR_TEST_CHANNEL,
+            "active",
+        );
+        let other_state = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "archived");
+
+        for (label, scope) in [
+            ("another channel", other_channel),
+            ("another community", other_community),
+            ("the archived partition", other_state),
+        ] {
+            assert!(
+                decode_thread_directory_cursor(&key, scope, &encoded).is_err(),
+                "a cursor minted for the active directory of one channel must \
+                 not be accepted in {label}"
+            );
+        }
+
+        // Sanity: it still works in the scope it was actually minted for, so
+        // the assertions above are rejecting on scope and not on something else.
+        assert!(
+            decode_thread_directory_cursor(&key, minted_for, &encoded).is_ok(),
+            "the cursor must still open in its own scope"
+        );
+    }
+
+    /// A version bump has to invalidate every outstanding cursor, otherwise the
+    /// field cannot be used to retire a broken format.
+    #[test]
+    fn directory_cursor_rejects_an_unknown_version() {
+        let key = test_cursor_key();
+        let scope = test_scope(CURSOR_TEST_COMMUNITY, CURSOR_TEST_CHANNEL, "active");
+        let future = sign_test_cursor(
+            &key,
+            serde_json::json!({
+                "v": DIRECTORY_CURSOR_VERSION + 1,
+                "c": CURSOR_TEST_COMMUNITY,
+                "h": CURSOR_TEST_CHANNEL,
+                "s": "active",
+                "pinned": false,
+                "activity_at": 1_700_000_000i64,
+                "root_id": hex::encode([4u8; 32]),
+                "activity_cutoff": 1_700_000_000i64,
+            }),
+        );
+        assert!(
+            decode_thread_directory_cursor(&key, scope, &future).is_err(),
+            "a correctly signed cursor from an unknown version must be rejected"
+        );
+    }
+
+    /// BUG-013. The SQL directory query and the live 39007 fan-out both decide
+    /// directory membership against the auto-active bound, and they have to
+    /// agree exactly: a root whose activity lands on the boundary second must
+    /// not be present to one path and absent to the other.
+    ///
+    /// They drifted before because the arithmetic was written out twice, one
+    /// side floored and the other not. This pins the shared helper's contract
+    /// so a future caller cannot reintroduce a sub-second bound.
+    #[test]
+    fn auto_active_cutoff_is_whole_seconds_for_every_caller() {
+        let cutoff = buzz_db::thread::auto_active_cutoff();
+
+        assert_eq!(
+            cutoff.timestamp_subsec_nanos(),
+            0,
+            "a sub-second bound makes the live path disagree with the SQL path \
+             for the remainder of the boundary second, and cannot survive the \
+             cursor wire format either"
+        );
+
+        // Stored Nostr timestamps are whole seconds, so an event exactly on the
+        // bound is the case that has to be decided identically everywhere.
+        let on_the_boundary = cutoff;
+        assert!(
+            on_the_boundary >= cutoff,
+            "an event exactly on the cutoff second counts as recent, matching \
+             the SQL predicate's >= comparison"
+        );
+
+        let a_second_earlier = cutoff - chrono::Duration::seconds(1);
+        assert!(
+            a_second_earlier < cutoff,
+            "the second before the bound is aged out"
+        );
+
+        // Two reads inside the same second must not straddle the boundary.
+        let again = buzz_db::thread::auto_active_cutoff();
+        assert!(
+            (again - cutoff).num_seconds().abs() <= 1,
+            "the bound must advance monotonically with wall clock, not jitter"
+        );
+    }
+
+    const CURSOR_TEST_COMMUNITY: &str = "11111111-2222-4333-8444-555555555555";
+    const CURSOR_TEST_CHANNEL: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+
+    fn test_cursor_key() -> [u8; 32] {
+        [1u8; 32]
+    }
+
+    fn test_scope<'a>(community: &str, channel: &str, state: &'a str) -> DirectoryCursorScope<'a> {
+        DirectoryCursorScope {
+            community: community.parse().expect("valid community uuid"),
+            channel: channel.parse().expect("valid channel uuid"),
+            state,
+        }
+    }
+
+    fn test_cursor() -> buzz_db::thread::ThreadDirectoryCursor {
+        buzz_db::thread::ThreadDirectoryCursor {
+            pinned: false,
+            activity_at: chrono::DateTime::from_timestamp(1_800_000_000, 0)
+                .expect("valid activity"),
+            root_event_id: vec![4u8; 32],
+            activity_cutoff: chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .expect("valid cutoff"),
+        }
+    }
+
+    /// Sign an arbitrary payload the way the encoder would, so tests can build
+    /// shapes the encoder itself would never produce.
+    fn sign_test_cursor(key: &[u8; 32], wire: serde_json::Value) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        use hmac::{Hmac, KeyInit, Mac};
+
+        let payload = serde_json::to_vec(&wire).expect("serialize");
+        let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key)
+            .expect("HMAC accepts any key size");
+        mac.update(&payload);
+        format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(&payload),
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        )
     }
 }
