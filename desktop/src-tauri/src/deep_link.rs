@@ -291,6 +291,112 @@ fn parse_nostr_bind_deep_link(url: &Url) -> Result<NostrBindDeepLinkPayload, Str
     })
 }
 
+/// A validated `buzz://restart-agent?…` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestartAgentRequest {
+    /// Lower-cased 64-hex agent pubkey.
+    pubkey: String,
+    /// Presented control token. Never logged.
+    token: String,
+    /// Restart only this pair when set; otherwise every live pair.
+    relay_url: Option<String>,
+}
+
+/// Parse `buzz://restart-agent?pubkey=<64 hex>&token=<token>[&relay=<ws(s)://…>]`.
+///
+/// Validation is strict and happens before the token is even looked at: the
+/// pubkey must be exactly 64 hex characters (the managed-agent key shape, see
+/// `ManagedAgentRuntimeKey::new`) so a malformed link can never reach the
+/// runtime registry, and an unparseable `relay` is an error rather than a
+/// silent fall-through to "restart everything".
+///
+/// Uppercase pubkeys are normalised rather than rejected: relay tooling and
+/// nostr clients disagree on case, and the runtime keys itself lower-case.
+///
+/// Pure so it can be unit-tested without a live `tauri::AppHandle`.
+fn parse_restart_agent_deep_link(url: &Url) -> Result<RestartAgentRequest, String> {
+    let pubkey = non_empty_param(url, "pubkey")?.to_ascii_lowercase();
+    if pubkey.len() != 64 || !pubkey.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("pubkey must be 64 hexadecimal characters".into());
+    }
+    let token = non_empty_param(url, "token")?;
+    let relay_url = match optional_non_empty_param(url, "relay") {
+        Some(_) => Some(
+            parse_websocket_relay_param(url)
+                .ok_or_else(|| "relay must be a ws:// or wss:// URL".to_string())?,
+        ),
+        None => None,
+    };
+    Ok(RestartAgentRequest {
+        pubkey,
+        token,
+        relay_url,
+    })
+}
+
+/// Carry out an authenticated `restart-agent` request.
+///
+/// Two distinct shapes, because "restart" means different things depending on
+/// whether anything is running:
+/// - one or more live pairs — stop+start each of them in place, off the async
+///   executor since `restart_managed_agent_runtime` blocks on process teardown;
+/// - no live pair at all (the common real-world case: the harness already died,
+///   which is *why* something is asking for a restart) — there is nothing to
+///   stop, so take the same start path as the UI's start button, preflight and
+///   persona re-snapshot included.
+async fn run_restart_agent_deep_link(app: tauri::AppHandle, request: RestartAgentRequest) {
+    let prefix: String = request.pubkey.chars().take(8).collect();
+
+    let relay_urls: Vec<String> = match request.relay_url.clone() {
+        Some(relay_url) => vec![relay_url],
+        None => {
+            let state = app.state::<crate::app_state::AppState>();
+            let Ok(runtimes) = state.managed_agent_processes.lock() else {
+                eprintln!("buzz-desktop: restart-agent {prefix}: runtime registry unavailable");
+                return;
+            };
+            crate::managed_agents::managed_agent_runtime_keys(&runtimes, &request.pubkey)
+                .into_iter()
+                .map(|key| key.relay_url)
+                .collect()
+        }
+    };
+
+    if relay_urls.is_empty() {
+        let state = app.state::<crate::app_state::AppState>();
+        match crate::commands::start_managed_agent(request.pubkey.clone(), app.clone(), state).await
+        {
+            Ok(_) => eprintln!("buzz-desktop: restart-agent {prefix}: started (no live pair)"),
+            Err(error) => {
+                eprintln!("buzz-desktop: restart-agent {prefix}: start failed: {error}");
+            }
+        }
+        return;
+    }
+
+    for relay_url in relay_urls {
+        let restart_app = app.clone();
+        let pubkey = request.pubkey.clone();
+        let logged_relay = relay_url.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
+            crate::managed_agents::restart_managed_agent_runtime(pubkey, relay_url, restart_app)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(status)) => eprintln!(
+                "buzz-desktop: restart-agent {prefix}: restarted on {logged_relay} (pid {:?})",
+                status.pid
+            ),
+            Ok(Err(error)) => eprintln!(
+                "buzz-desktop: restart-agent {prefix}: restart on {logged_relay} failed: {error}"
+            ),
+            Err(error) => eprintln!(
+                "buzz-desktop: restart-agent {prefix}: restart task on {logged_relay} failed: {error}"
+            ),
+        }
+    }
+}
+
 /// Handle an incoming `buzz://` deep link URL.
 ///
 /// Currently supports:
@@ -375,6 +481,39 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
                 eprintln!("buzz-desktop: rejecting nostr-bind deep link: {error}: {url_str}");
             }
         },
+        Some("restart-agent") => {
+            // `buzz://restart-agent?pubkey=<64 hex>&token=<control token>[&relay=<ws(s)://…>]`
+            //
+            // A machine-to-machine control link, not a user-facing one: a
+            // supervisor script fires it when an agent's harness has gone
+            // quiet. So unlike every arm above it neither activates the main
+            // window nor emits to the frontend — a background restart must not
+            // steal focus from whatever the user is doing.
+            //
+            // Authentication is the local control-token file, checked before
+            // any work is scheduled. A bad token gets a stderr line and
+            // nothing else: no dialog, no window, no distinguishable timing —
+            // an unauthenticated caller learns nothing, not even whether the
+            // named agent exists.
+            let request = match parse_restart_agent_deep_link(&url) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("buzz-desktop: rejecting restart-agent deep link: {error}");
+                    return;
+                }
+            };
+            if !crate::managed_agents::control_token::verify_control_token(app, &request.token) {
+                let prefix: String = request.pubkey.chars().take(8).collect();
+                eprintln!(
+                    "buzz-desktop: rejecting restart-agent deep link for {prefix}: invalid control token"
+                );
+                return;
+            }
+            // The restart itself is slow (process teardown, relay preflight)
+            // and this runs on the main thread, so hand it off and return.
+            let restart_app = app.clone();
+            tauri::async_runtime::spawn(run_restart_agent_deep_link(restart_app, request));
+        }
         Some(action) => {
             eprintln!("buzz-desktop: unknown deep link action: {action}");
         }
@@ -390,8 +529,11 @@ mod tests {
 
     use super::{
         parse_add_community_deep_link, parse_join_deep_link, parse_message_deep_link,
-        parse_nostr_bind_deep_link, PendingCommunityDeepLink, PendingCommunityDeepLinks,
+        parse_nostr_bind_deep_link, parse_restart_agent_deep_link, PendingCommunityDeepLink,
+        PendingCommunityDeepLinks,
     };
+
+    const AGENT_PUBKEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn pending(id: &str, relay_url: &str, code: Option<&str>) -> PendingCommunityDeepLink {
         PendingCommunityDeepLink {
@@ -700,6 +842,111 @@ mod tests {
     fn parse_nostr_bind_deep_link_rejects_unsupported_return_mode() {
         let url = Url::parse("buzz://nostr-bind?challenge_id=550e8400-e29b-41d4-a716-446655440000&nonce=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi01234567&verification_code=123456&audience=buzz%3Anostr-identity&action=bind_nostr_identity&protocol=buzz-nostr-identity&version=1&origin=https%3A%2F%2Fexample.com&expires_at=2999-01-01T00%3A00%3A00Z&return=callback").unwrap();
         assert!(parse_nostr_bind_deep_link(&url).is_err());
+    }
+
+    #[test]
+    fn parse_restart_agent_deep_link_extracts_pubkey_and_token() {
+        let url = Url::parse(&format!(
+            "buzz://restart-agent?pubkey={AGENT_PUBKEY}&token=s3cret"
+        ))
+        .unwrap();
+        let request = parse_restart_agent_deep_link(&url).unwrap();
+        assert_eq!(request.pubkey, AGENT_PUBKEY);
+        assert_eq!(request.token, "s3cret");
+        assert_eq!(request.relay_url, None);
+    }
+
+    #[test]
+    fn parse_restart_agent_deep_link_extracts_optional_relay() {
+        let url = Url::parse(&format!(
+            "buzz://restart-agent?pubkey={AGENT_PUBKEY}&token=s3cret&relay=wss%3A%2F%2Frelay.example"
+        ))
+        .unwrap();
+        let request = parse_restart_agent_deep_link(&url).unwrap();
+        assert_eq!(request.relay_url.as_deref(), Some("wss://relay.example"));
+    }
+
+    #[test]
+    fn parse_restart_agent_deep_link_normalizes_an_uppercase_pubkey() {
+        let url = Url::parse(&format!(
+            "buzz://restart-agent?pubkey={}&token=s3cret",
+            AGENT_PUBKEY.to_ascii_uppercase()
+        ))
+        .unwrap();
+        let request = parse_restart_agent_deep_link(&url).unwrap();
+        assert_eq!(request.pubkey, AGENT_PUBKEY);
+    }
+
+    #[test]
+    fn parse_restart_agent_deep_link_rejects_a_missing_or_empty_pubkey() {
+        for raw in [
+            "buzz://restart-agent?token=s3cret".to_owned(),
+            "buzz://restart-agent?pubkey=&token=s3cret".to_owned(),
+        ] {
+            assert_eq!(
+                parse_restart_agent_deep_link(&Url::parse(&raw).unwrap()).unwrap_err(),
+                "missing pubkey"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_restart_agent_deep_link_rejects_a_malformed_pubkey() {
+        for pubkey in [
+            "notahexstring",
+            &AGENT_PUBKEY[..63],
+            &format!("{AGENT_PUBKEY}0"),
+            &format!("{}zz", &AGENT_PUBKEY[..62]),
+        ] {
+            let url = Url::parse(&format!(
+                "buzz://restart-agent?pubkey={pubkey}&token=s3cret"
+            ))
+            .unwrap();
+            assert_eq!(
+                parse_restart_agent_deep_link(&url).unwrap_err(),
+                "pubkey must be 64 hexadecimal characters",
+                "{pubkey}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_restart_agent_deep_link_rejects_a_missing_or_empty_token() {
+        for raw in [
+            format!("buzz://restart-agent?pubkey={AGENT_PUBKEY}"),
+            format!("buzz://restart-agent?pubkey={AGENT_PUBKEY}&token="),
+        ] {
+            assert_eq!(
+                parse_restart_agent_deep_link(&Url::parse(&raw).unwrap()).unwrap_err(),
+                "missing token"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_restart_agent_deep_link_rejects_a_non_websocket_relay() {
+        // A present-but-invalid relay must fail, not silently degrade into the
+        // "restart every live pair" branch.
+        for relay in ["not-a-url", "https%3A%2F%2Frelay.example", "wss%3A%2F%2F"] {
+            let url = Url::parse(&format!(
+                "buzz://restart-agent?pubkey={AGENT_PUBKEY}&token=s3cret&relay={relay}"
+            ))
+            .unwrap();
+            assert_eq!(
+                parse_restart_agent_deep_link(&url).unwrap_err(),
+                "relay must be a ws:// or wss:// URL",
+                "{relay}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_restart_agent_deep_link_treats_an_empty_relay_as_absent() {
+        let url = Url::parse(&format!(
+            "buzz://restart-agent?pubkey={AGENT_PUBKEY}&token=s3cret&relay="
+        ))
+        .unwrap();
+        assert_eq!(parse_restart_agent_deep_link(&url).unwrap().relay_url, None);
     }
 
     #[test]
