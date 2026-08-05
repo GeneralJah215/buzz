@@ -1,3 +1,4 @@
+import type { QueryClient } from "@tanstack/react-query";
 import type {
   ThreadDirectoryItem,
   ThreadDirectoryPage,
@@ -60,7 +61,7 @@ type DirectoryQueryKey =
   | ReturnType<typeof threadDirectoryQueryKey>
   | ReturnType<typeof threadDirectoryLiveQueryKey>;
 
-export function sameThreadDirectoryQueryKey(
+function sameThreadDirectoryQueryKey(
   left: DirectoryQueryKey,
   right: DirectoryQueryKey,
 ): boolean {
@@ -70,9 +71,10 @@ export function sameThreadDirectoryQueryKey(
   );
 }
 
-type DirectoryScopeClient = {
-  removeQueries(options: { queryKey: DirectoryQueryKey; exact: true }): unknown;
-};
+type DirectoryScopeClient = Pick<
+  QueryClient,
+  "getQueryCache" | "removeQueries"
+>;
 
 export type ThreadDirectoryQueryScope = {
   client: DirectoryScopeClient;
@@ -80,30 +82,38 @@ export type ThreadDirectoryQueryScope = {
   liveQueryKey: ReturnType<typeof threadDirectoryLiveQueryKey>;
 };
 
-/** Drop only an obsolete exact scope; sibling channels remain untouched. */
-export function discardPreviousThreadDirectoryScope(
-  previous: ThreadDirectoryQueryScope | null,
+function removeUnobservedThreadDirectoryQuery(
+  scope: ThreadDirectoryQueryScope,
+  queryKey: DirectoryQueryKey,
+) {
+  const query = scope.client.getQueryCache().find({ queryKey, exact: true });
+  if (query && query.getObserversCount() > 0) return;
+  void scope.client.removeQueries({ queryKey, exact: true });
+}
+
+/** Drop only keys replaced during a mounted scope transition. */
+export function discardReplacedThreadDirectoryScope(
+  previous: ThreadDirectoryQueryScope,
   current: ThreadDirectoryQueryScope,
 ) {
-  if (!previous) return;
   if (
     previous.client !== current.client ||
     !sameThreadDirectoryQueryKey(previous.queryKey, current.queryKey)
   ) {
-    void previous.client.removeQueries({
-      queryKey: previous.queryKey,
-      exact: true,
-    });
+    removeUnobservedThreadDirectoryQuery(previous, previous.queryKey);
   }
   if (
     previous.client !== current.client ||
     !sameThreadDirectoryQueryKey(previous.liveQueryKey, current.liveQueryKey)
   ) {
-    void previous.client.removeQueries({
-      queryKey: previous.liveQueryKey,
-      exact: true,
-    });
+    removeUnobservedThreadDirectoryQuery(previous, previous.liveQueryKey);
   }
+}
+
+/** Drop both exact caches for one captured scope; sibling channels survive. */
+export function discardThreadDirectoryScope(scope: ThreadDirectoryQueryScope) {
+  removeUnobservedThreadDirectoryQuery(scope, scope.queryKey);
+  removeUnobservedThreadDirectoryQuery(scope, scope.liveQueryKey);
 }
 
 function activityAt(

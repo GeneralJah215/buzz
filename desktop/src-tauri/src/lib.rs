@@ -9,6 +9,7 @@ mod event_sync;
 mod events;
 mod huddle;
 mod identity_storage;
+mod initial_window;
 mod key_backup;
 mod linux_media;
 mod managed_agents;
@@ -75,16 +76,6 @@ use tray_menu::show_main_window;
 
 #[cfg(target_os = "macos")]
 const INITIAL_RENDER_READY_EVENT: &str = "initial-render-ready";
-
-fn reveal_initial_window<R: tauri::Runtime>(window: &tauri::Window<R>) {
-    if let Err(error) = window.show() {
-        eprintln!("buzz-desktop: failed to reveal main window: {error}");
-        return;
-    }
-    if let Err(error) = window.set_focus() {
-        eprintln!("buzz-desktop: failed to focus main window: {error}");
-    }
-}
 
 #[cfg(target_os = "macos")]
 fn set_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<R>) {
@@ -236,14 +227,14 @@ pub fn run() {
                                 );
                             }
 
-                            reveal_initial_window(&window);
+                            initial_window::reveal(&window);
                             clear_initial_window_backing(&window).await;
                         });
                     }
 
                     #[cfg(not(target_os = "macos"))]
                     {
-                        reveal_initial_window(&window);
+                        initial_window::reveal(&window);
                     }
                 })
                 .build(),

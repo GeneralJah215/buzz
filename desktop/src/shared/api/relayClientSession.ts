@@ -9,9 +9,6 @@ import {
   KIND_STREAM_MESSAGE,
   KIND_TYPING_INDICATOR,
   KIND_USER_STATUS,
-  CHANNEL_EVENT_KINDS,
-  KIND_CHANNEL_THREAD_SUMMARY,
-  KIND_THREAD_DIRECTORY_ITEM,
 } from "@/shared/constants/kinds";
 import {
   getTextPayload,
@@ -66,6 +63,7 @@ import {
   STALL_IDLE_TIMEOUT_MS,
 } from "@/shared/api/relayClientTimings";
 import { closeWebSocket } from "@/shared/api/relayWebSocketClose";
+import * as live from "@/shared/api/relayLiveSubscriptionFilters";
 import { buildThreadReferenceTags } from "@/features/messages/lib/threading";
 
 export class RelayClient {
@@ -326,18 +324,7 @@ export class RelayClient {
     channelId: string,
     onEvent: (event: RelayEvent) => void,
   ) {
-    return this.subscribe(
-      {
-        // 39005 rides only this window-store subscription — not
-        // CHANNEL_EVENT_KINDS, whose other consumers (unread tracking,
-        // timeline-cache merges) must never see summary overlays.
-        kinds: [...CHANNEL_EVENT_KINDS, KIND_CHANNEL_THREAD_SUMMARY],
-        "#h": [channelId],
-        limit: 1000,
-        since: Math.floor(Date.now() / 1_000),
-      },
-      onEvent,
-    );
+    return this.subscribe(live.channelFilter(channelId), onEvent);
   }
 
   /** Subscribe only to live thread-directory item overlays, never timeline rows. */
@@ -345,15 +332,7 @@ export class RelayClient {
     channelId: string,
     onEvent: (event: RelayEvent) => void,
   ) {
-    return this.subscribe(
-      {
-        kinds: [KIND_THREAD_DIRECTORY_ITEM],
-        "#h": [channelId],
-        limit: 0,
-        since: Math.floor(Date.now() / 1_000),
-      },
-      onEvent,
-    );
+    return this.subscribe(live.threadDirectoryFilter(channelId), onEvent);
   }
 
   /**

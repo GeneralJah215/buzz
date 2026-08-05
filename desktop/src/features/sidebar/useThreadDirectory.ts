@@ -18,7 +18,8 @@ import {
 } from "@/shared/api/threadDirectory";
 import type { RelayEvent } from "@/shared/api/types";
 import {
-  discardPreviousThreadDirectoryScope,
+  discardThreadDirectoryScope,
+  discardReplacedThreadDirectoryScope,
   mergeThreadDirectoryLiveProjection,
   reconcileThreadDirectoryItems,
   rollbackThreadDirectoryOptimisticProjection,
@@ -110,12 +111,52 @@ export function useThreadDirectory({
     () => threadDirectoryLiveQueryKey(communityId, relayUrl, pubkey, channelId),
     [channelId, communityId, pubkey, relayUrl],
   );
-  const previousScopeRef = React.useRef<ThreadDirectoryQueryScope | null>(null);
+  const currentScope = React.useMemo<ThreadDirectoryQueryScope>(
+    () => ({ client: queryClient, queryKey, liveQueryKey }),
+    [liveQueryKey, queryClient, queryKey],
+  );
+  const latestScopeRef = React.useRef(currentScope);
+  const mountedScopeRef = React.useRef<ThreadDirectoryQueryScope | null>(null);
+  React.useLayoutEffect(() => {
+    latestScopeRef.current = currentScope;
+  }, [currentScope]);
   React.useEffect(() => {
-    const currentScope = { client: queryClient, queryKey, liveQueryKey };
-    discardPreviousThreadDirectoryScope(previousScopeRef.current, currentScope);
-    previousScopeRef.current = currentScope;
-  }, [liveQueryKey, queryClient, queryKey]);
+    mountedScopeRef.current = currentScope;
+    return () => {
+      if (mountedScopeRef.current === currentScope) {
+        mountedScopeRef.current = null;
+      }
+      if (latestScopeRef.current !== currentScope) {
+        const nextScope = latestScopeRef.current;
+        discardReplacedThreadDirectoryScope(currentScope, nextScope);
+        // Query observers switch keys later in passive cleanup. Retry once in
+        // the next task: obsolete unobserved keys are then removable, while a
+        // key still shared by another mounted consumer remains protected.
+        setTimeout(() => {
+          discardReplacedThreadDirectoryScope(currentScope, nextScope);
+        }, 0);
+        return;
+      }
+      // StrictMode immediately remounts the same effect in development, while
+      // Query observers unsubscribe later in passive cleanup. Check next task:
+      // a simulated remount is active, and a real unmount has zero observers.
+      setTimeout(() => {
+        if (mountedScopeRef.current !== currentScope) {
+          discardThreadDirectoryScope(currentScope);
+        }
+      }, 0);
+    };
+  }, [currentScope]);
+  const liveScopeCanWriteCache = React.useCallback(() => {
+    const mountedScope = mountedScopeRef.current;
+    return (
+      mountedScope?.client === queryClient &&
+      mountedScope.liveQueryKey === liveQueryKey &&
+      queryClient
+        .getQueryCache()
+        .find({ queryKey: liveQueryKey, exact: true }) !== undefined
+    );
+  }, [liveQueryKey, queryClient]);
   const liveQuery = useQuery({
     queryKey: liveQueryKey,
     queryFn: () => Promise.resolve(EMPTY_LIVE_STATE),
@@ -166,6 +207,7 @@ export function useThreadDirectory({
             );
             return;
           }
+          if (!liveScopeCanWriteCache()) return;
           queryClient.setQueryData<ThreadDirectoryLiveState>(
             liveQueryKey,
             (current = EMPTY_LIVE_STATE) =>
@@ -180,6 +222,7 @@ export function useThreadDirectory({
       },
     });
     const unsubscribeReconnect = relayClient.subscribeToReconnects(() => {
+      if (!liveScopeCanWriteCache()) return;
       queryClient.setQueryData<ThreadDirectoryLiveState>(
         liveQueryKey,
         (current = EMPTY_LIVE_STATE) => ({
@@ -194,7 +237,14 @@ export function useThreadDirectory({
       unsubscribeReconnect();
       subscription.dispose();
     };
-  }, [channelId, liveQueryKey, queryClient, queryEnabled, queryKey]);
+  }, [
+    channelId,
+    liveQueryKey,
+    liveScopeCanWriteCache,
+    queryClient,
+    queryEnabled,
+    queryKey,
+  ]);
 
   const mutation = useMutation<
     RelayEvent,
@@ -213,6 +263,13 @@ export function useThreadDirectory({
     },
     onMutate: async ({ rootId, snapshot }) => {
       await queryClient.cancelQueries({ queryKey, exact: true });
+      if (!liveScopeCanWriteCache()) {
+        return {
+          rootId,
+          previousProjection: undefined,
+          optimisticOrder: null,
+        };
+      }
       const previous =
         queryClient.getQueryData<ThreadDirectoryLiveState>(liveQueryKey) ??
         EMPTY_LIVE_STATE;
@@ -255,7 +312,12 @@ export function useThreadDirectory({
       };
     },
     onError: (_error, _variables, context) => {
-      if (!context || context.optimisticOrder === null) return;
+      if (
+        !context ||
+        context.optimisticOrder === null ||
+        !liveScopeCanWriteCache()
+      )
+        return;
       const optimisticOrder = context.optimisticOrder;
       queryClient.setQueryData<ThreadDirectoryLiveState>(
         liveQueryKey,
