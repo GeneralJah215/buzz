@@ -506,6 +506,17 @@ pub fn run() {
                 mgr.start_tts_download(state.http_client.clone());
             }
 
+            // Mint the external-control token before any deep link can be
+            // delivered. `buzz://restart-agent` authenticates against this file,
+            // and the cold-start link is dispatched from the registration just
+            // below — so a token that appeared later would reject the very first
+            // request. Non-fatal: without it, control links simply fail closed.
+            if let Err(error) =
+                managed_agents::control_token::load_or_create_control_token(&app_handle)
+            {
+                eprintln!("buzz-desktop: failed to prepare agent control token: {error}");
+            }
+
             // Handle deep link URLs received while the app is running (macOS)
             // and on cold start. The single-instance plugin handles forwarding
             // from duplicate launches on Windows/Linux.
