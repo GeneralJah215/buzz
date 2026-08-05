@@ -1,9 +1,11 @@
 # SPEC-2026-08-05 — buzz-edge Phase 1: Local Continuity
 
-Status: APPROVED build (option 3, James, 2026-08-05); spec revision 4 answering
+Status: APPROVED build (option 3, James, 2026-08-05); spec revision 5 answering
 Ava FAIL verdicts on `d5382d11e` (rev-1, event `28d54430…`), `5b96643d8`
-(rev-2 R1–R6, event `d3aa9d73…`), and `951eece30` (rev-3 findings 1–3, event
-`8f242013…`; finding 3's lease duration is an owner decision, recorded in §7).
+(rev-2 R1–R6, event `d3aa9d73…`), `951eece30` (rev-3 findings 1–3, event
+`8f242013…`; finding 3's lease duration is an owner decision, recorded in §7),
+and `48cbd7c4d` (rev-4 finding 1 — roster freshness, event `39657457…`; the
+residual author-revocation risk is an owner decision, recorded in §7).
 Spec owner: Cody. Builder: Forge. Reviewer: Ava (this document is the single review artifact).
 Base: `44337aa4f54ee17a7eb85c708ccc8fccc3bae5bb` (fork checkout `restart-patch-on-desktop-v0.5.5`).
 
@@ -117,7 +119,7 @@ Event allowlist and local ingress:
    community.
 2. At local ingress it verifies the event signature; requires the event pubkey
    to match the authenticated NIP-42/NIP-98 principal; checks channel
-   membership against the current authorization snapshot (§7); stores the
+   membership against the current working roster (§7); stores the
    exact signed event bytes plus a device-signed local receipt; returns `OK`;
    and fans out to all local subscribers immediately.
 3. It never re-signs or mutates a user's event, so event IDs and reply
@@ -177,32 +179,108 @@ Edge identity provisioning (answers F1):
    visibility itself grants access.
 7. A channel is **eligible for edge routing only if the edge identity's
    membership in it is confirmed or covered by a valid authorization lease**
-   (answers rev-2 R1; contents extended per rev-3 review). On every
-   successful upstream verification the sidecar persists an **authorization
-   snapshot** in SQLite as one atomic signed record — verified by the edge
-   key on load — containing: the community binding; the eligible channel
-   set; **the complete per-channel active-author roster**, taken from the
-   relay-signed membership state (NIP-43 kind-39002 list) together with its
-   source event ID and the upstream cursor; and `verified_at`. Local ingress
-   (§2) authorizes submitting principals against exactly this roster —
-   author authorization and edge eligibility therefore share one
-   `verified_at` and one lease bound; no separately-aging member cache
-   exists. The snapshot is only ever replaced whole, never partially
-   updated. Refresh cadence: on every reconnect, and at least every 6 hours
-   while online, each refresh preceded by a full upstream session recycle
-   (§6). Startup rules, exactly: if upstream is reachable, verify fresh
-   before serving. If upstream is unreachable, serve from the snapshot only
-   while `now − verified_at ≤ LEASE` (LEASE = owner-selected duration; see
-   the owner-decision record below); past the lease, fail closed to
+   (answers rev-2 R1; contents extended per rev-3 review; roster-freshness
+   contract corrected per rev-4 review). Two different trust levels are in
+   play, and this spec names them separately rather than letting one
+   `verified_at` imply both:
+
+   **(a) Edge eligibility — authoritative.** The relay enforces the edge
+   identity's own access at every AUTH and on every read it performs
+   (`crates/buzz-relay/src/handlers/auth.rs:216-238`;
+   `crates/buzz-relay/src/handlers/req.rs:94,133-167`). A refresh therefore
+   proves edge eligibility directly: authenticate fresh, read each selected
+   channel, record what succeeded. `verified_at` attests exactly this
+   authoritative check and nothing more.
+
+   **(b) Author roster — a relay-signed projection plus removal signals,
+   not an authoritative read.** The per-channel active-author roster comes
+   from the kind-39002 group-members list (NIP-29 group membership, not
+   NIP-43 relay membership — label corrected per rev-4 review). The pinned
+   relay commits a membership mutation first, then publishes the updated
+   kind-39002 **best-effort**: emission failure is swallowed with a warning
+   (`crates/buzz-relay/src/handlers/side_effects.rs:1624-1666` —
+   `remove_member` commits at `:1624-1627`, discovery-emission failure
+   warned at `:1651-1653`; same shape on self-leave at `:2307-2329`), and
+   production runs no reconciliation that repairs a stale projection (the
+   only reconciler is dev/CI-gated behind `BUZZ_RECONCILE_CHANNELS`,
+   `crates/buzz-relay/src/main.rs:572-576`, and repairs only missing
+   kind-39000). No client-readable authoritative per-channel member read
+   exists in the pinned tree — the CLI's own `channels members` reads the
+   same kind-39002 projection
+   (`crates/buzz-cli/src/commands/channels.rs`, `cmd_list_channel_members`).
+   Normative rules that follow:
+   - **Re-fetching an unchanged kind-39002 proves nothing and renews
+     nothing.** The snapshot stores the roster's source event ID, that
+     event's `created_at`, and the fetch cursor. A refresh returning the
+     same event ID advances no freshness field. Roster state advances only
+     when a kind-39002 with a different event ID is fetched, and then only
+     by whole-record replacement.
+   - **Removal signals force immediate local revocation.** The sidecar
+     consumes three independent relay-signed carriers of a removal, all
+     available for its selected channels: (1) a changed kind-39002; (2) the
+     kind-40099 channel system message with type `member_removed` /
+     `member_left` emitted by every removal handler
+     (`side_effects.rs:759-779` definition; emitted at `:1639-1649` and
+     `:2316-2325`) — channel-scoped, so the §8 mirror receives it live and
+     in reconnect catch-up; (3) the kind-44100/44101 global membership
+     notifications (`side_effects.rs:1140-1196`), the same stream the ACP
+     harness already consumes (`crates/buzz-acp/src/relay.rs:3238-3250`).
+     On any removal signal for (channel, author), that author leaves the
+     working roster immediately — local ingress fails closed for them — and
+     is re-authorized only by a subsequently fetched kind-39002 with a
+     different event ID that lists them.
+   - **A canonical rejection is authoritative.** If an author's drain
+     submission is rejected upstream for membership, the sidecar marks that
+     (channel, author) revoked exactly as if a removal signal had arrived.
+   - **The claim this spec makes — and the one it does not.** Online author
+     revocation is signal-driven: it takes local effect on receipt of any
+     carrier, ordinarily within seconds, and never later than the next
+     refresh that observes a changed kind-39002. It is **not guaranteed
+     bounded**: every carrier is best-effort in the pinned relay, so if the
+     kind-39002 republication, the kind-40099 system message, and the
+     kind-44101 notification are all lost, a removed author retains
+     **local-only** ingress on this one PC until a later signal, roster
+     change, or canonical rejection arrives. Canonical history is never
+     exposed — the canonical relay re-checks membership at ingest and
+     rejects them regardless. Fail-closed roster expiry was considered and
+     rejected: with no authoritative read to renew against, a roster-age
+     timer would shut off quiet channels on a schedule, defeating the
+     availability goal of the project.
+     **Owner-decision record (residual author-revocation risk):** requested
+     from James 2026-08-05 (buzz-infra event `64e06a08…`; options accept
+     residual / fail closed, recommendation accept). DECIDED 2026-08-05:
+     **accept the residual** (Option A). Reply event
+     `adb16c155dfa97ec576e8667fecb95f535d2a1823cc45128f54a43ef30c9e023`
+     (buzz-infra, 2026-08-05T19:42:18Z, verbatim: "lets go with A").
+
+   Snapshot contents (one atomic signed record, verified by the edge key on
+   load, replaced whole, never partially updated): the community binding;
+   the eligible channel set; the per-channel author roster with its source
+   kind-39002 event ID, that event's `created_at`, and the fetch cursor;
+   the signal cursor (last processed kind-40099/44101 position per
+   channel); and `verified_at` (edge-eligibility attestation time). Local
+   ingress (§2) authorizes submitting principals against the **working
+   roster**: the snapshot roster minus every author since removed by a
+   removal signal or canonical rejection. Refresh cadence: on every
+   reconnect, and at least every 6 hours while online, each refresh
+   preceded by a full upstream session recycle (§6). Startup rules,
+   exactly: if upstream is reachable, verify edge eligibility fresh and
+   process the mirrored signal backlog before first ingress. If upstream is
+   unreachable, serve from the snapshot only while
+   `now − verified_at ≤ LEASE` (LEASE = owner-selected duration; see the
+   owner-decision record below); past the lease, fail closed to
    canonical-only (which, offline, means messaging halts — disclosed, not
    hidden). Trade-off stated: within the lease, a revocation performed
    upstream during a total outage — of the edge identity or of any local
-   author — is enforced locally only at the next successful verification
-   (revocation lag ≤ LEASE). On reconnect the sidecar refreshes the snapshot
-   first, before any drain; channels or authors revoked while offline drop
-   immediately — no local ingress, no mirroring, cached rows retained
-   read-only, their queued events follow the §12 revocation rule, and
-   clients transparently fall back to canonical.
+   author — is enforced locally only at the next successful reconnect:
+   lag ≤ LEASE for the edge identity's own eligibility; for authors,
+   reconnect catch-up delivers the mirrored removal signals, subject to the
+   lost-signal residual disclosed above. On reconnect the sidecar refreshes
+   eligibility and processes the signal backlog first, before any drain;
+   channels or authors revoked while offline drop immediately — no local
+   ingress, no mirroring, cached rows retained read-only, their queued
+   events follow the §12 revocation rule, and clients transparently fall
+   back to canonical.
    **Owner-decision record (LEASE):** requested from James 2026-08-05
    (buzz-infra event `4e7c5563…`; options 24 h / 72 h / 7 d, recommendation
    72 h). DECIDED 2026-08-05: **LEASE = 7 days (168 hours)**, chosen by
@@ -213,6 +291,10 @@ Edge identity provisioning (answers F1):
 8. Using the edge identity, the sidecar subscribes upstream to the selected
    channels and mirrors received events and member state into SQLite, so
    local reads are served from loopback even when upstream is merely slow.
+   The mirror explicitly includes the §7 removal-signal kinds — kind-40099
+   channel system messages and kind-44100/44101 membership notifications —
+   consumed live while connected and as backlog during reconnect catch-up,
+   feeding the working-roster rules of §7.
 
 Reconnect synchronization — durable outbox:
 
@@ -316,9 +398,10 @@ collection counts):
 
 - M1 — this spec reviewed by Ava (gates M3+; M2 may run in parallel).
 - M2 — sidecar core (~3d): loopback relay, SQLite schema incl. drain-state
-  outbox, community binding, authorization-lease snapshot, and digest
-  materialization store; signature/membership checks, `REQ`/`COUNT` subset,
-  local fan-out, edge-identity provisioning verification.
+  outbox, community binding, authorization-lease snapshot (with roster
+  source-event fields, signal cursor, and working-roster removals), and
+  digest materialization store; signature/membership checks, `REQ`/`COUNT`
+  subset, local fan-out, edge-identity provisioning verification.
 - M3 — routing split (~2d): Desktop, CLI message paths, ACP two-client
   topology, community-switch fail-closed behavior.
 - M4 — reconnect sync (~2d): author-drain protocol, digest fallback, dual
@@ -377,11 +460,23 @@ not summaries):
    always refreshes the snapshot before drain begins; (e) **local author
    removed from a channel while offline** → within the lease their local
    ingress continues (disclosed lag), and it stops at the reconnect refresh
-   — the stated boundary; (f) **local author removed while online** → their
-   local ingress stops at the next snapshot refresh, within the 6-hour
-   cadence; (g) **local author added to a channel while offline** → they
-   cannot write through the edge until a refreshed roster authorizes them
-   (canonical-only in the meantime, once online).
+   — the stated boundary; (f) **local author removed while online, healthy
+   announcement path** → their local ingress stops on receipt of the first
+   mirrored removal signal (proven via the kind-40099 system message), not
+   merely at the next 6-hour refresh; (g) **local author added to a channel
+   while offline** → they cannot write through the edge until a refreshed
+   kind-39002 with a different event ID authorizes them (canonical-only in
+   the meantime, once online); (h) **roster-staleness fault injection**
+   (rev-4 finding 1): commit a channel-member removal upstream, force the
+   kind-39002 republication to fail, keep upstream reachable through at
+   least two refresh cycles (compressed clock). Prove three things: the
+   unchanged kind-39002 re-fetch advances no freshness field of the stored
+   snapshot; the removed author is blocked from local ingress from the
+   moment the mirrored kind-40099/kind-44101 signal arrives; and in the
+   variant with all three carriers suppressed, the removed author's
+   local-only ingress persists exactly as the §7 residual discloses, their
+   drain submission is rejected by canonical ingest, and that rejection then
+   revokes them locally — the contract's stated boundary, nothing stronger.
 8. **Mixed-age thread gate** (rev-2 R2): author A posts a thread root at
    T−16 minutes, author B replies at T−5 minutes, reconnect at T. Prove the
    root and the reply both go to the digest path, in order; no orphan
@@ -431,10 +526,13 @@ Failure-mode and protocol tests:
     and waiting-for-author indicator each shown driven by real sidecar state,
     not mocks.
 19. Unit/integration coverage per milestone: ingress validation (signature,
-    principal match, membership), `REQ`/`COUNT` subset conformance, outbox
-    dependency gating (global ancestor rule, per-author FIFO within the
-    claimable set), digest construction (ordering, mention neutralization,
-    chunking determinism, edge-identity signature), routing split.
+    principal match, working-roster membership), removal-signal processing
+    (kind-40099 and kind-44101 parsing, working-roster removal, no freshness
+    advance on unchanged kind-39002), `REQ`/`COUNT` subset conformance,
+    outbox dependency gating (global ancestor rule, per-author FIFO within
+    the claimable set), digest construction (ordering, mention
+    neutralization, chunking determinism, edge-identity signature), routing
+    split.
 
 ## Safety implications
 
@@ -456,13 +554,17 @@ Failure-mode and protocol tests:
   the two-part post-revocation gate); selected private-channel membership
   removal is the per-operation lever. The sidecar's 6-hour online session
   recycle bounds its own live-session exposure.
-- **Bounded revocation lag offline** (rev-2 R1): within the owner-selected
-  authorization lease, a revocation issued during a total outage — of the
-  edge identity or of any local author, since the author roster lives inside
-  the same signed snapshot — takes local effect only at the next successful
-  upstream verification. This window is a stated design trade-off chosen by
-  the owner, not an oversight; reconnect enforces revocation before any
-  queued submission drains.
+- **Revocation propagation, exactly** (rev-2 R1; corrected per rev-4
+  review): the edge identity's own access is enforced authoritatively by
+  the relay at every AUTH and read. Local **author** authorization rests on
+  a relay-signed projection plus three independent removal signals (§7); it
+  takes local effect on the first signal received — ordinarily seconds —
+  and is enforced without exception at canonical ingest, but it is not
+  guaranteed bounded locally when every carrier is lost. That residual is
+  disclosed in §7, carries an owner-decision record there, and its blast
+  radius is local-only delivery on this one PC. Offline, the owner-selected
+  lease bounds continuation; reconnect processes mirrored removal signals
+  and refreshes eligibility before any queued submission drains.
 - **Loopback only.** The sidecar binds to localhost exclusively. No LAN or
   remote exposure; no new open ports beyond loopback.
 - **Canonical relay untouched.** No server-side code ships or deploys in this
