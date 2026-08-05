@@ -1,8 +1,8 @@
 # SPEC-2026-08-05 — buzz-edge Phase 1: Local Continuity
 
-Status: APPROVED build (option 3, James, 2026-08-05); spec revision 2 answering
-Ava FAIL verdict on commit `d5382d11ebf5a56f944919d69a6dc15fa9bf532c` (findings
-F1–F6, buzz-infra event `28d54430…`).
+Status: APPROVED build (option 3, James, 2026-08-05); spec revision 3 answering
+Ava FAIL verdicts on `d5382d11e` (rev-1 findings, event `28d54430…`) and
+`5b96643d8` (rev-2 findings R1–R6, event `d3aa9d73…`).
 Spec owner: Cody. Builder: Forge. Reviewer: Ava (this document is the single review artifact).
 Base: `44337aa4f54ee17a7eb85c708ccc8fccc3bae5bb` (fork checkout `restart-patch-on-desktop-v0.5.5`).
 
@@ -57,6 +57,13 @@ New code:
 - Desktop drain + status IPC: new `desktop/src-tauri/src/commands/edge_status.rs`
   (registered alongside existing commands) exposing delivery-state,
   quarantine, and drain-trigger commands to the frontend.
+- Desktop supervisor: new `desktop/src-tauri/src/edge_supervisor.rs` — verifies
+  and repairs the scheduled task at every launch and after upgrades, performs
+  the readiness gate and health-check respawn of Behavior contract §16.
+- Installer hooks: new `desktop/src-tauri/windows/edge-task.nsi`, wired via a
+  new `bundle > windows > nsis > installerHooks` entry in
+  `desktop/src-tauri/tauri.conf.json` (no NSIS section exists in the pinned
+  tree today) — registers, upgrades, and unregisters the scheduled task.
 - Desktop UI: new feature module `desktop/src/features/edge-status/` — the two
   delivery-state labels, the quarantine list, and the "waiting for author"
   indicator. No existing feature module is repurposed.
@@ -83,11 +90,18 @@ Modified code (routing split — edge URL for message paths only):
 - `Justfile:151-158, 235+`: add the sidecar to build/stub/release lists.
 
 Packaging and watchdog (decided now, not deferred to M5): `buzz-edge.exe` is
-bundled via Tauri `externalBin` and registered at install time as a Windows
-Scheduled Task at user logon, so it starts before Desktop and restarts
-independently of it. Desktop additionally health-checks the sidecar at launch
-and respawns it if absent. M5 wires the gates; it does not choose the
-packaging form.
+bundled via Tauri `externalBin`. The NSIS installer hook registers a Windows
+Scheduled Task scoped to the installing user (no elevation, `LimitedToken`),
+with the executable path quoted, trigger = user logon, and restart-on-failure
+with backoff (three restarts at 1-minute intervals per failure window); the
+hook re-registers on upgrade and unregisters + stops the process on uninstall.
+A logon task alone guarantees neither start-before-Desktop nor crash recovery,
+so `edge_supervisor.rs` closes both gaps: at every Desktop launch it repairs a
+missing/outdated task registration, then gates agent/harness startup on edge
+readiness — handshake ping with a 2-second deadline, after which Desktop
+cleanly selects canonical-only routing and retries the edge in the background —
+and respawns the sidecar if the health check finds it dead. M5 wires the
+gates; it does not choose the packaging form.
 
 Explicitly NOT touched: `desktop/src-tauri/src/commands/project_git_exec.rs`
 clone-origin check (git stays canonical-only), all `crates/buzz-relay` server
@@ -101,10 +115,10 @@ Event allowlist and local ingress:
    existing mention and thread tags, for explicitly selected channels of one
    community.
 2. At local ingress it verifies the event signature; requires the event pubkey
-   to match the authenticated NIP-42/NIP-98 principal; checks cached channel
-   membership and owner attestation; stores the exact signed event bytes plus
-   a device-signed local receipt; returns `OK`; and fans out to all local
-   subscribers immediately.
+   to match the authenticated NIP-42/NIP-98 principal; checks channel
+   membership against the current authorization snapshot (§7); stores the
+   exact signed event bytes plus a device-signed local receipt; returns `OK`;
+   and fans out to all local subscribers immediately.
 3. It never re-signs or mutates a user's event, so event IDs and reply
    references remain stable end-to-end.
 
@@ -123,25 +137,48 @@ Authentication and keys:
 Edge identity provisioning (answers F1):
 
 6. Phase 1 uses a **provisioned member model** for the edge identity. At
-   setup, while online, the community owner (a) issues the owner attestation
-   (NIP-OA auth tag) for the edge-device pubkey so it can authenticate
-   upstream, and (b) explicitly adds the edge-device pubkey as a member of
-   every selected channel, using the existing membership flow. This is a
-   one-time setup action; runtime membership mutation remains out of scope.
-   Rationale: upstream reads are scoped to channels accessible to the
-   authenticated pubkey (`crates/buzz-relay/src/handlers/req.rs:94,133-167`;
-   membership resolution `crates/buzz-db/src/channel.rs:746-771`), and ingest
-   requires `event.pubkey == authenticated identity`
+   setup, while online, the community owner (a) adds the edge-device pubkey as
+   a **direct relay member** — chosen precisely because direct membership is
+   an existing, admin-removable server-side grant evaluated at admission
+   (`crates/buzz-relay/src/api/mod.rs:76-79`), unlike a NIP-OA auth tag,
+   which is a static signature with no registry and no admission-time
+   revocation (`api/mod.rs:81-100`; `crates/buzz-sdk/src/nip_oa.rs:179-235`)
+   and therefore is NOT the admission basis here — and (b) explicitly adds
+   the edge-device pubkey as a member of every selected channel, using the
+   existing membership flow. This is a one-time setup action; runtime
+   membership mutation remains out of scope. Rationale: upstream reads are
+   scoped to channels accessible to the authenticated pubkey
+   (`crates/buzz-relay/src/handlers/req.rs:94,133-167`; membership resolution
+   `crates/buzz-db/src/channel.rs:746-771`), and ingest requires
+   `event.pubkey == authenticated identity`
    (`crates/buzz-relay/src/handlers/ingest.rs:1878-1881`) — so mirroring
    private selected channels and ingesting edge-signed digests both require
-   real membership; attestation alone is insufficient.
+   real membership.
+   Revocation semantics, stated exactly: removing the edge identity's
+   **relay membership** revokes upstream admission itself and is the
+   upstream-enforced kill path (proven by the direct-to-upstream
+   post-revocation gate in the Test list — the kill-switch claim stands only
+   as far as that gate proves it). Removing a **channel membership** revokes
+   that channel. Residual risk documented: while the edge identity remains a
+   relay member, open channels stay readable to it, because open visibility
+   itself grants access; full removal requires the relay-membership path.
 7. A channel is **eligible for edge routing only if the edge identity's
-   membership in it is confirmed**; the sidecar verifies this at startup and
-   on every reconnect, and drops non-eligible channels to canonical-only
-   routing, visibly. Revocation flow: the owner removes the edge pubkey's
-   membership (or the attestation); on next verification the sidecar fails
-   closed for the affected channels — no local ingress, no mirroring, cached
-   rows retained read-only, clients transparently fall back to canonical.
+   membership in it is confirmed or covered by a valid authorization lease**
+   (answers rev-2 R1). On every successful upstream membership verification
+   the sidecar persists an **authorization snapshot** in SQLite — the
+   eligible channel set, the community binding, and `verified_at` — signed by
+   the edge key and verified on load. Startup rules, exactly: if upstream is
+   reachable, verify fresh before serving. If upstream is unreachable, serve
+   from the snapshot only while `now − verified_at ≤ 72 hours` (the lease);
+   past the lease, fail closed to canonical-only (which, offline, means
+   messaging halts — disclosed, not hidden). Trade-off stated: within the
+   lease, a revocation performed upstream during a total outage is enforced
+   locally only at the next successful verification (revocation lag ≤ lease
+   length); this is accepted for a single-owner PC and bounded at 72 hours.
+   On reconnect the sidecar refreshes the snapshot first; channels revoked
+   while offline drop immediately — no local ingress, no mirroring, cached
+   rows retained read-only, their queued events follow the §12 revocation
+   rule, and clients transparently fall back to canonical.
 8. Using the edge identity, the sidecar subscribes upstream to the selected
    channels and mirrors received events and member state into SQLite, so
    local reads are served from loopback even when upstream is merely slow.
@@ -149,9 +186,15 @@ Edge identity provisioning (answers F1):
 Reconnect synchronization — durable outbox:
 
 9. The SQLite outbox and cache survive sidecar and Desktop restarts.
-10. Outbox rows carry an explicit drain-state machine (answers F3):
-    `pending → claimed(lease) → submitted → delivered | quarantined`, with
-    `claimed → pending` on lease expiry.
+10. Outbox rows carry an explicit drain-state machine (answers F3; tightened
+    for rev-2 R3): `pending → claimed(lease) → delivered | quarantined`, with
+    `claimed → pending` on lease expiry. There is **no separate `submitted`
+    state**: a row stays `claimed` until the author's per-event
+    acknowledgment arrives, so the crash window between upstream acceptance
+    and sidecar acknowledgment cannot strand a row — the lease expires, the
+    row returns to `pending`, the next drain re-submits the **identical
+    signed bytes**, and upstream's event-ID dedup answers duplicate, which
+    the protocol records as `delivered`.
 11. **Author-drain protocol** (answers F3): the sidecar cannot and does not
     submit another identity's events upstream (blocked by
     `ingest.rs:1878-1881`). Instead:
@@ -159,9 +202,23 @@ Reconnect synchronization — durable outbox:
       NIP-42-authenticated loopback session and calls the drain API. It may
       claim only rows whose author pubkey equals the session principal — the
       sidecar enforces this ownership check.
-    - A claim takes a renewable 60-second lease over an ordered batch
-      (parent-before-reply, FIFO within author/channel). Lease expiry returns
-      unacknowledged rows to `pending`.
+    - A claim takes a renewable 60-second lease over an ordered batch.
+      Ordering is **globally dependency-gated, not merely per-author**
+      (answers rev-2 R2): a row is claimable only when every locally known
+      ancestor in its thread chain is already `delivered` to canonical
+      history — because canonical ingest rejects a reply whose parent is not
+      stored (`crates/buzz-relay/src/handlers/ingest.rs:623-632`, "reply
+      parent not found") and threads routinely cross identities. Within the
+      claimable set, ordering is FIFO per author/channel. Lease expiry
+      returns unacknowledged rows to `pending`.
+    - **Mixed-age thread policy** (rev-2 R2): drain evaluates thread
+      components before claiming. If any required ancestor cannot be
+      replayed with its original ID — it is older than the drift window,
+      quarantined, or revocation-blocked — then that ancestor **and every
+      dependent descendant, even descendants still inside the drift window**,
+      are demoted to the local-only/digest path together, in order. Fresh
+      descendants of a stale parent are never submitted upstream; nothing is
+      ever submitted as an orphan.
     - The author submits each event upstream itself over a fresh
       NIP-42/NIP-98 session it owns, then acknowledges per-event results to
       the sidecar: accepted or duplicate → `delivered` (duplicate is success;
@@ -174,16 +231,28 @@ Reconnect synchronization — durable outbox:
       **waiting for author** state for that identity. Author restart resumes
       via fresh claim; duplicate-drain and mid-batch crash are safe because
       state transitions are per-event and idempotent.
-12. Events still inside the relay's ±15-minute drift window are submitted
-    as-is and retain their exact event IDs and thread tags. Older events
-    remain permanently marked local-only and are collapsed, in order, into one
-    fresh catch-up digest per channel — authored and signed by the provisioned
-    edge identity (a member, so ordinary ingest accepts it) — containing
-    author, local timestamp, and quoted, mention-neutralized content. The
-    digest becomes canonical; the original event IDs and thread structure of
-    those older events do not. Membership revocation wins: events authored
-    under stale local authorization may remain local but are rejected from
-    canonical history.
+12. Events still inside the relay's ±15-minute drift window — and not demoted
+    by the mixed-age thread policy in §11 — are submitted as-is and retain
+    their exact event IDs and thread tags. Demoted and older events remain
+    permanently marked local-only and are collapsed, in order, into a
+    catch-up digest per channel — authored and signed by the provisioned edge
+    identity (a member, so ordinary ingest accepts it) — containing author,
+    local timestamp, and quoted, mention-neutralized content. The digest
+    becomes canonical; the original event IDs and thread structure of those
+    events do not. Digest construction is **transactional and byte-stable**
+    (answers rev-2 R4): the sidecar persists, in one SQLite transaction, the
+    exact source-row set and the exact signed digest event bytes **before**
+    first submission; every retry — after an ambiguous response, a crash, or
+    a restart — re-submits those identical bytes, so the event ID cannot
+    change and upstream dedup makes acceptance exactly-once. Because relay
+    ingest rejects content over 256 KiB
+    (`crates/buzz-relay/src/handlers/ingest.rs:1868-1872`), digest content is
+    deterministically chunked: rows in order, greedily packed to ≤200 KiB per
+    chunk, each chunk a separate pre-signed event tagged `part i` / `total
+    N`. Source rows transition to resolved only after **every** chunk is
+    acknowledged accepted-or-duplicate. Membership revocation wins: events
+    authored under stale local authorization may remain local but are
+    rejected from canonical history.
 13. Every surface that shows delivery state labels the two success states
     separately: **delivered locally** vs **synced to canonical history**.
 
@@ -216,8 +285,9 @@ collection counts):
 
 - M1 — this spec reviewed by Ava (gates M3+; M2 may run in parallel).
 - M2 — sidecar core (~3d): loopback relay, SQLite schema incl. drain-state
-  outbox and community binding, signature/membership checks, `REQ`/`COUNT`
-  subset, local fan-out, edge-identity provisioning verification.
+  outbox, community binding, authorization-lease snapshot, and digest
+  materialization store; signature/membership checks, `REQ`/`COUNT` subset,
+  local fan-out, edge-identity provisioning verification.
 - M3 — routing split (~2d): Desktop, CLI message paths, ACP two-client
   topology, community-switch fail-closed behavior.
 - M4 — reconnect sync (~2d): author-drain protocol, digest fallback, dual
@@ -232,10 +302,11 @@ not summaries):
 
 1. **Full-cut gate**: sever upstream connectivity for more than 15 minutes.
    Desktop and two local agents exchange thread replies immediately
-   throughout; the sidecar is restarted mid-outage with no loss; on
-   reconnect, sub-15-minute events land upstream exactly once with identical
-   event IDs and thread tags; older events appear in exactly one digest, in
-   order.
+   throughout; the sidecar is restarted mid-outage with no loss, continuing
+   under its valid authorization lease (§7); on reconnect, sub-15-minute
+   events not demoted by the mixed-age policy land upstream exactly once
+   with identical event IDs and thread tags; demoted and older events appear
+   in the digest (chunked if over the size bound), in order, exactly once.
 2. **Slow-upstream transport SLO** (James's actual failure mode; answers F5):
    inject ≥10 seconds of artificial upstream delay (upstream reachable, not
    cut). Over ≥100 warmed kind-9 messages exchanged between Desktop and two
@@ -254,42 +325,73 @@ not summaries):
 5. **Private-channel end-to-end gate** (answers F1): in a private selected
    channel, prove the provisioned edge identity mirrors events, builds cached
    authorization, and lands a digest via ordinary ingest; then revoke its
-   membership and prove fail-closed behavior (no ingress, no mirror, clean
-   canonical fallback, digest rejected upstream).
-6. **Community-switch gate** (answers F4): two communities containing equal
+   channel membership and prove fail-closed behavior (no ingress, no mirror,
+   clean canonical fallback, digest rejected upstream).
+6. **Direct-to-upstream post-revocation gate** (rev-2 R5): after the owner
+   removes the edge identity's **relay membership**, prove by direct upstream
+   connection — bypassing the sidecar — that admission itself is refused
+   (reads and ingest both). The "remote kill switch" claim in this spec is
+   valid only if this gate passes.
+7. **Authorization-lease gates** (rev-2 R1): (a) offline sidecar restart with
+   a valid lease → local messaging continues from the snapshot; (b) offline
+   restart with an expired lease → fail closed, canonical-only, clearly
+   surfaced; (c) revocation performed upstream while offline → enforced at
+   reconnect refresh before any queued submission, affected rows follow the
+   §12 revocation rule; (d) reconnect always refreshes the snapshot before
+   drain begins.
+8. **Mixed-age thread gate** (rev-2 R2): author A posts a thread root at
+   T−16 minutes, author B replies at T−5 minutes, reconnect at T. Prove the
+   root and the reply both go to the digest path, in order; no orphan
+   submission reaches upstream; nothing lands in quarantine as
+   `reply parent not found`.
+9. **Community-switch gate** (answers F4): two communities containing equal
    channel UUIDs; switch Desktop's active community both directions; prove
    handshake rejection, fail-closed canonical fallback, and zero
    cross-community read, write, or cache reuse.
+10. **Digest durability gates** (rev-2 R4): (a) ambiguous upstream response
+    followed by retry → identical bytes re-sent, exactly one canonical
+    digest; (b) sidecar restart between digest materialization and
+    acknowledgment → same; (c) backlog whose digest content exceeds 256 KiB →
+    deterministic `part i/total N` chunks each ≤200 KiB, source rows resolved
+    only after all chunks acknowledged.
+11. **Packaging lifecycle gates** (rev-2 R6): login race (task and Desktop
+    starting together → readiness gate holds agents until edge answers or
+    the 2-second fallback fires), sidecar crash → scheduled-task
+    restart-on-failure brings it back and clients re-attach, reboot →
+    sidecar up before Desktop interaction, upgrade → task re-registered
+    pointing at the new binary, uninstall → task unregistered and process
+    stopped, nothing left running.
 
 Failure-mode and protocol tests:
 
-7. Author-drain protocol (answers F3): absent-author (rows stay pending,
-   waiting-for-author surfaced), author-restart mid-batch, duplicate-drain,
-   mid-batch crash with lease expiry, ownership check (a session cannot claim
-   another author's rows), permanent-reject → quarantine transition.
-8. Duplicate upstream acknowledgment treated as success (no re-send loop).
-9. Corrupt or missing local receipt → event quarantined and surfaced, sync of
-   other events unaffected.
-10. Membership revoked during outage → affected events rejected from
-    canonical history, visibly quarantined locally.
-11. Offline upload attempt and offline git operation → clear, immediate
+12. Author-drain protocol (answers F3, tightened for rev-2 R3): absent-author
+    (rows stay pending, waiting-for-author surfaced), author-restart
+    mid-batch, duplicate-drain, mid-batch crash with lease expiry, **crash
+    after upstream acceptance but before sidecar acknowledgment** (lease
+    expiry → re-submission of identical bytes → duplicate → `delivered`),
+    ownership check (a session cannot claim another author's rows),
+    permanent-reject → quarantine transition.
+13. Duplicate upstream acknowledgment treated as success (no re-send loop).
+14. Corrupt or missing local receipt → event quarantined and surfaced, sync
+    of other events unaffected.
+15. Offline upload attempt and offline git operation → clear, immediate
     failure with no corruption and no queuing.
-12. **Negative routing tests per canonical-only class** (answers F2): with
+16. **Negative routing tests per canonical-only class** (answers F2): with
     the edge active, channel/membership discovery, HTTP bridge and memory
     ops, observer/control, typing/presence, uploads, git, admin, and
     non-kind-9 events each provably reach only the canonical URL.
-13. **Build/package acceptance** (answers F6): workspace builds with the new
+17. **Build/package acceptance** (answers F6): workspace builds with the new
     crate registered in root `Cargo.toml`/`Cargo.lock`; the Tauri bundle
-    contains the `externalBin` sidecar; the logon scheduled task is
-    registered; Desktop health-check respawn works.
-14. **UI-state acceptance** (answers F6): delivery labels, quarantine list,
+    contains the `externalBin` sidecar and the NSIS installer hook; the logon
+    scheduled task is registered with quoted path and user scope.
+18. **UI-state acceptance** (answers F6): delivery labels, quarantine list,
     and waiting-for-author indicator each shown driven by real sidecar state,
     not mocks.
-15. Unit/integration coverage per milestone: ingress validation (signature,
+19. Unit/integration coverage per milestone: ingress validation (signature,
     principal match, membership), `REQ`/`COUNT` subset conformance, outbox
-    ordering (parent-before-reply, per-author FIFO), digest construction
-    (ordering, mention neutralization, edge-identity signature), routing
-    split.
+    dependency gating (global ancestor rule, per-author FIFO within the
+    claimable set), digest construction (ordering, mention neutralization,
+    chunking determinism, edge-identity signature), routing split.
 
 ## Safety implications
 
@@ -298,12 +400,22 @@ Failure-mode and protocol tests:
   anywhere. The drain API's ownership check means no session can claim or
   acknowledge another author's events. The edge identity can author only its
   own receipts, subscriptions, and digests.
-- **The provisioned edge identity is a real member of selected channels.**
-  This is a deliberate, owner-visible grant (F1): compromise of the
-  edge-device key exposes read access to those channels and the ability to
-  post digests as itself — not the ability to impersonate anyone. Mitigation:
-  DPAPI storage, loopback-only exposure, owner-side revocation (§7) that the
-  sidecar honors fail-closed, and the private-channel revocation gate.
+- **The provisioned edge identity is a real relay member and a member of
+  selected channels.** This is a deliberate, owner-visible grant (F1):
+  compromise of the edge-device key exposes read access to those channels
+  (plus open channels, which any relay member can read) and the ability to
+  post digests as itself — not the ability to impersonate anyone.
+  Mitigation: DPAPI storage, loopback-only exposure, and two upstream-side
+  revocation levers with honestly different strengths (rev-2 R5): relay
+  membership removal revokes admission entirely (proven by the
+  direct-to-upstream post-revocation gate); channel membership removal
+  revokes one channel but leaves open-channel access while relay membership
+  stands.
+- **Bounded revocation lag offline** (rev-2 R1): within the 72-hour
+  authorization lease, a revocation issued during a total outage takes local
+  effect only at the next successful upstream verification. This window is a
+  stated design trade-off, not an oversight; reconnect enforces revocation
+  before any queued submission drains.
 - **Loopback only.** The sidecar binds to localhost exclusively. No LAN or
   remote exposure; no new open ports beyond loopback.
 - **Canonical relay untouched.** No server-side code ships or deploys in this
@@ -348,9 +460,13 @@ Failure-mode and protocol tests:
 - **Config-level (instant):** unset `BUZZ_EDGE_RELAY_URL` and stop the
   scheduled task. Every client reverts to today's canonical-only routing; the
   sidecar is inert. This is the first-line rollback at any milestone.
-- **Identity:** the owner removes the edge-device pubkey's channel
-  memberships and attestation; the sidecar's own fail-closed check (§7) makes
-  this an independent remote kill switch even if the PC is unattended.
+- **Identity:** the owner removes the edge-device pubkey's **relay
+  membership** — the upstream-enforced kill path, refusing admission itself
+  regardless of what runs on the PC (valid only as far as the
+  direct-to-upstream post-revocation gate proves it) — and its channel
+  memberships. The sidecar's own lease-bounded fail-closed check (§7)
+  additionally shuts the local side down at the next verification, with
+  revocation lag bounded by the 72-hour lease if the PC is fully offline.
 - **Data:** SQLite files are additive and local. Before deleting them, export
   any queued-but-unsynced events to a plain-text digest file so no authored
   content is silently lost; then archive or delete the database.
