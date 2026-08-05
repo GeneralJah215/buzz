@@ -298,16 +298,20 @@ pub async fn insert_thread_metadata(
             }
 
             // Increment parent's direct reply count and last_reply_at.
+            // Activity is event time, not ingest time: a backfilled or
+            // late-arriving reply must age against its created_at, and an
+            // out-of-order old reply must not move activity backward.
             sqlx::query(
                 r#"
                 UPDATE thread_metadata
                 SET reply_count   = reply_count + 1,
-                    last_reply_at = NOW()
+                    last_reply_at = GREATEST(COALESCE(last_reply_at, to_timestamp(0)), $3)
                 WHERE community_id = $1 AND event_id = $2
                 "#,
             )
             .bind(community_id.as_uuid())
             .bind(pid)
+            .bind(event_created_at)
             .execute(&mut *tx)
             .await?;
 
@@ -348,18 +352,21 @@ pub async fn increment_reply_count(
     community_id: CommunityId,
     parent_event_id: &[u8],
     root_event_id: Option<&[u8]>,
+    reply_created_at: DateTime<Utc>,
 ) -> Result<()> {
     // Always bump the parent's direct reply count and last-reply timestamp.
+    // Same event-time semantics as the inline path in `insert_thread_metadata`.
     sqlx::query(
         r#"
         UPDATE thread_metadata
         SET reply_count  = reply_count + 1,
-            last_reply_at = NOW()
+            last_reply_at = GREATEST(COALESCE(last_reply_at, to_timestamp(0)), $3)
         WHERE community_id = $1 AND event_id = $2
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(parent_event_id)
+    .bind(reply_created_at)
     .execute(pool)
     .await?;
 
@@ -789,11 +796,11 @@ pub async fn get_thread_directory(
     match state {
         ThreadDirectoryState::Active => {
             qb.push(
-                " AND COALESCE(ds.archived, false) = false\
-                   AND (ds.title_override IS NOT NULL\
-                        OR COALESCE(ds.pinned, false) = true\
-                        OR (tm.descendant_count >= 3\
-                            AND COALESCE(tm.last_reply_at, e.created_at) >= ",
+                r#" AND COALESCE(ds.archived, false) = false
+                   AND (ds.title_override IS NOT NULL
+                        OR COALESCE(ds.pinned, false) = true
+                        OR (tm.descendant_count >= 3
+                            AND COALESCE(tm.last_reply_at, e.created_at) >= "#,
             );
             qb.push_bind(activity_cutoff);
             qb.push("))");
