@@ -218,6 +218,7 @@ pub async fn run_upstream_mirror(relay: EdgeRelay, edge_keys: Keys, startup_was_
                 Ok(RelayMessage::Eose {
                     subscription_id: received,
                 }) if received == subscription_id => {
+                    relay.mark_authorization_backlog_processed().await;
                     debug!("upstream mirror caught up to canonical history");
                 }
                 Ok(RelayMessage::Closed {
@@ -738,6 +739,7 @@ mod tests {
             crate::EdgeConfig::new("ws://127.0.0.1:3031", binding).expect("config"),
             Arc::clone(&store),
             edge_keys.clone(),
+            true,
         )
         .expect("relay");
 

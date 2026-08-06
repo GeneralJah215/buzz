@@ -8,7 +8,7 @@ pub mod upstream;
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -157,6 +157,7 @@ struct EdgeState {
     connections: Arc<Semaphore>,
     sequence: tokio::sync::Mutex<()>,
     authorization_epoch: tokio::sync::RwLock<()>,
+    local_routing_ready: AtomicBool,
     #[cfg(test)]
     history_gate: Mutex<Option<Arc<HistoryGate>>>,
 }
@@ -176,10 +177,15 @@ pub struct EdgeRelay {
 
 impl EdgeRelay {
     /// Build a sidecar around an opened store and dedicated edge-device key.
+    ///
+    /// `local_routing_ready` is true only when startup restored a valid offline
+    /// lease. A fresh online verification stays fail-closed until the mirror's
+    /// authorization-signal subscription reaches EOSE.
     pub fn new(
         config: EdgeConfig,
         store: Arc<EdgeStore>,
         edge_keys: Keys,
+        local_routing_ready: bool,
     ) -> Result<Self, EdgeError> {
         if store.binding() != &config.binding {
             return Err(EdgeError::Config(
@@ -196,6 +202,7 @@ impl EdgeRelay {
                 connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
                 sequence: tokio::sync::Mutex::new(()),
                 authorization_epoch: tokio::sync::RwLock::new(()),
+                local_routing_ready: AtomicBool::new(local_routing_ready),
                 #[cfg(test)]
                 history_gate: Mutex::new(None),
             }),
@@ -215,14 +222,30 @@ impl EdgeRelay {
     ) -> Result<eligibility::AuthorizationStartup, EdgeError> {
         let result = {
             let _authorization = self.state.authorization_epoch.write().await;
+            if !matches!(
+                verification,
+                eligibility::VerificationResult::Unavailable(_)
+            ) {
+                self.state
+                    .local_routing_ready
+                    .store(false, Ordering::Release);
+            }
             let store = Arc::clone(&self.state.store);
             let edge_keys = self.state.edge_keys.clone();
-            tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 eligibility::apply_startup_policy(&store, &edge_keys, now, verification)
             })
             .await
             .map_err(|error| EdgeError::Join(error.to_string()))?
-            .map_err(EdgeError::from)?
+            .map_err(EdgeError::from)?;
+            self.state.local_routing_ready.store(
+                matches!(
+                    result,
+                    eligibility::AuthorizationStartup::OfflineLease { .. }
+                ),
+                Ordering::Release,
+            );
+            result
         };
         self.close_ineligible_subscriptions().await?;
         Ok(result)
@@ -237,14 +260,32 @@ impl EdgeRelay {
             let _authorization = self.state.authorization_epoch.write().await;
             let store = Arc::clone(&self.state.store);
             let edge_keys = self.state.edge_keys.clone();
-            tokio::task::spawn_blocking(move || {
+            let outcome = tokio::task::spawn_blocking(move || {
                 store.apply_authorization_signal(&event, &edge_keys)
             })
             .await
-            .map_err(|error| EdgeError::Join(error.to_string()))??
+            .map_err(|error| EdgeError::Join(error.to_string()))??;
+            if matches!(
+                outcome,
+                storage::AuthorizationSignalOutcome::EdgeRemoved { .. }
+                    | storage::AuthorizationSignalOutcome::RefreshRequired { .. }
+            ) {
+                self.state
+                    .local_routing_ready
+                    .store(false, Ordering::Release);
+            }
+            outcome
         };
         self.close_ineligible_subscriptions().await?;
         Ok(outcome)
+    }
+
+    /// Allow local routing after the current upstream signal backlog reaches EOSE.
+    pub(crate) async fn mark_authorization_backlog_processed(&self) {
+        let _authorization = self.state.authorization_epoch.write().await;
+        self.state
+            .local_routing_ready
+            .store(true, Ordering::Release);
     }
 
     /// Treat a canonical membership rejection as an authoritative local removal.
@@ -627,6 +668,9 @@ impl EdgeRelay {
         channel_id: Uuid,
         principal: PublicKey,
     ) -> Result<bool, EdgeError> {
+        if !self.state.local_routing_ready.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         let store = Arc::clone(&self.state.store);
         tokio::task::spawn_blocking(move || store.principal_can_access(channel_id, &principal))
             .await
@@ -1309,7 +1353,7 @@ mod tests {
         let address = listener.local_addr().expect("address");
         let url = format!("ws://{address}");
         let config = EdgeConfig::new(&url, binding).expect("config");
-        let relay = EdgeRelay::new(config, store, edge_keys).expect("relay");
+        let relay = EdgeRelay::new(config, store, edge_keys, true).expect("relay");
         let task = tokio::spawn(run_server(listener, relay));
         (url, task)
     }
@@ -1416,6 +1460,7 @@ mod tests {
             EdgeConfig::new(&url, binding.clone()).expect("config"),
             Arc::clone(&store),
             edge_keys.clone(),
+            true,
         )
         .expect("relay");
         let gate = Arc::new(HistoryGate::default());
@@ -1468,6 +1513,63 @@ mod tests {
             .expect("reason")
             .contains("authorization changed"));
         fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn fresh_authorization_waits_for_signal_backlog_before_local_access() {
+        let binding =
+            CommunityBinding::new("wss://relay.example.com", Uuid::new_v4()).expect("binding");
+        let store =
+            Arc::new(EdgeStore::open_in_memory(binding.clone(), test_policy()).expect("store"));
+        let edge_keys = Keys::generate();
+        let author = Keys::generate();
+        let channel = Uuid::new_v4();
+        store
+            .set_channel_selected(channel, true)
+            .expect("selection");
+        let now = test_now();
+        let authorization =
+            authorization(channel, &[edge_keys.public_key(), author.public_key()], now);
+        store
+            .persist_verified_authorization_snapshot(
+                std::slice::from_ref(&authorization),
+                now,
+                &edge_keys,
+            )
+            .expect("authorization");
+        let relay = EdgeRelay::new(
+            EdgeConfig::new("ws://127.0.0.1:3031", binding).expect("config"),
+            store,
+            edge_keys,
+            true,
+        )
+        .expect("relay");
+        assert!(relay
+            .principal_can_access(channel, author.public_key())
+            .await
+            .expect("initial access"));
+
+        let startup = relay
+            .apply_authorization_refresh(
+                now,
+                eligibility::VerificationResult::Verified(vec![authorization]),
+            )
+            .await
+            .expect("refresh");
+        assert!(matches!(
+            startup,
+            eligibility::AuthorizationStartup::Fresh { .. }
+        ));
+        assert!(!relay
+            .principal_can_access(channel, author.public_key())
+            .await
+            .expect("access while signal backlog is pending"));
+
+        relay.mark_authorization_backlog_processed().await;
+        assert!(relay
+            .principal_can_access(channel, author.public_key())
+            .await
+            .expect("access after signal backlog EOSE"));
     }
 
     #[tokio::test]
@@ -1619,6 +1721,7 @@ mod tests {
             EdgeConfig::new(&url, binding.clone()).expect("config"),
             Arc::clone(&store),
             edge_keys,
+            true,
         )
         .expect("relay");
         let server = tokio::spawn(run_server(listener, relay.clone()));
@@ -1688,6 +1791,7 @@ mod tests {
             EdgeConfig::new(&url, binding.clone()).expect("config"),
             Arc::clone(&store),
             edge_keys.clone(),
+            true,
         )
         .expect("relay");
         let server = tokio::spawn(run_server(listener, relay.clone()));
@@ -1800,6 +1904,7 @@ mod tests {
             EdgeConfig::new("ws://127.0.0.1:3031", binding).expect("config"),
             store,
             edge_keys,
+            true,
         )
         .expect("relay");
 
@@ -2078,6 +2183,6 @@ mod tests {
             CommunityBinding::new("wss://relay.example.com", Uuid::new_v4()).expect("second");
         let store = Arc::new(EdgeStore::open_in_memory(second, test_policy()).expect("store"));
         let config = EdgeConfig::new("ws://127.0.0.1:3031", first).expect("config");
-        assert!(EdgeRelay::new(config, store, Keys::generate()).is_err());
+        assert!(EdgeRelay::new(config, store, Keys::generate(), true).is_err());
     }
 }

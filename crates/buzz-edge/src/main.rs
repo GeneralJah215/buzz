@@ -69,8 +69,13 @@ async fn run() -> Result<(), String> {
         env::var("BUZZ_EDGE_RELAY_URL").unwrap_or_else(|_| "ws://127.0.0.1:3031".to_string());
     let listen_address = loopback_socket_address(&edge_url)?;
     let config = EdgeConfig::new(&edge_url, binding).map_err(|error| error.to_string())?;
-    let relay =
-        EdgeRelay::new(config, store, edge_keys.clone()).map_err(|error| error.to_string())?;
+    let relay = EdgeRelay::new(
+        config,
+        store,
+        edge_keys.clone(),
+        matches!(startup, AuthorizationStartup::OfflineLease { .. }),
+    )
+    .map_err(|error| error.to_string())?;
     let listener = TcpListener::bind(listen_address)
         .await
         .map_err(|error| format!("failed to bind {listen_address}: {error}"))?;
