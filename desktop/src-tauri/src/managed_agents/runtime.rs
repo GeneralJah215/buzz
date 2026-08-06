@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use super::agent_env::build_buzz_agent_provider_defaults;
 
@@ -108,7 +108,6 @@ pub(crate) fn workspace_pair_key(
     app: &AppHandle,
     record: &ManagedAgentRecord,
 ) -> Option<ManagedAgentRuntimeKey> {
-    use tauri::Manager;
     let state = app.state::<crate::app_state::AppState>();
     resolve_workspace_pair_key(
         &record.pubkey,
@@ -569,6 +568,11 @@ pub fn spawn_agent_child(
     command.env("RUST_LOG", child_rust_log_filter());
     command.env("BUZZ_PRIVATE_KEY", &record.private_key_nsec);
     command.env("BUZZ_RELAY_URL", &effective_relay_url);
+    crate::relay::apply_agent_env(
+        &mut command,
+        &app.state::<crate::app_state::AppState>(),
+        &effective_relay_url,
+    );
     command.env("BUZZ_ACP_LAZY_POOL", if lazy { "true" } else { "false" });
     command.env("BUZZ_ACP_AGENT_COMMAND", &resolved_agent_command);
     command.env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));
@@ -967,7 +971,6 @@ pub fn start_managed_agent_process(
     owner_hex: Option<&str>,
 ) -> Result<(), String> {
     let relay_url = {
-        use tauri::Manager;
         let state = app.state::<crate::app_state::AppState>();
         crate::relay::effective_agent_relay_url(
             &record.relay_url,

@@ -676,6 +676,7 @@ pub fn run() {
             get_legacy_workspace_storage,
             is_shared_identity,
             get_relay_ws_url,
+            get_edge_relay_binding,
             get_relay_http_url,
             get_media_proxy_port,
             fetch_link_preview_title,

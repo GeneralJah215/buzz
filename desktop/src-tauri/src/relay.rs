@@ -54,6 +54,9 @@ pub fn relay_api_base_url_with_override(state: &AppState) -> String {
     }
 }
 
+mod edge;
+pub use edge::{apply_agent_env, edge_relay_binding, set_active_community, EdgeRelayBinding};
+
 /// Selects the relay a managed agent should use for a relay operation.
 ///
 /// Always the active workspace relay. The legacy per-record `relay_url` pin is
@@ -306,6 +309,9 @@ pub async fn query_relay(
     state: &AppState,
     filters: &[serde_json::Value],
 ) -> Result<Vec<nostr::Event>, String> {
+    if let Some(events) = edge::try_query(state, filters).await {
+        return Ok(events);
+    }
     query_relay_at(state, &relay_api_base_url_with_override(state), filters).await
 }
 
@@ -563,6 +569,9 @@ pub async fn submit_signed_event_with_keys(
 ) -> Result<SubmitEventResponse, String> {
     if event.pubkey != keys.public_key() {
         return Err("signed event does not match the publishing identity".to_string());
+    }
+    if let Some(response) = edge::try_submit(event, state, keys, auth_tag).await {
+        return Ok(response);
     }
     crate::relay_admission::wait_for_rate_limit().await;
     let url = format!("{}/events", relay_api_base_url_with_override(state));

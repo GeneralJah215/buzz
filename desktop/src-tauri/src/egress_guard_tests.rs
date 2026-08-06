@@ -78,6 +78,7 @@ fn error_names_the_boundary_context() {
 // `commands`; their injection tests live next to them:
 //   - commands/team_snapshot/tests.rs::egress_guard_boundary
 //   - commands/personas/snapshot/import.rs::egress_guard_tests
+//   - relay/submit.rs::edge_egress_tests (boundary 9, loopback edge submit)
 
 /// Boundary 1: `relay/submit.rs` `submit_event_at_with_keys` (the funnel for
 /// all `submit_event*` variants).
@@ -240,8 +241,11 @@ fn src_rust_files() -> Vec<std::path::PathBuf> {
 /// guard + adding an injection test for the new site.
 const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Production egress boundaries (see egress_guard.rs table):
-    ("src/relay.rs", 2, 2),                             // boundaries 2, 4
-    ("src/relay/submit.rs", 1, 1),                      // boundaries 1 + 3 (shared funnel)
+    ("src/relay.rs", 2, 2), // boundaries 2, 4
+    // boundaries 1 + 3 (shared funnel), and boundary 9 (loopback edge submit,
+    // SPEC-2026-08-05). Boundary 9 is module-private, so its injection test
+    // lives beside it in this file's `edge_egress_tests`.
+    ("src/relay/submit.rs", 2, 2),
     ("src/huddle/pipeline.rs", 1, 1),                   // boundary 5
     ("src/commands/team_snapshot.rs", 1, 1),            // boundary 6
     ("src/commands/personas/snapshot/import.rs", 2, 1), // boundary 7 + its in-file injection-test fixture URL

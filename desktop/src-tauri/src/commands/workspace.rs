@@ -125,6 +125,7 @@ pub async fn validate_repos_dir(dir: String) -> Result<(), String> {
 /// catches a value that went bad after save (deleted dir, unmounted volume).
 #[tauri::command]
 pub async fn apply_workspace(
+    community_id: String,
     relay_url: String,
     nsec: Option<String>,
     repos_dir: Option<String>,
@@ -142,6 +143,9 @@ pub async fn apply_workspace(
             }
             None => None,
         };
+        let parsed_community_id = community_id
+            .parse::<uuid::Uuid>()
+            .map_err(|error| format!("invalid community id: {error}"))?;
 
         // Decide the effective repos_dir from the candidate. A bad path does NOT
         // reject — it is treated as if no override were set: relay/keys still
@@ -168,6 +172,10 @@ pub async fn apply_workspace(
             let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
             *override_guard = Some(relay_url);
         }
+        // Re-bind edge routing to the community being applied. A switch
+        // re-points the binding, so the handshake fails closed against the
+        // previous community's sidecar database instead of reading its cache.
+        crate::relay::set_active_community(parsed_community_id);
         // Reset the Rust-side admission gate when switching workspace/community,
         // matching `resetRateLimitGate()` on the TS side (useCommunityInit.ts:38).
         crate::relay_admission::reset_gate_for_workspace_change();
