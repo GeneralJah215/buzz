@@ -187,7 +187,11 @@ pub async fn verify_upstream_membership(
                 membership_event_id: event.id,
                 membership_event_created_at: i64::try_from(event.created_at.as_secs()).ok()?,
                 membership_event_bytes: event.as_json().into_bytes(),
+                membership_fetch_cursor: None,
+                signal_cursor: None,
+                edge_notification_cursor: None,
                 active_authors,
+                removed_authors: Vec::new(),
             })
         })
         .collect();
@@ -393,7 +397,11 @@ mod tests {
             membership_event_id: event.id,
             membership_event_created_at: created_at,
             membership_event_bytes: event.as_json().into_bytes(),
+            membership_fetch_cursor: None,
+            signal_cursor: None,
+            edge_notification_cursor: None,
             active_authors,
+            removed_authors: Vec::new(),
         }
     }
 

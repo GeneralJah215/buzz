@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::eligibility::{verify_upstream_membership, AuthorizationStartup};
 use crate::protocol::event_channel;
-use crate::storage::{EdgeStore, UpstreamCursor};
+use crate::storage::{AuthorizationSignalOutcome, EdgeStore, UpstreamCursor};
 use crate::EdgeRelay;
 
 const ONLINE_SESSION_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
@@ -29,6 +29,8 @@ const BACKFILL_PAGE_SIZE: usize = 1_000;
 struct MirrorChannel {
     channel_id: Uuid,
     cursor: Option<UpstreamCursor>,
+    signal_cursor: Option<UpstreamCursor>,
+    edge_notification_cursor: Option<UpstreamCursor>,
 }
 
 /// Maintain one authenticated upstream mirror session, recycling it every six hours.
@@ -83,19 +85,28 @@ pub async fn run_upstream_mirror(relay: EdgeRelay, edge_keys: Keys, startup_was_
         }
         may_reuse_startup_verification = false;
 
-        let channels = match mirror_channels(Arc::clone(relay.store())).await {
-            Ok(channels) if !channels.is_empty() => channels,
-            Ok(_) => {
-                tokio::time::sleep(RECONNECT_DELAY).await;
-                continue;
-            }
+        let channels =
+            match mirror_channels(Arc::clone(relay.store()), edge_keys.public_key()).await {
+                Ok(channels) if !channels.is_empty() => channels,
+                Ok(_) => {
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    continue;
+                }
+                Err(reason) => {
+                    error!(%reason, "upstream mirror could not load selected channels");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    continue;
+                }
+            };
+        let relay_identity = match relay.store().relay_identity(&edge_keys.public_key()) {
+            Ok(identity) => identity,
             Err(reason) => {
-                error!(%reason, "upstream mirror could not load selected channels");
+                error!(%reason, "upstream mirror could not load the pinned relay identity");
                 tokio::time::sleep(RECONNECT_DELAY).await;
                 continue;
             }
         };
-        let filter = mirror_filter(&channels);
+        let filters = mirror_filters(&channels, edge_keys.public_key(), relay_identity);
         let canonical_origin = relay.store().binding().canonical_origin().to_string();
         let mut connection =
             match NostrWsConnection::connect_authenticated(&canonical_origin, &edge_keys, None)
@@ -110,10 +121,16 @@ pub async fn run_upstream_mirror(relay: EdgeRelay, edge_keys: Keys, startup_was_
             };
 
         let subscription_id = format!("buzz-edge-mirror-{}", Uuid::new_v4());
-        if let Err(reason) = connection
-            .send_raw(&json!(["REQ", subscription_id, filter]))
-            .await
-        {
+        let request = match subscription_request(&subscription_id, &filters) {
+            Ok(request) => request,
+            Err(reason) => {
+                error!(%reason, "upstream mirror could not encode its subscription");
+                let _ = connection.disconnect().await;
+                tokio::time::sleep(RECONNECT_DELAY).await;
+                continue;
+            }
+        };
+        if let Err(reason) = connection.send_raw(&request).await {
             warn!(%reason, "upstream mirror subscription failed");
             tokio::time::sleep(RECONNECT_DELAY).await;
             continue;
@@ -147,6 +164,27 @@ pub async fn run_upstream_mirror(relay: EdgeRelay, edge_keys: Keys, startup_was_
                     subscription_id: received,
                     event,
                 }) if received == subscription_id => {
+                    if event.kind.as_u16() != 9 {
+                        match relay.apply_authorization_signal(*event).await {
+                            Ok(
+                                AuthorizationSignalOutcome::EdgeRemoved { .. }
+                                | AuthorizationSignalOutcome::RefreshRequired { .. },
+                            ) => {
+                                debug!("authorization signal requires a fresh upstream check");
+                                break;
+                            }
+                            Ok(
+                                AuthorizationSignalOutcome::Duplicate
+                                | AuthorizationSignalOutcome::SignalObserved { .. }
+                                | AuthorizationSignalOutcome::RosterReplaced { .. }
+                                | AuthorizationSignalOutcome::AuthorRemoved { .. },
+                            ) => continue,
+                            Err(reason) => {
+                                warn!(%reason, "rejected upstream authorization signal");
+                                continue;
+                            }
+                        }
+                    }
                     let cursor = UpstreamCursor {
                         created_at: match i64::try_from(event.created_at.as_secs()) {
                             Ok(value) => value,
@@ -235,7 +273,7 @@ async fn backfill_channel(
     if let Some(cursor) = &channel.cursor {
         filter["since"] = json!(cursor.created_at);
     }
-    let mut newest = channel.cursor.clone();
+    let mut newest = channel.cursor;
     loop {
         let body = serde_json::to_vec(&[filter.clone()]).map_err(|error| error.to_string())?;
         let auth = sign_nip98(edge_keys, "POST", query_url, &body)?;
@@ -327,7 +365,10 @@ fn sign_nip98(keys: &Keys, method: &str, url: &str, body: &[u8]) -> Result<Strin
     ))
 }
 
-async fn mirror_channels(store: Arc<EdgeStore>) -> Result<Vec<MirrorChannel>, String> {
+async fn mirror_channels(
+    store: Arc<EdgeStore>,
+    edge_pubkey: nostr::PublicKey,
+) -> Result<Vec<MirrorChannel>, String> {
     tokio::task::spawn_blocking(move || {
         let channel_ids = store
             .eligible_channels()
@@ -338,7 +379,18 @@ async fn mirror_channels(store: Arc<EdgeStore>) -> Result<Vec<MirrorChannel>, St
                 let cursor = store
                     .upstream_cursor(channel_id)
                     .map_err(|error| error.to_string())?;
-                Ok(MirrorChannel { channel_id, cursor })
+                let signal_cursor = store
+                    .authorization_signal_cursor(&edge_pubkey, channel_id)
+                    .map_err(|error| error.to_string())?;
+                let edge_notification_cursor = store
+                    .edge_notification_cursor(&edge_pubkey, channel_id)
+                    .map_err(|error| error.to_string())?;
+                Ok(MirrorChannel {
+                    channel_id,
+                    cursor,
+                    signal_cursor,
+                    edge_notification_cursor,
+                })
             })
             .collect()
     })
@@ -364,6 +416,77 @@ fn mirror_filter(channels: &[MirrorChannel]) -> Filter {
         filter = filter.since(Timestamp::from(created_at));
     }
     filter
+}
+
+fn mirror_filters(
+    channels: &[MirrorChannel],
+    edge_pubkey: nostr::PublicKey,
+    relay_identity: nostr::PublicKey,
+) -> Vec<Filter> {
+    let channel_values = channels
+        .iter()
+        .map(|channel| channel.channel_id.to_string())
+        .collect::<Vec<_>>();
+    let mut system_messages = Filter::new()
+        .kind(Kind::Custom(40_099))
+        .author(relay_identity)
+        .custom_tags(
+            SingleLetterTag::lowercase(Alphabet::H),
+            channel_values.clone(),
+        )
+        .limit(BACKFILL_PAGE_SIZE);
+    let earliest_signal_cursor = channels
+        .iter()
+        .map(|channel| {
+            channel
+                .signal_cursor
+                .as_ref()
+                .map(|cursor| cursor.created_at)
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|cursors| cursors.into_iter().min());
+    if let Some(created_at) = earliest_signal_cursor.and_then(|value| u64::try_from(value).ok()) {
+        system_messages = system_messages.since(Timestamp::from(created_at));
+    }
+    let edge_hex = edge_pubkey.to_hex();
+    let roster = Filter::new()
+        .kind(Kind::Custom(39_002))
+        .author(relay_identity)
+        .custom_tags(SingleLetterTag::lowercase(Alphabet::P), [edge_hex.as_str()]);
+    let mut edge_notifications = Filter::new()
+        .kinds([Kind::Custom(44_100), Kind::Custom(44_101)])
+        .author(relay_identity)
+        .custom_tags(SingleLetterTag::lowercase(Alphabet::P), [edge_hex.as_str()])
+        .limit(BACKFILL_PAGE_SIZE);
+    let earliest_edge_notification_cursor = channels
+        .iter()
+        .map(|channel| {
+            channel
+                .edge_notification_cursor
+                .as_ref()
+                .map(|cursor| cursor.created_at)
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|cursors| cursors.into_iter().min());
+    if let Some(created_at) =
+        earliest_edge_notification_cursor.and_then(|value| u64::try_from(value).ok())
+    {
+        edge_notifications = edge_notifications.since(Timestamp::from(created_at));
+    }
+    vec![
+        mirror_filter(channels),
+        system_messages,
+        roster,
+        edge_notifications,
+    ]
+}
+
+fn subscription_request(subscription_id: &str, filters: &[Filter]) -> Result<Value, String> {
+    let mut request = vec![json!("REQ"), json!(subscription_id)];
+    for filter in filters {
+        request.push(serde_json::to_value(filter).map_err(|error| error.to_string())?);
+    }
+    Ok(Value::Array(request))
 }
 
 fn canonical_query_url(canonical_origin: &str) -> Result<String, String> {
@@ -419,6 +542,8 @@ mod tests {
                     created_at: 200,
                     event_id: EventId::from_byte_array([1; 32]),
                 }),
+                signal_cursor: None,
+                edge_notification_cursor: None,
             },
             MirrorChannel {
                 channel_id: second,
@@ -426,6 +551,8 @@ mod tests {
                     created_at: 100,
                     event_id: EventId::from_byte_array([2; 32]),
                 }),
+                signal_cursor: None,
+                edge_notification_cursor: None,
             },
         ]);
         assert_eq!(filter.limit, Some(BACKFILL_PAGE_SIZE));
@@ -449,13 +576,59 @@ mod tests {
                     created_at: 100,
                     event_id: EventId::from_byte_array([1; 32]),
                 }),
+                signal_cursor: None,
+                edge_notification_cursor: None,
             },
             MirrorChannel {
                 channel_id: Uuid::new_v4(),
                 cursor: None,
+                signal_cursor: None,
+                edge_notification_cursor: None,
             },
         ]);
         assert_eq!(filter.since, None);
+    }
+
+    #[test]
+    fn authorization_filters_keep_global_notifications_edge_self_scoped() {
+        let edge = Keys::generate();
+        let relay = Keys::generate();
+        let channel = Uuid::new_v4();
+        let filters = mirror_filters(
+            &[MirrorChannel {
+                channel_id: channel,
+                cursor: None,
+                signal_cursor: Some(UpstreamCursor {
+                    created_at: 123,
+                    event_id: EventId::from_byte_array([3; 32]),
+                }),
+                edge_notification_cursor: Some(UpstreamCursor {
+                    created_at: 456,
+                    event_id: EventId::from_byte_array([4; 32]),
+                }),
+            }],
+            edge.public_key(),
+            relay.public_key(),
+        );
+        assert_eq!(filters.len(), 4);
+        let request = subscription_request("signals", &filters).expect("request");
+        let values = request.as_array().expect("array");
+        assert_eq!(values.len(), 6);
+        let system = &values[3];
+        assert_eq!(system["kinds"], json!([40_099]));
+        assert_eq!(system["#h"], json!([channel.to_string()]));
+        assert_eq!(system["since"], json!(123));
+        let roster = &values[4];
+        assert_eq!(roster["kinds"], json!([39_002]));
+        assert_eq!(roster["#p"], json!([edge.public_key().to_hex()]));
+        let notifications = &values[5];
+        assert_eq!(notifications["kinds"], json!([44_100, 44_101]));
+        assert_eq!(notifications["#p"], json!([edge.public_key().to_hex()]));
+        assert_eq!(
+            notifications["authors"],
+            json!([relay.public_key().to_hex()])
+        );
+        assert_eq!(notifications["since"], json!(456));
     }
 
     #[test]
@@ -551,7 +724,11 @@ mod tests {
                     membership_event_id: membership.id,
                     membership_event_created_at: verified_at,
                     membership_event_bytes: membership.as_json().into_bytes(),
+                    membership_fetch_cursor: None,
+                    signal_cursor: None,
+                    edge_notification_cursor: None,
                     active_authors: vec![edge_keys.public_key()],
+                    removed_authors: Vec::new(),
                 }],
                 verified_at,
                 &edge_keys,
@@ -597,6 +774,8 @@ mod tests {
         let channel_state = MirrorChannel {
             channel_id: channel,
             cursor: None,
+            signal_cursor: None,
+            edge_notification_cursor: None,
         };
         let query_url = format!("http://{address}/query");
 

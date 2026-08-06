@@ -18,6 +18,8 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+const AUTHORIZATION_LEASE_HOURS: u64 = 7 * 24;
+
 #[cfg(windows)]
 const EDGE_KEYRING_SERVICE: &str = "buzz-edge";
 
@@ -40,7 +42,7 @@ async fn run() -> Result<(), String> {
         .map_err(|error| format!("BUZZ_COMMUNITY_ID must be a UUID: {error}"))?;
     let binding = CommunityBinding::new(&canonical_origin, community_id)
         .map_err(|error| error.to_string())?;
-    let authorization_policy = authorization_policy_from_env()?;
+    let authorization_policy = authorization_policy()?;
     let data_directory = PathBuf::from(required_env("BUZZ_EDGE_DATA_DIR")?);
     let (store, database_path) =
         EdgeStore::open_bound(&data_directory, binding.clone(), authorization_policy)
@@ -125,14 +127,10 @@ fn selected_channels_from_env() -> Result<Vec<Uuid>, String> {
         .collect()
 }
 
-fn authorization_policy_from_env() -> Result<AuthorizationPolicy, String> {
-    let raw = required_env("BUZZ_EDGE_AUTHORIZATION_LEASE_HOURS")?;
-    let hours = raw.parse::<u64>().map_err(|error| {
-        format!("BUZZ_EDGE_AUTHORIZATION_LEASE_HOURS must be a positive integer: {error}")
-    })?;
-    let seconds = hours
+fn authorization_policy() -> Result<AuthorizationPolicy, String> {
+    let seconds = AUTHORIZATION_LEASE_HOURS
         .checked_mul(60 * 60)
-        .ok_or_else(|| "BUZZ_EDGE_AUTHORIZATION_LEASE_HOURS is too large".to_string())?;
+        .ok_or_else(|| "authorization lease is too large".to_string())?;
     AuthorizationPolicy::new(Duration::from_secs(seconds)).map_err(|error| error.to_string())
 }
 
@@ -212,5 +210,13 @@ mod tests {
         assert!(loopback_socket_address("ws://localhost:3031/path").is_err());
         assert!(loopback_socket_address("wss://127.0.0.1:3031").is_err());
         assert!(loopback_socket_address("ws://192.0.2.1:3031").is_err());
+    }
+
+    #[test]
+    fn authorization_lease_is_the_owner_selected_seven_days() {
+        assert_eq!(
+            authorization_policy().expect("policy").lease_seconds(),
+            7 * 24 * 60 * 60
+        );
     }
 }

@@ -228,6 +228,45 @@ impl EdgeRelay {
         Ok(result)
     }
 
+    /// Apply one verified upstream roster/removal signal without racing ingress.
+    pub(crate) async fn apply_authorization_signal(
+        &self,
+        event: Event,
+    ) -> Result<storage::AuthorizationSignalOutcome, EdgeError> {
+        let outcome = {
+            let _authorization = self.state.authorization_epoch.write().await;
+            let store = Arc::clone(&self.state.store);
+            let edge_keys = self.state.edge_keys.clone();
+            tokio::task::spawn_blocking(move || {
+                store.apply_authorization_signal(&event, &edge_keys)
+            })
+            .await
+            .map_err(|error| EdgeError::Join(error.to_string()))??
+        };
+        self.close_ineligible_subscriptions().await?;
+        Ok(outcome)
+    }
+
+    /// Treat a canonical membership rejection as an authoritative local removal.
+    pub async fn apply_canonical_membership_rejection(
+        &self,
+        channel_id: Uuid,
+        author: PublicKey,
+    ) -> Result<(), EdgeError> {
+        {
+            let _authorization = self.state.authorization_epoch.write().await;
+            let store = Arc::clone(&self.state.store);
+            let edge_keys = self.state.edge_keys.clone();
+            tokio::task::spawn_blocking(move || {
+                store.revoke_author_after_canonical_rejection(channel_id, author, &edge_keys)
+            })
+            .await
+            .map_err(|error| EdgeError::Join(error.to_string()))??;
+        }
+        self.close_ineligible_subscriptions().await?;
+        Ok(())
+    }
+
     async fn accept_event(
         &self,
         principal: PublicKey,
@@ -1296,7 +1335,11 @@ mod tests {
             membership_event_id: membership.id,
             membership_event_created_at: verified_at,
             membership_event_bytes: membership.as_json().into_bytes(),
+            membership_fetch_cursor: None,
+            signal_cursor: None,
+            edge_notification_cursor: None,
             active_authors: authors.to_vec(),
+            removed_authors: Vec::new(),
         }
     }
 
@@ -1320,9 +1363,7 @@ mod tests {
         store: Arc<EdgeStore>,
         edge_keys: Keys,
         reader: Keys,
-        author: Keys,
         channel: Uuid,
-        relay: EdgeRelay,
         gate: Arc<HistoryGate>,
         url: String,
         server: tokio::task::JoinHandle<Result<(), EdgeError>>,
@@ -1385,9 +1426,7 @@ mod tests {
             store,
             edge_keys,
             reader,
-            author,
             channel,
-            relay,
             gate,
             url,
             server,
@@ -1407,6 +1446,28 @@ mod tests {
             .expect("subscribe");
         fixture.gate.entered.notified().await;
         socket
+    }
+
+    #[tokio::test]
+    async fn revocation_during_history_backfill_prevents_stale_delivery() {
+        let fixture = gated_fixture(test_policy()).await;
+        let mut socket = begin_gated_subscription(&fixture).await;
+        fixture
+            .store
+            .revoke_author_after_canonical_rejection(
+                fixture.channel,
+                fixture.reader.public_key(),
+                &fixture.edge_keys,
+            )
+            .expect("revoke reader");
+        fixture.gate.release.notify_waiters();
+        let frame = text(&mut socket).await;
+        assert_eq!(frame[0], "CLOSED");
+        assert!(frame[2]
+            .as_str()
+            .expect("reason")
+            .contains("authorization changed"));
+        fixture.server.abort();
     }
 
     #[tokio::test]
@@ -1440,11 +1501,15 @@ mod tests {
             membership_event_id: membership.id,
             membership_event_created_at: verified_at,
             membership_event_bytes: membership.as_json().into_bytes(),
+            membership_fetch_cursor: None,
+            signal_cursor: None,
+            edge_notification_cursor: None,
             active_authors: vec![
                 edge_keys.public_key(),
                 sender_keys.public_key(),
                 receiver_keys.public_key(),
             ],
+            removed_authors: Vec::new(),
         };
         store
             .persist_verified_authorization_snapshot(
@@ -1536,7 +1601,11 @@ mod tests {
                     membership_event_id: membership.id,
                     membership_event_created_at: verified_at,
                     membership_event_bytes: membership.as_json().into_bytes(),
+                    membership_fetch_cursor: None,
+                    signal_cursor: None,
+                    edge_notification_cursor: None,
                     active_authors: vec![edge_keys.public_key(), receiver_keys.public_key()],
+                    removed_authors: Vec::new(),
                 }],
                 verified_at,
                 &edge_keys,
@@ -1895,7 +1964,11 @@ mod tests {
                     membership_event_id: membership.id,
                     membership_event_created_at: verified_at,
                     membership_event_bytes: membership.as_json().into_bytes(),
+                    membership_fetch_cursor: None,
+                    signal_cursor: None,
+                    edge_notification_cursor: None,
                     active_authors: vec![edge_keys.public_key(), author.public_key()],
+                    removed_authors: Vec::new(),
                 }],
                 verified_at,
                 &edge_keys,

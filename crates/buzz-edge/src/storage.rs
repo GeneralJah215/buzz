@@ -54,6 +54,9 @@ pub enum StorageError {
     /// An authorization snapshot could not be signed or verified.
     #[error("invalid authorization snapshot: {0}")]
     AuthorizationSnapshot(String),
+    /// A relay-signed roster or removal signal was malformed or unauthentic.
+    #[error("invalid authorization signal: {0}")]
+    AuthorizationSignal(String),
     /// Digest materialization inputs are incomplete or inconsistent.
     #[error("invalid digest materialization: {0}")]
     InvalidDigest(String),
@@ -119,8 +122,22 @@ pub struct VerifiedChannelAuthorization {
     pub membership_event_created_at: i64,
     /// Exact relay-signed kind-39002 source bytes.
     pub membership_event_bytes: Vec<u8>,
+    /// Durable fetch cursor for the source projection. An unchanged source event
+    /// never advances this cursor or any other roster freshness field.
+    #[serde(default)]
+    pub membership_fetch_cursor: Option<UpstreamCursor>,
+    /// Last processed relay-signed kind-40099 channel removal signal.
+    #[serde(default)]
+    pub signal_cursor: Option<UpstreamCursor>,
+    /// Last processed relay-signed kind-44100/44101 signal addressed to the edge.
+    #[serde(default)]
+    pub edge_notification_cursor: Option<UpstreamCursor>,
     /// Complete active author set extracted from the source event.
     pub active_authors: Vec<PublicKey>,
+    /// Authors removed by a verified signal or canonical membership rejection
+    /// since the current roster source was published.
+    #[serde(default)]
+    pub removed_authors: Vec<PublicKey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -208,12 +225,29 @@ pub struct MaterializedDigestPart {
 }
 
 /// Durable high-water mark for one mirrored upstream channel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpstreamCursor {
     /// Highest mirrored event timestamp in Unix seconds.
     pub created_at: i64,
     /// Highest event ID seen at that timestamp.
     pub event_id: EventId,
+}
+
+/// Durable effect of one relay-signed authorization signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizationSignalOutcome {
+    /// The signal was valid but older than or equal to the durable cursor.
+    Duplicate,
+    /// A relay-signed non-removal system event advanced the durable signal cursor.
+    SignalObserved { channel_id: Uuid },
+    /// A changed kind-39002 replaced the roster projection atomically.
+    RosterReplaced { channel_id: Uuid },
+    /// A kind-40099 or canonical rejection removed one local author.
+    AuthorRemoved { channel_id: Uuid, author: PublicKey },
+    /// An edge-self kind-44101 revoked local routing for the channel.
+    EdgeRemoved { channel_id: Uuid },
+    /// An edge-self kind-44100 requires a fresh authoritative eligibility read.
+    RefreshRequired { channel_id: Uuid },
 }
 
 /// SQLite-backed event cache, membership cache, and phase-1 outbox.
@@ -581,70 +615,57 @@ impl EdgeStore {
             .ok_or_else(|| {
                 StorageError::AuthorizationSnapshot("lease timestamp overflow".to_string())
             })?;
-        let mut channels = channels.to_vec();
-        channels.sort_by_key(|channel| channel.channel_id);
-        channels.dedup_by_key(|channel| channel.channel_id);
-        for channel in &mut channels {
-            channel.active_authors.sort_by_key(PublicKey::to_hex);
-            channel.active_authors.dedup();
-            validate_channel_authorization(channel)?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        let existing = load_signed_snapshot_payload(&transaction, &edge_keys.public_key())?;
+        let existing_by_channel = existing
+            .map(|payload| {
+                payload
+                    .channels
+                    .into_iter()
+                    .map(|channel| (channel.channel_id, channel))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let mut merged = Vec::with_capacity(channels.len());
+        for channel in channels {
+            let mut candidate = channel.clone();
+            candidate.active_authors.sort_by_key(PublicKey::to_hex);
+            candidate.active_authors.dedup();
+            candidate.removed_authors.sort_by_key(PublicKey::to_hex);
+            candidate.removed_authors.dedup();
+            if candidate.membership_fetch_cursor.is_none() {
+                candidate.membership_fetch_cursor = Some(UpstreamCursor {
+                    created_at: candidate.membership_event_created_at,
+                    event_id: candidate.membership_event_id,
+                });
+            }
+            validate_channel_authorization(&candidate)?;
+            if let Some(previous) = existing_by_channel.get(&candidate.channel_id) {
+                if !membership_projection_is_newer(&candidate, previous) {
+                    candidate = previous.clone();
+                } else {
+                    candidate.signal_cursor = previous.signal_cursor;
+                    candidate.edge_notification_cursor = previous.edge_notification_cursor;
+                    candidate.removed_authors.clear();
+                }
+            }
+            merged.push(candidate);
         }
+        merged.sort_by_key(|channel| channel.channel_id);
+        merged.dedup_by_key(|channel| channel.channel_id);
         let payload = AuthorizationSnapshotPayload {
             canonical_origin: self.binding.canonical_origin().to_string(),
             community_id: self.binding.community_id(),
             verified_at,
             expires_at,
-            channels,
+            channels: merged,
         };
-        let content = serde_json::to_string(&payload)
-            .map_err(|error| StorageError::AuthorizationSnapshot(error.to_string()))?;
-        let verified_at_u64 = u64::try_from(verified_at)
-            .map_err(|error| StorageError::AuthorizationSnapshot(error.to_string()))?;
-        let snapshot = EventBuilder::new(Kind::Custom(AUTHORIZATION_SNAPSHOT_KIND), content)
-            .tags([
-                Tag::identifier("edge-authorization-snapshot"),
-                Tag::parse([
-                    "community",
-                    self.binding.community_id().to_string().as_str(),
-                ])
-                .map_err(|error| StorageError::AuthorizationSnapshot(error.to_string()))?,
-            ])
-            .custom_created_at(Timestamp::from(verified_at_u64))
-            .sign_with_keys(edge_keys)
-            .map_err(|error| StorageError::AuthorizationSnapshot(error.to_string()))?;
-
-        let mut connection = self.connection.lock();
-        let transaction = connection.transaction()?;
-        transaction.execute("UPDATE selected_channels SET edge_eligible = 0", [])?;
-        for channel in &payload.channels {
-            transaction.execute(
-                "UPDATE selected_channels
-                 SET edge_eligible = CASE WHEN active = 1 THEN 1 ELSE 0 END,
-                     eligibility_checked_at = ?2,
-                     updated_at = ?2
-                 WHERE channel_id = ?1",
-                params![channel.channel_id.to_string(), verified_at],
-            )?;
-            replace_channel_members_transaction(&transaction, channel)?;
-        }
-        transaction.execute(
-            "INSERT INTO authorization_snapshot(
-                 singleton, edge_pubkey, verified_at, expires_at,
-                 snapshot_event_id, snapshot_event_bytes
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(singleton) DO UPDATE SET
-                 edge_pubkey = excluded.edge_pubkey,
-                 verified_at = excluded.verified_at,
-                 expires_at = excluded.expires_at,
-                 snapshot_event_id = excluded.snapshot_event_id,
-                 snapshot_event_bytes = excluded.snapshot_event_bytes",
-            params![
-                edge_keys.public_key().to_hex(),
-                verified_at,
-                expires_at,
-                snapshot.id.to_hex(),
-                snapshot.as_json().as_bytes(),
-            ],
+        let snapshot = persist_snapshot_transaction(
+            &transaction,
+            &payload,
+            edge_keys,
+            self.binding.community_id(),
         )?;
         transaction.commit()?;
         Ok(snapshot)
@@ -656,17 +677,26 @@ impl EdgeStore {
         edge_pubkey: &PublicKey,
         now: i64,
     ) -> Result<AuthorizationLease, StorageError> {
-        let row: Option<(String, i64, i64, Vec<u8>)> = self
+        let row: Option<(String, i64, i64, String, Vec<u8>)> = self
             .connection
             .lock()
             .query_row(
-                "SELECT edge_pubkey, verified_at, expires_at, snapshot_event_bytes
+                "SELECT edge_pubkey, verified_at, expires_at,
+                        snapshot_event_id, snapshot_event_bytes
                  FROM authorization_snapshot WHERE singleton = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((stored_pubkey, verified_at, expires_at, bytes)) = row else {
+        let Some((stored_pubkey, verified_at, expires_at, stored_event_id, bytes)) = row else {
             return Ok(AuthorizationLease::Missing);
         };
         if stored_pubkey != edge_pubkey.to_hex() {
@@ -676,7 +706,8 @@ impl EdgeStore {
         }
         let event: Event = serde_json::from_slice(&bytes)
             .map_err(|error| StorageError::AuthorizationSnapshot(error.to_string()))?;
-        if event.pubkey != *edge_pubkey
+        if event.id.to_hex() != stored_event_id
+            || event.pubkey != *edge_pubkey
             || event.kind != Kind::Custom(AUTHORIZATION_SNAPSHOT_KIND)
             || buzz_core::verification::verify_event(&event).is_err()
         {
@@ -714,6 +745,144 @@ impl EdgeStore {
                 expires_at,
             })
         }
+    }
+
+    /// Return the relay signing identity pinned by the current roster sources.
+    pub fn relay_identity(&self, edge_pubkey: &PublicKey) -> Result<PublicKey, StorageError> {
+        let connection = self.connection.lock();
+        let payload = load_signed_snapshot_payload(&connection, edge_pubkey)?.ok_or_else(|| {
+            StorageError::AuthorizationSnapshot("authorization snapshot is missing".to_string())
+        })?;
+        snapshot_relay_identity(&payload)
+    }
+
+    /// Return the durable authorization-signal cursor for one channel.
+    pub fn authorization_signal_cursor(
+        &self,
+        edge_pubkey: &PublicKey,
+        channel_id: Uuid,
+    ) -> Result<Option<UpstreamCursor>, StorageError> {
+        let connection = self.connection.lock();
+        let payload = load_signed_snapshot_payload(&connection, edge_pubkey)?.ok_or_else(|| {
+            StorageError::AuthorizationSnapshot("authorization snapshot is missing".to_string())
+        })?;
+        Ok(payload
+            .channels
+            .into_iter()
+            .find(|channel| channel.channel_id == channel_id)
+            .and_then(|channel| channel.signal_cursor))
+    }
+
+    /// Return the durable edge-self membership-notification cursor for one channel.
+    pub fn edge_notification_cursor(
+        &self,
+        edge_pubkey: &PublicKey,
+        channel_id: Uuid,
+    ) -> Result<Option<UpstreamCursor>, StorageError> {
+        let connection = self.connection.lock();
+        let payload = load_signed_snapshot_payload(&connection, edge_pubkey)?.ok_or_else(|| {
+            StorageError::AuthorizationSnapshot("authorization snapshot is missing".to_string())
+        })?;
+        Ok(payload
+            .channels
+            .into_iter()
+            .find(|channel| channel.channel_id == channel_id)
+            .and_then(|channel| channel.edge_notification_cursor))
+    }
+
+    /// Validate and atomically apply one relay-signed roster/removal signal.
+    ///
+    /// kind-40099 may remove other authors. kind-44100/44101 is accepted only
+    /// when addressed to the edge identity itself and never mutates another
+    /// author's working-roster entry.
+    pub fn apply_authorization_signal(
+        &self,
+        event: &Event,
+        edge_keys: &Keys,
+    ) -> Result<AuthorizationSignalOutcome, StorageError> {
+        if buzz_core::verification::verify_event(event).is_err() {
+            return Err(StorageError::AuthorizationSignal(
+                "signal signature verification failed".to_string(),
+            ));
+        }
+        let cursor = event_cursor(event)?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        let mut payload = load_signed_snapshot_payload(&transaction, &edge_keys.public_key())?
+            .ok_or_else(|| {
+                StorageError::AuthorizationSnapshot("authorization snapshot is missing".to_string())
+            })?;
+        if event.pubkey != snapshot_relay_identity(&payload)? {
+            return Err(StorageError::AuthorizationSignal(
+                "signal signer does not match the roster-source relay".to_string(),
+            ));
+        }
+
+        let outcome = match event.kind.as_u16() {
+            39_002 => {
+                apply_roster_projection(&mut payload, event, cursor, &edge_keys.public_key())?
+            }
+            40_099 => apply_system_removal(&mut payload, event, cursor)?,
+            44_100 | 44_101 => apply_edge_membership_notification(
+                &mut payload,
+                event,
+                cursor,
+                &edge_keys.public_key(),
+            )?,
+            kind => {
+                return Err(StorageError::AuthorizationSignal(format!(
+                    "unsupported signal kind {kind}"
+                )))
+            }
+        };
+        if outcome != AuthorizationSignalOutcome::Duplicate {
+            persist_snapshot_transaction(
+                &transaction,
+                &payload,
+                edge_keys,
+                self.binding.community_id(),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    /// Apply an authoritative canonical membership rejection to the working roster.
+    pub fn revoke_author_after_canonical_rejection(
+        &self,
+        channel_id: Uuid,
+        author: PublicKey,
+        edge_keys: &Keys,
+    ) -> Result<AuthorizationSignalOutcome, StorageError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        let mut payload = load_signed_snapshot_payload(&transaction, &edge_keys.public_key())?
+            .ok_or_else(|| {
+                StorageError::AuthorizationSnapshot("authorization snapshot is missing".to_string())
+            })?;
+        let channel = payload
+            .channels
+            .iter_mut()
+            .find(|channel| channel.channel_id == channel_id)
+            .ok_or_else(|| {
+                StorageError::AuthorizationSignal("rejected channel is not eligible".to_string())
+            })?;
+        let changed =
+            channel.active_authors.contains(&author) && !channel.removed_authors.contains(&author);
+        if changed {
+            channel.removed_authors.push(author);
+            channel.removed_authors.sort_by_key(PublicKey::to_hex);
+        }
+        if changed {
+            persist_snapshot_transaction(
+                &transaction,
+                &payload,
+                edge_keys,
+                self.binding.community_id(),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(AuthorizationSignalOutcome::AuthorRemoved { channel_id, author })
     }
 
     /// Upsert a cached channel membership decision in protocol tests.
@@ -1277,6 +1446,325 @@ impl EdgeStore {
     }
 }
 
+fn load_signed_snapshot_payload(
+    connection: &Connection,
+    edge_pubkey: &PublicKey,
+) -> Result<Option<AuthorizationSnapshotPayload>, StorageError> {
+    let row: Option<(String, i64, i64, String, Vec<u8>)> = connection
+        .query_row(
+            "SELECT edge_pubkey, verified_at, expires_at,
+                    snapshot_event_id, snapshot_event_bytes
+             FROM authorization_snapshot WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((stored_pubkey, verified_at, expires_at, stored_event_id, bytes)) = row else {
+        return Ok(None);
+    };
+    if stored_pubkey != edge_pubkey.to_hex() {
+        return Err(StorageError::AuthorizationSnapshot(
+            "snapshot signer does not match the configured edge identity".to_string(),
+        ));
+    }
+    let event: Event = serde_json::from_slice(&bytes)
+        .map_err(|error| StorageError::AuthorizationSnapshot(error.to_string()))?;
+    if event.id.to_hex() != stored_event_id
+        || event.pubkey != *edge_pubkey
+        || event.kind != Kind::Custom(AUTHORIZATION_SNAPSHOT_KIND)
+        || buzz_core::verification::verify_event(&event).is_err()
+    {
+        return Err(StorageError::AuthorizationSnapshot(
+            "snapshot signature verification failed".to_string(),
+        ));
+    }
+    let payload: AuthorizationSnapshotPayload = serde_json::from_str(&event.content)
+        .map_err(|error| StorageError::AuthorizationSnapshot(error.to_string()))?;
+    if payload.verified_at != verified_at || payload.expires_at != expires_at {
+        return Err(StorageError::AuthorizationSnapshot(
+            "snapshot timestamps do not match the database record".to_string(),
+        ));
+    }
+    for channel in &payload.channels {
+        validate_channel_authorization(channel)?;
+    }
+    Ok(Some(payload))
+}
+
+fn persist_snapshot_transaction(
+    transaction: &Transaction<'_>,
+    payload: &AuthorizationSnapshotPayload,
+    edge_keys: &Keys,
+    community_id: Uuid,
+) -> Result<Event, StorageError> {
+    for channel in &payload.channels {
+        validate_channel_authorization(channel)?;
+    }
+    let content = serde_json::to_string(payload)
+        .map_err(|error| StorageError::AuthorizationSnapshot(error.to_string()))?;
+    let verified_at = u64::try_from(payload.verified_at)
+        .map_err(|error| StorageError::AuthorizationSnapshot(error.to_string()))?;
+    let snapshot = EventBuilder::new(Kind::Custom(AUTHORIZATION_SNAPSHOT_KIND), content)
+        .tags([
+            Tag::identifier("edge-authorization-snapshot"),
+            Tag::parse(["community", community_id.to_string().as_str()])
+                .map_err(|error| StorageError::AuthorizationSnapshot(error.to_string()))?,
+        ])
+        .custom_created_at(Timestamp::from(verified_at))
+        .sign_with_keys(edge_keys)
+        .map_err(|error| StorageError::AuthorizationSnapshot(error.to_string()))?;
+
+    transaction.execute("UPDATE selected_channels SET edge_eligible = 0", [])?;
+    for channel in &payload.channels {
+        transaction.execute(
+            "UPDATE selected_channels
+             SET edge_eligible = CASE WHEN active = 1 THEN 1 ELSE 0 END,
+                 eligibility_checked_at = ?2,
+                 updated_at = ?2
+             WHERE channel_id = ?1",
+            params![channel.channel_id.to_string(), payload.verified_at],
+        )?;
+        replace_channel_members_transaction(transaction, channel)?;
+    }
+    transaction.execute(
+        "INSERT INTO authorization_snapshot(
+             singleton, edge_pubkey, verified_at, expires_at,
+             snapshot_event_id, snapshot_event_bytes
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(singleton) DO UPDATE SET
+             edge_pubkey = excluded.edge_pubkey,
+             verified_at = excluded.verified_at,
+             expires_at = excluded.expires_at,
+             snapshot_event_id = excluded.snapshot_event_id,
+             snapshot_event_bytes = excluded.snapshot_event_bytes",
+        params![
+            edge_keys.public_key().to_hex(),
+            payload.verified_at,
+            payload.expires_at,
+            snapshot.id.to_hex(),
+            snapshot.as_json().as_bytes(),
+        ],
+    )?;
+    Ok(snapshot)
+}
+
+fn snapshot_relay_identity(
+    payload: &AuthorizationSnapshotPayload,
+) -> Result<PublicKey, StorageError> {
+    let mut relay_identity = None;
+    for channel in &payload.channels {
+        let event: Event = serde_json::from_slice(&channel.membership_event_bytes)
+            .map_err(|error| StorageError::AuthorizationSnapshot(error.to_string()))?;
+        if relay_identity.is_some_and(|identity| identity != event.pubkey) {
+            return Err(StorageError::AuthorizationSnapshot(
+                "roster sources have inconsistent relay signers".to_string(),
+            ));
+        }
+        relay_identity = Some(event.pubkey);
+    }
+    relay_identity.ok_or_else(|| {
+        StorageError::AuthorizationSnapshot("snapshot contains no relay roster source".to_string())
+    })
+}
+
+fn event_cursor(event: &Event) -> Result<UpstreamCursor, StorageError> {
+    Ok(UpstreamCursor {
+        created_at: i64::try_from(event.created_at.as_secs())
+            .map_err(|error| StorageError::AuthorizationSignal(error.to_string()))?,
+        event_id: event.id,
+    })
+}
+
+fn cursor_is_newer(candidate: UpstreamCursor, current: UpstreamCursor) -> bool {
+    candidate.created_at > current.created_at
+        || (candidate.created_at == current.created_at && candidate.event_id > current.event_id)
+}
+
+fn membership_projection_is_newer(
+    candidate: &VerifiedChannelAuthorization,
+    current: &VerifiedChannelAuthorization,
+) -> bool {
+    candidate.membership_event_created_at > current.membership_event_created_at
+        || (candidate.membership_event_created_at == current.membership_event_created_at
+            && candidate.membership_event_id < current.membership_event_id)
+}
+
+fn exact_uuid_tag(event: &Event, name: &str) -> Result<Uuid, StorageError> {
+    let mut tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some(name));
+    let value = tags
+        .next()
+        .and_then(|tag| tag.as_slice().get(1))
+        .ok_or_else(|| StorageError::AuthorizationSignal(format!("missing {name} tag")))?;
+    if tags.next().is_some() {
+        return Err(StorageError::AuthorizationSignal(format!(
+            "signal has multiple {name} tags"
+        )));
+    }
+    Uuid::parse_str(value).map_err(|error| StorageError::AuthorizationSignal(error.to_string()))
+}
+
+fn exact_public_key_tag(event: &Event, name: &str) -> Result<PublicKey, StorageError> {
+    let mut tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some(name));
+    let value = tags
+        .next()
+        .and_then(|tag| tag.as_slice().get(1))
+        .ok_or_else(|| StorageError::AuthorizationSignal(format!("missing {name} tag")))?;
+    if tags.next().is_some() {
+        return Err(StorageError::AuthorizationSignal(format!(
+            "signal has multiple {name} tags"
+        )));
+    }
+    PublicKey::from_hex(value).map_err(|error| StorageError::AuthorizationSignal(error.to_string()))
+}
+
+fn apply_roster_projection(
+    payload: &mut AuthorizationSnapshotPayload,
+    event: &Event,
+    cursor: UpstreamCursor,
+    edge_pubkey: &PublicKey,
+) -> Result<AuthorizationSignalOutcome, StorageError> {
+    let channel_id = exact_uuid_tag(event, "d")?;
+    let active_authors = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("p"))
+        .filter_map(|tag| tag.as_slice().get(1))
+        .map(|value| {
+            PublicKey::from_hex(value)
+                .map_err(|error| StorageError::AuthorizationSignal(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !active_authors.contains(edge_pubkey) {
+        return Err(StorageError::AuthorizationSignal(
+            "roster projection does not authorize the edge identity".to_string(),
+        ));
+    }
+    let Some(previous) = payload
+        .channels
+        .iter_mut()
+        .find(|channel| channel.channel_id == channel_id)
+    else {
+        return Ok(AuthorizationSignalOutcome::RefreshRequired { channel_id });
+    };
+    let mut replacement = VerifiedChannelAuthorization {
+        channel_id,
+        membership_event_id: event.id,
+        membership_event_created_at: cursor.created_at,
+        membership_event_bytes: event.as_json().into_bytes(),
+        membership_fetch_cursor: Some(cursor),
+        signal_cursor: previous.signal_cursor,
+        edge_notification_cursor: previous.edge_notification_cursor,
+        active_authors,
+        removed_authors: Vec::new(),
+    };
+    replacement.active_authors.sort_by_key(PublicKey::to_hex);
+    replacement.active_authors.dedup();
+    validate_channel_authorization(&replacement)?;
+    if !membership_projection_is_newer(&replacement, previous) {
+        return Ok(AuthorizationSignalOutcome::Duplicate);
+    }
+    *previous = replacement;
+    Ok(AuthorizationSignalOutcome::RosterReplaced { channel_id })
+}
+
+fn apply_system_removal(
+    payload: &mut AuthorizationSnapshotPayload,
+    event: &Event,
+    cursor: UpstreamCursor,
+) -> Result<AuthorizationSignalOutcome, StorageError> {
+    let channel_id = exact_uuid_tag(event, "h")?;
+    let channel = payload
+        .channels
+        .iter_mut()
+        .find(|channel| channel.channel_id == channel_id)
+        .ok_or_else(|| {
+            StorageError::AuthorizationSignal("system-message channel is not eligible".to_string())
+        })?;
+    if channel
+        .signal_cursor
+        .is_some_and(|current| !cursor_is_newer(cursor, current))
+    {
+        return Ok(AuthorizationSignalOutcome::Duplicate);
+    }
+    let content: serde_json::Value = serde_json::from_str(&event.content)
+        .map_err(|error| StorageError::AuthorizationSignal(error.to_string()))?;
+    let message_type = content.get("type").and_then(serde_json::Value::as_str);
+    let field = match message_type {
+        Some("member_removed") => "target",
+        Some("member_left") => "actor",
+        _ => {
+            channel.signal_cursor = Some(cursor);
+            return Ok(AuthorizationSignalOutcome::SignalObserved { channel_id });
+        }
+    };
+    let author = content
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| StorageError::AuthorizationSignal(format!("missing {field} pubkey")))
+        .and_then(|value| {
+            PublicKey::from_hex(value)
+                .map_err(|error| StorageError::AuthorizationSignal(error.to_string()))
+        })?;
+    channel.signal_cursor = Some(cursor);
+    if channel.active_authors.contains(&author) && !channel.removed_authors.contains(&author) {
+        channel.removed_authors.push(author);
+        channel.removed_authors.sort_by_key(PublicKey::to_hex);
+    }
+    Ok(AuthorizationSignalOutcome::AuthorRemoved { channel_id, author })
+}
+
+fn apply_edge_membership_notification(
+    payload: &mut AuthorizationSnapshotPayload,
+    event: &Event,
+    cursor: UpstreamCursor,
+    edge_pubkey: &PublicKey,
+) -> Result<AuthorizationSignalOutcome, StorageError> {
+    if exact_public_key_tag(event, "p")? != *edge_pubkey {
+        return Err(StorageError::AuthorizationSignal(
+            "membership notification is not addressed only to the edge identity".to_string(),
+        ));
+    }
+    let channel_id = exact_uuid_tag(event, "h")?;
+    let Some(index) = payload
+        .channels
+        .iter()
+        .position(|channel| channel.channel_id == channel_id)
+    else {
+        return Ok(if event.kind.as_u16() == 44_100 {
+            AuthorizationSignalOutcome::RefreshRequired { channel_id }
+        } else {
+            AuthorizationSignalOutcome::EdgeRemoved { channel_id }
+        });
+    };
+    if payload.channels[index]
+        .edge_notification_cursor
+        .is_some_and(|current| !cursor_is_newer(cursor, current))
+    {
+        return Ok(AuthorizationSignalOutcome::Duplicate);
+    }
+    if event.kind.as_u16() == 44_101 {
+        payload.channels.remove(index);
+        Ok(AuthorizationSignalOutcome::EdgeRemoved { channel_id })
+    } else {
+        payload.channels[index].edge_notification_cursor = Some(cursor);
+        Ok(AuthorizationSignalOutcome::RefreshRequired { channel_id })
+    }
+}
+
 fn validate_channel_authorization(
     channel: &VerifiedChannelAuthorization,
 ) -> Result<(), StorageError> {
@@ -1323,6 +1811,23 @@ fn validate_channel_authorization(
             "signed active-author roster differs from its source event".to_string(),
         ));
     }
+    if channel.membership_fetch_cursor.is_some_and(|cursor| {
+        cursor.created_at != channel.membership_event_created_at
+            || cursor.event_id != channel.membership_event_id
+    }) {
+        return Err(StorageError::AuthorizationSnapshot(
+            "roster fetch cursor differs from its source event".to_string(),
+        ));
+    }
+    if channel
+        .removed_authors
+        .iter()
+        .any(|author| !channel.active_authors.contains(author))
+    {
+        return Err(StorageError::AuthorizationSnapshot(
+            "working-roster removal is absent from the source roster".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -1343,7 +1848,11 @@ fn replace_channel_members_transaction(
         "UPDATE channel_members SET active = 0, updated_at = ?2 WHERE channel_id = ?1",
         params![channel.channel_id.to_string(), unix_seconds()],
     )?;
-    for member in &channel.active_authors {
+    for member in channel
+        .active_authors
+        .iter()
+        .filter(|member| !channel.removed_authors.contains(member))
+    {
         transaction.execute(
             "INSERT INTO channel_members(channel_id, pubkey, active, updated_at)
              VALUES (?1, ?2, 1, ?3)
@@ -1516,6 +2025,15 @@ mod tests {
         created_at: i64,
     ) -> VerifiedChannelAuthorization {
         let relay = Keys::generate();
+        authorization_from_relay(&relay, channel_id, active_authors, created_at)
+    }
+
+    fn authorization_from_relay(
+        relay: &Keys,
+        channel_id: Uuid,
+        active_authors: &[PublicKey],
+        created_at: i64,
+    ) -> VerifiedChannelAuthorization {
         let mut tags = vec![Tag::parse(["d", channel_id.to_string().as_str()]).expect("d tag")];
         for author in active_authors {
             tags.push(Tag::parse(["p", author.to_hex().as_str()]).expect("p tag"));
@@ -1523,15 +2041,35 @@ mod tests {
         let event = EventBuilder::new(Kind::Custom(39_002), "")
             .tags(tags)
             .custom_created_at(Timestamp::from(created_at as u64))
-            .sign_with_keys(&relay)
+            .sign_with_keys(relay)
             .expect("membership event");
         VerifiedChannelAuthorization {
             channel_id,
             membership_event_id: event.id,
             membership_event_created_at: created_at,
             membership_event_bytes: event.as_json().into_bytes(),
+            membership_fetch_cursor: None,
+            signal_cursor: None,
+            edge_notification_cursor: None,
             active_authors: active_authors.to_vec(),
+            removed_authors: Vec::new(),
         }
+    }
+
+    fn system_removal(relay: &Keys, channel_id: Uuid, author: PublicKey, created_at: i64) -> Event {
+        EventBuilder::new(
+            Kind::Custom(40_099),
+            serde_json::json!({
+                "type": "member_removed",
+                "actor": relay.public_key().to_hex(),
+                "target": author.to_hex(),
+            })
+            .to_string(),
+        )
+        .tags([Tag::parse(["h", channel_id.to_string().as_str()]).expect("h tag")])
+        .custom_created_at(Timestamp::from(created_at as u64))
+        .sign_with_keys(relay)
+        .expect("system removal")
     }
 
     fn message(keys: &Keys, channel: Uuid, content: &str) -> Event {
@@ -1812,6 +2350,11 @@ mod tests {
         let verified_at = 1_800_000_000;
         let lease_seconds = policy().lease_seconds();
         let channel_authorization = authorization(channel, &[edge.public_key()], verified_at);
+        let mut expected_authorization = channel_authorization.clone();
+        expected_authorization.membership_fetch_cursor = Some(UpstreamCursor {
+            created_at: verified_at,
+            event_id: channel_authorization.membership_event_id,
+        });
         let snapshot = store
             .persist_verified_authorization_snapshot(
                 std::slice::from_ref(&channel_authorization),
@@ -1825,7 +2368,7 @@ mod tests {
                 .load_authorization_lease(&edge.public_key(), verified_at + 1)
                 .expect("valid lease"),
             AuthorizationLease::Valid {
-                channels: vec![channel_authorization],
+                channels: vec![expected_authorization],
                 verified_at,
                 expires_at: verified_at + lease_seconds,
             }
@@ -1965,6 +2508,238 @@ mod tests {
             .digest_parts("ambiguous")
             .expect("rollback")
             .is_empty());
+    }
+
+    #[test]
+    fn system_removal_survives_an_unchanged_roster_refresh() {
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let edge = Keys::generate();
+        let relay = Keys::generate();
+        let author = Keys::generate();
+        let channel = Uuid::new_v4();
+        let now = unix_seconds();
+        store.set_channel_selected(channel, true).expect("select");
+        let projection = authorization_from_relay(
+            &relay,
+            channel,
+            &[edge.public_key(), author.public_key()],
+            now,
+        );
+        store
+            .persist_verified_authorization_snapshot(std::slice::from_ref(&projection), now, &edge)
+            .expect("snapshot");
+
+        let removal = system_removal(&relay, channel, author.public_key(), now + 1);
+        assert_eq!(
+            store
+                .apply_authorization_signal(&removal, &edge)
+                .expect("removal"),
+            AuthorizationSignalOutcome::AuthorRemoved {
+                channel_id: channel,
+                author: author.public_key(),
+            }
+        );
+        assert!(!store
+            .principal_can_access(channel, &author.public_key())
+            .expect("removed"));
+        let signal_cursor = store
+            .authorization_signal_cursor(&edge.public_key(), channel)
+            .expect("cursor")
+            .expect("stored cursor");
+
+        store
+            .persist_verified_authorization_snapshot(&[projection], now + 2, &edge)
+            .expect("unchanged refresh");
+        assert!(!store
+            .principal_can_access(channel, &author.public_key())
+            .expect("unchanged roster cannot reauthorize"));
+        assert_eq!(
+            store
+                .authorization_signal_cursor(&edge.public_key(), channel)
+                .expect("cursor"),
+            Some(signal_cursor)
+        );
+        let AuthorizationLease::Valid { channels, .. } = store
+            .load_authorization_lease(&edge.public_key(), now + 2)
+            .expect("lease")
+        else {
+            panic!("expected valid lease");
+        };
+        assert_eq!(channels[0].membership_event_created_at, now);
+        assert_eq!(
+            channels[0].membership_fetch_cursor,
+            Some(UpstreamCursor {
+                created_at: now,
+                event_id: channels[0].membership_event_id,
+            })
+        );
+        assert_eq!(channels[0].removed_authors, vec![author.public_key()]);
+    }
+
+    #[test]
+    fn changed_roster_projection_can_reauthorize_a_removed_author() {
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let edge = Keys::generate();
+        let relay = Keys::generate();
+        let author = Keys::generate();
+        let channel = Uuid::new_v4();
+        let now = unix_seconds();
+        store.set_channel_selected(channel, true).expect("select");
+        store
+            .persist_verified_authorization_snapshot(
+                &[authorization_from_relay(
+                    &relay,
+                    channel,
+                    &[edge.public_key(), author.public_key()],
+                    now,
+                )],
+                now,
+                &edge,
+            )
+            .expect("snapshot");
+        store
+            .apply_authorization_signal(
+                &system_removal(&relay, channel, author.public_key(), now + 1),
+                &edge,
+            )
+            .expect("removal");
+
+        let changed = authorization_from_relay(
+            &relay,
+            channel,
+            &[edge.public_key(), author.public_key()],
+            now + 2,
+        );
+        assert_eq!(
+            store
+                .apply_authorization_signal(
+                    &Event::from_json(&changed.membership_event_bytes).expect("event"),
+                    &edge,
+                )
+                .expect("changed roster"),
+            AuthorizationSignalOutcome::RosterReplaced {
+                channel_id: channel
+            }
+        );
+        assert!(store
+            .principal_can_access(channel, &author.public_key())
+            .expect("reauthorized"));
+    }
+
+    #[test]
+    fn suppressed_removal_carriers_leave_local_access_until_canonical_rejection() {
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let edge = Keys::generate();
+        let relay = Keys::generate();
+        let author = Keys::generate();
+        let channel = Uuid::new_v4();
+        let now = unix_seconds();
+        store.set_channel_selected(channel, true).expect("select");
+        let unchanged = authorization_from_relay(
+            &relay,
+            channel,
+            &[edge.public_key(), author.public_key()],
+            now,
+        );
+        store
+            .persist_verified_authorization_snapshot(std::slice::from_ref(&unchanged), now, &edge)
+            .expect("snapshot");
+        store
+            .persist_verified_authorization_snapshot(&[unchanged], now + 1, &edge)
+            .expect("unchanged refresh");
+        assert!(store
+            .principal_can_access_at(channel, &author.public_key(), now + 1)
+            .expect("disclosed residual"));
+
+        store
+            .revoke_author_after_canonical_rejection(channel, author.public_key(), &edge)
+            .expect("canonical rejection");
+        assert!(!store
+            .principal_can_access_at(channel, &author.public_key(), now + 1)
+            .expect("canonical rejection revokes locally"));
+    }
+
+    #[test]
+    fn membership_notifications_are_edge_self_only() {
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let edge = Keys::generate();
+        let relay = Keys::generate();
+        let other = Keys::generate();
+        let channel = Uuid::new_v4();
+        let now = unix_seconds();
+        store.set_channel_selected(channel, true).expect("select");
+        store
+            .persist_verified_authorization_snapshot(
+                &[authorization_from_relay(
+                    &relay,
+                    channel,
+                    &[edge.public_key()],
+                    now,
+                )],
+                now,
+                &edge,
+            )
+            .expect("snapshot");
+        let notification = |target: PublicKey, created_at: i64| {
+            EventBuilder::new(Kind::Custom(44_101), "")
+                .tags([
+                    Tag::parse(["p", target.to_hex().as_str()]).expect("p"),
+                    Tag::parse(["h", channel.to_string().as_str()]).expect("h"),
+                ])
+                .custom_created_at(Timestamp::from(created_at as u64))
+                .sign_with_keys(&relay)
+                .expect("notification")
+        };
+        assert!(matches!(
+            store.apply_authorization_signal(&notification(other.public_key(), now + 1), &edge),
+            Err(StorageError::AuthorizationSignal(_))
+        ));
+        assert!(store
+            .channel_is_edge_eligible(channel)
+            .expect("still eligible"));
+        assert_eq!(
+            store
+                .apply_authorization_signal(&notification(edge.public_key(), now + 2), &edge)
+                .expect("self removal"),
+            AuthorizationSignalOutcome::EdgeRemoved {
+                channel_id: channel
+            }
+        );
+        assert!(!store.channel_is_edge_eligible(channel).expect("revoked"));
+    }
+
+    #[test]
+    fn forged_system_removal_is_rejected() {
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let edge = Keys::generate();
+        let relay = Keys::generate();
+        let impostor = Keys::generate();
+        let author = Keys::generate();
+        let channel = Uuid::new_v4();
+        let now = unix_seconds();
+        store.set_channel_selected(channel, true).expect("select");
+        store
+            .persist_verified_authorization_snapshot(
+                &[authorization_from_relay(
+                    &relay,
+                    channel,
+                    &[edge.public_key(), author.public_key()],
+                    now,
+                )],
+                now,
+                &edge,
+            )
+            .expect("snapshot");
+        assert!(matches!(
+            store.apply_authorization_signal(
+                &system_removal(&impostor, channel, author.public_key(), now + 1),
+                &edge,
+            ),
+            Err(StorageError::AuthorizationSignal(_))
+        ));
+        assert!(store
+            .principal_can_access(channel, &author.public_key())
+            .expect("forgery ignored"));
     }
 
     #[test]
