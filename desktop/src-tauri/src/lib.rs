@@ -5,6 +5,7 @@ mod archive;
 mod builderlab;
 mod commands;
 mod deep_link;
+mod desktop_logging;
 mod egress_guard;
 mod event_sync;
 mod events;
@@ -83,6 +84,9 @@ use tray_menu::show_main_window;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+    desktop_logging::install_and_announce_startup(&context.config().identifier);
+
     // mesh-llm's async chains (model download, node start/join) overflow
     // tokio's default 2 MiB worker stacks — a stack-guard SIGABRT, not a
     // panic. Upstream mesh-llm and mesh-console both run on 8 MiB worker
@@ -136,6 +140,7 @@ pub fn run() {
         .plugin(
             tauri::plugin::Builder::<_, ()>::new("initial-window-reveal")
                 .on_webview_ready(|webview| {
+                    desktop_logging::log_window_created(webview.label());
                     if webview.label() != "main" {
                         return;
                     }
@@ -611,6 +616,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            desktop_logging::report_frontend_error,
             terminal_runtime::terminal_attach,
             terminal_runtime::terminal_detach,
             terminal_runtime::terminal_close,
@@ -914,7 +920,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             tray_menu::update_tray_agent_activity,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application");
     let shutdown_done = Arc::new(AtomicBool::new(false));
 
@@ -964,6 +970,7 @@ pub fn run() {
             }
         }
         RunEvent::ExitRequested { code, .. } => {
+            desktop_logging::log_shutdown_requested(code, "exit_requested");
             if is_restart_request(code) {
                 restart_requested.store(true, Ordering::SeqCst);
             }
@@ -972,6 +979,7 @@ pub fn run() {
         RunEvent::Exit => {
             shut_down_app(app_handle, &run_shutdown_done);
             app_handle.state::<ClipboardState>().release();
+            desktop_logging::log_exit("run_event");
 
             #[cfg(all(feature = "mesh-llm", target_os = "macos"))]
             if restart_requested.load(Ordering::SeqCst) {

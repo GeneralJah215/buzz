@@ -5,7 +5,7 @@ use crate::managed_agents::{
     self, kill_stale_tracked_processes, load_managed_agents, save_managed_agents,
     sync_managed_agent_processes, BackendKind,
 };
-use crate::{prevent_sleep, util};
+use crate::{desktop_logging, prevent_sleep, util};
 
 pub(crate) fn is_restart_request(code: Option<i32>) -> bool {
     code == Some(tauri::RESTART_EXIT_CODE)
@@ -18,6 +18,7 @@ pub(crate) fn shut_down_app(app: &tauri::AppHandle, shutdown_done: &std::sync::a
         .shutdown_started
         .store(true, Ordering::SeqCst);
     if !shutdown_done.swap(true, Ordering::SeqCst) {
+        desktop_logging::log_cleanup_started();
         prevent_sleep::release(&app.state::<AppState>().prevent_sleep);
         app.state::<crate::terminal_runtime::TerminalSessions>()
             .shutdown_all();
@@ -26,6 +27,7 @@ pub(crate) fn shut_down_app(app: &tauri::AppHandle, shutdown_done: &std::sync::a
         }
         #[cfg(feature = "mesh-llm")]
         shutdown_mesh_runtime(app);
+        desktop_logging::log_cleanup_completed();
     }
 }
 
@@ -38,6 +40,7 @@ pub(crate) fn install_signal_handler(
     use std::sync::atomic::Ordering;
 
     if let Err(error) = ctrlc::set_handler(move || {
+        desktop_logging::log_shutdown_requested(None, "signal");
         app.state::<AppState>()
             .shutdown_started
             .store(true, Ordering::SeqCst);
@@ -48,6 +51,7 @@ pub(crate) fn install_signal_handler(
             #[cfg(feature = "mesh-llm")]
             shutdown_mesh_runtime(&app);
         }
+        desktop_logging::log_exit("signal");
         #[cfg(all(feature = "mesh-llm", target_os = "macos"))]
         hard_exit_after_mesh_shutdown();
         #[cfg(not(all(feature = "mesh-llm", target_os = "macos")))]
