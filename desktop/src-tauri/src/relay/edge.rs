@@ -58,8 +58,26 @@ pub struct EdgeRelayBinding {
 pub fn edge_relay_binding(state: &AppState) -> Option<EdgeRelayBinding> {
     let edge_url = super::configured_env_var("BUZZ_EDGE_RELAY_URL")?;
     let community_id = active_community()?;
+    let (relay_url, http_url) = resolve_edge_endpoint(&edge_url)?;
+    let canonical_origin = resolve_canonical_origin(&relay_ws_url_with_override(state))?;
 
-    let mut edge = url::Url::parse(&edge_url).ok()?;
+    Some(EdgeRelayBinding {
+        relay_url,
+        http_url,
+        canonical_origin,
+        community_id: community_id.to_string(),
+    })
+}
+
+/// Reduce a configured edge URL to its `(ws, http)` origin pair, or `None` if
+/// it is anything but a bare loopback origin.
+///
+/// This is deliberately strict. The sidecar's whole safety story is that it is
+/// local-only, so a typo that points at a remote host, smuggles credentials,
+/// or hides a path must resolve to canonical-only rather than quietly opening
+/// a remote hop for message traffic.
+fn resolve_edge_endpoint(edge_url: &str) -> Option<(String, String)> {
+    let mut edge = url::Url::parse(edge_url).ok()?;
     let loopback = match edge.host() {
         Some(url::Host::Ipv4(address)) => address.is_loopback(),
         Some(url::Host::Ipv6(address)) => address.is_loopback(),
@@ -80,9 +98,14 @@ pub fn edge_relay_binding(state: &AppState) -> Option<EdgeRelayBinding> {
     edge.set_scheme("ws").ok()?;
     let relay_url = edge.as_str().trim_end_matches('/').to_string();
     edge.set_scheme("http").ok()?;
-    let http_url = edge.as_str().trim_end_matches('/').to_string();
+    Some((relay_url, edge.as_str().trim_end_matches('/').to_string()))
+}
 
-    let mut canonical = url::Url::parse(&relay_ws_url_with_override(state)).ok()?;
+/// The canonical origin the client declares in the §14 handshake. A canonical
+/// URL that is not a bare `ws`/`wss` origin yields `None`, which disables edge
+/// routing — the binding must name exactly one unambiguous origin.
+fn resolve_canonical_origin(canonical_url: &str) -> Option<String> {
+    let mut canonical = url::Url::parse(canonical_url).ok()?;
     if !matches!(canonical.scheme(), "ws" | "wss")
         || canonical.host_str().is_none()
         || !canonical.username().is_empty()
@@ -94,13 +117,7 @@ pub fn edge_relay_binding(state: &AppState) -> Option<EdgeRelayBinding> {
         return None;
     }
     canonical.set_path("");
-
-    Some(EdgeRelayBinding {
-        relay_url,
-        http_url,
-        canonical_origin: canonical.as_str().trim_end_matches('/').to_string(),
-        community_id: community_id.to_string(),
-    })
+    Some(canonical.as_str().trim_end_matches('/').to_string())
 }
 
 /// True only for filters the sidecar is allowed to answer: exactly kind 9,
@@ -219,7 +236,75 @@ pub fn apply_agent_env(
 
 #[cfg(test)]
 mod tests {
-    use super::filters_are_edge_message_only;
+    use super::{filters_are_edge_message_only, resolve_canonical_origin, resolve_edge_endpoint};
+
+    #[test]
+    fn loopback_edge_urls_resolve_to_a_ws_and_http_origin_pair() {
+        for accepted in [
+            "ws://127.0.0.1:7777",
+            "ws://127.0.0.1:7777/",
+            "http://127.0.0.1:7777",
+            "http://localhost:7777",
+            "http://LOCALHOST:7777",
+            "ws://[::1]:7777",
+        ] {
+            let (relay, http) =
+                resolve_edge_endpoint(accepted).unwrap_or_else(|| panic!("{accepted}"));
+            assert!(relay.starts_with("ws://"), "{accepted} -> {relay}");
+            assert!(http.starts_with("http://"), "{accepted} -> {http}");
+            assert!(!relay.ends_with('/'), "{accepted} -> {relay}");
+        }
+    }
+
+    /// Everything that is not a bare loopback origin must disable edge routing.
+    /// A mistake here would send message traffic somewhere it was never meant
+    /// to go, so each rejection is asserted individually.
+    #[test]
+    fn non_loopback_or_decorated_edge_urls_are_refused() {
+        for rejected in [
+            "ws://example.com:7777",         // remote host
+            "wss://127.0.0.1:7777",          // tls scheme is not an edge scheme
+            "https://127.0.0.1:7777",        // same
+            "ws://8.8.8.8:7777",             // public address
+            "ws://user@127.0.0.1:7777",      // credentials
+            "ws://user:pass@127.0.0.1:7777", // credentials
+            "ws://127.0.0.1:7777/path",      // path
+            "ws://127.0.0.1:7777/?a=b",      // query
+            "ws://127.0.0.1:7777/#frag",     // fragment
+            "file:///tmp/socket",            // wrong scheme entirely
+            "not a url",
+            "",
+        ] {
+            assert!(
+                resolve_edge_endpoint(rejected).is_none(),
+                "{rejected} must not resolve to an edge endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_origin_keeps_only_a_bare_ws_origin() {
+        assert_eq!(
+            resolve_canonical_origin("wss://relay.example.com/").as_deref(),
+            Some("wss://relay.example.com")
+        );
+        assert_eq!(
+            resolve_canonical_origin("ws://relay.example.com:8080").as_deref(),
+            Some("ws://relay.example.com:8080")
+        );
+        for rejected in [
+            "https://relay.example.com",
+            "wss://relay.example.com/path",
+            "wss://relay.example.com/?a=b",
+            "wss://user@relay.example.com",
+            "not a url",
+        ] {
+            assert!(
+                resolve_canonical_origin(rejected).is_none(),
+                "{rejected} must not become a canonical origin"
+            );
+        }
+    }
 
     #[test]
     fn edge_http_filter_requires_exact_kind_nine_and_uuid_channel() {
