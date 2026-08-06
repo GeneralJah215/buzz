@@ -306,6 +306,9 @@ test-unit:
         # because nothing in CI runs `cargo test --workspace` — workspace
         # membership alone buys clippy/check, not a single executed test.
         cargo nextest run -p buzz-backend-kubernetes
+        # Local continuity sidecar: protocol, SQLite durability, authorization
+        # lease, and loopback fan-out are all infra-free.
+        cargo nextest run -p buzz-edge
     else
         ./scripts/run-tests.sh unit
     fi

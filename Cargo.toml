@@ -24,6 +24,7 @@ members = [
     "crates/git-credential-nostr",
     "crates/git-sign-nostr",
     "crates/buzz-pair-relay",
+    "crates/buzz-edge",
     "crates/buzz-relay-mesh",
     "crates/buzz-dev-mcp",
     "crates/buzz-voice",
@@ -54,6 +55,7 @@ tower-http  = { version = "0.6", features = ["trace", "cors", "compression-gzip"
 sqlx = { version = "0.9", features = [
     "runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json"
 ] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 
 # Redis
 redis        = { version = "1.0", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }

@@ -112,6 +112,11 @@ run_unit_tests() {
   # the two lists must stay in step or the fallback silently covers less.
   run_test_step "buzz-backend-kubernetes tests" \
     cargo test -p buzz-backend-kubernetes -- --nocapture
+
+  # Local continuity sidecar: protocol and SQLite tests are infra-free.
+  # Keep this aligned with the cargo-nextest list in just test-unit.
+  run_test_step "buzz-edge tests" \
+    cargo test -p buzz-edge -- --nocapture
 }
 
 # ---- DB / integration tests (infra required) --------------------------------
