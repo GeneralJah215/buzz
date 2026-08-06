@@ -773,6 +773,31 @@ impl EdgeStore {
             .and_then(|channel| channel.signal_cursor))
     }
 
+    /// Return the relay-signed roster cursor that bounds historical signals.
+    pub fn authorization_roster_cursor(
+        &self,
+        edge_pubkey: &PublicKey,
+        channel_id: Uuid,
+    ) -> Result<UpstreamCursor, StorageError> {
+        let connection = self.connection.lock();
+        let payload = load_signed_snapshot_payload(&connection, edge_pubkey)?.ok_or_else(|| {
+            StorageError::AuthorizationSnapshot("authorization snapshot is missing".to_string())
+        })?;
+        let channel = payload
+            .channels
+            .into_iter()
+            .find(|channel| channel.channel_id == channel_id)
+            .ok_or_else(|| {
+                StorageError::AuthorizationSnapshot(
+                    "authorization snapshot does not contain the channel".to_string(),
+                )
+            })?;
+        Ok(channel.membership_fetch_cursor.unwrap_or(UpstreamCursor {
+            created_at: channel.membership_event_created_at,
+            event_id: channel.membership_event_id,
+        }))
+    }
+
     /// Return the durable edge-self membership-notification cursor for one channel.
     pub fn edge_notification_cursor(
         &self,
@@ -1700,6 +1725,10 @@ fn apply_system_removal(
     {
         return Ok(AuthorizationSignalOutcome::Duplicate);
     }
+    if cursor.created_at < channel.membership_event_created_at {
+        channel.signal_cursor = Some(cursor);
+        return Ok(AuthorizationSignalOutcome::SignalObserved { channel_id });
+    }
     let content: serde_json::Value = serde_json::from_str(&event.content)
         .map_err(|error| StorageError::AuthorizationSignal(error.to_string()))?;
     let message_type = content.get("type").and_then(serde_json::Value::as_str);
@@ -1755,6 +1784,10 @@ fn apply_edge_membership_notification(
         .is_some_and(|current| !cursor_is_newer(cursor, current))
     {
         return Ok(AuthorizationSignalOutcome::Duplicate);
+    }
+    if cursor.created_at < payload.channels[index].membership_event_created_at {
+        payload.channels[index].edge_notification_cursor = Some(cursor);
+        return Ok(AuthorizationSignalOutcome::SignalObserved { channel_id });
     }
     if event.kind.as_u16() == 44_101 {
         payload.channels.remove(index);
@@ -2577,6 +2610,44 @@ mod tests {
     }
 
     #[test]
+    fn pre_snapshot_system_removal_cannot_override_a_newer_roster() {
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let edge = Keys::generate();
+        let relay = Keys::generate();
+        let author = Keys::generate();
+        let channel = Uuid::new_v4();
+        let now = unix_seconds();
+        store.set_channel_selected(channel, true).expect("select");
+        store
+            .persist_verified_authorization_snapshot(
+                &[authorization_from_relay(
+                    &relay,
+                    channel,
+                    &[edge.public_key(), author.public_key()],
+                    now,
+                )],
+                now,
+                &edge,
+            )
+            .expect("snapshot");
+
+        assert_eq!(
+            store
+                .apply_authorization_signal(
+                    &system_removal(&relay, channel, author.public_key(), now - 1),
+                    &edge,
+                )
+                .expect("historical signal"),
+            AuthorizationSignalOutcome::SignalObserved {
+                channel_id: channel
+            }
+        );
+        assert!(store
+            .principal_can_access(channel, &author.public_key())
+            .expect("newer roster remains authoritative"));
+    }
+
+    #[test]
     fn changed_roster_projection_can_reauthorize_a_removed_author() {
         let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
         let edge = Keys::generate();
@@ -2697,6 +2768,17 @@ mod tests {
         assert!(store
             .channel_is_edge_eligible(channel)
             .expect("still eligible"));
+        assert_eq!(
+            store
+                .apply_authorization_signal(&notification(edge.public_key(), now - 1), &edge)
+                .expect("historical self removal"),
+            AuthorizationSignalOutcome::SignalObserved {
+                channel_id: channel
+            }
+        );
+        assert!(store
+            .channel_is_edge_eligible(channel)
+            .expect("newer roster remains eligible"));
         assert_eq!(
             store
                 .apply_authorization_signal(&notification(edge.public_key(), now + 2), &edge)
