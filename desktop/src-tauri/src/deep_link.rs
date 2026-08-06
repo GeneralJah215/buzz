@@ -352,7 +352,11 @@ async fn run_restart_agent_deep_link(app: tauri::AppHandle, request: RestartAgen
         None => {
             let state = app.state::<crate::app_state::AppState>();
             let Ok(runtimes) = state.managed_agent_processes.lock() else {
-                eprintln!("buzz-desktop: restart-agent {prefix}: runtime registry unavailable");
+                tracing::error!(
+                    event = "restart_agent_registry_unavailable",
+                    agent = %prefix,
+                    "managed-agent runtime registry unavailable"
+                );
                 return;
             };
             crate::managed_agents::managed_agent_runtime_keys(&runtimes, &request.pubkey)
@@ -366,9 +370,18 @@ async fn run_restart_agent_deep_link(app: tauri::AppHandle, request: RestartAgen
         let state = app.state::<crate::app_state::AppState>();
         match crate::commands::start_managed_agent(request.pubkey.clone(), app.clone(), state).await
         {
-            Ok(_) => eprintln!("buzz-desktop: restart-agent {prefix}: started (no live pair)"),
+            Ok(_) => tracing::info!(
+                event = "restart_agent_started",
+                agent = %prefix,
+                "agent started from restart deep link (no live pair)"
+            ),
             Err(error) => {
-                eprintln!("buzz-desktop: restart-agent {prefix}: start failed: {error}");
+                tracing::error!(
+                    event = "restart_agent_start_failed",
+                    agent = %prefix,
+                    error = %error,
+                    "agent start failed for restart deep link"
+                );
             }
         }
         return;
@@ -383,15 +396,26 @@ async fn run_restart_agent_deep_link(app: tauri::AppHandle, request: RestartAgen
         })
         .await;
         match outcome {
-            Ok(Ok(status)) => eprintln!(
-                "buzz-desktop: restart-agent {prefix}: restarted on {logged_relay} (pid {:?})",
-                status.pid
+            Ok(Ok(status)) => tracing::info!(
+                event = "restart_agent_restarted",
+                agent = %prefix,
+                relay = %logged_relay,
+                pid = ?status.pid,
+                "agent restarted"
             ),
-            Ok(Err(error)) => eprintln!(
-                "buzz-desktop: restart-agent {prefix}: restart on {logged_relay} failed: {error}"
+            Ok(Err(error)) => tracing::error!(
+                event = "restart_agent_failed",
+                agent = %prefix,
+                relay = %logged_relay,
+                error = %error,
+                "agent restart failed"
             ),
-            Err(error) => eprintln!(
-                "buzz-desktop: restart-agent {prefix}: restart task on {logged_relay} failed: {error}"
+            Err(error) => tracing::error!(
+                event = "restart_agent_task_failed",
+                agent = %prefix,
+                relay = %logged_relay,
+                error = %error,
+                "agent restart task failed"
             ),
         }
     }
@@ -491,21 +515,27 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
             // steal focus from whatever the user is doing.
             //
             // Authentication is the local control-token file, checked before
-            // any work is scheduled. A bad token gets a stderr line and
-            // nothing else: no dialog, no window, no distinguishable timing —
-            // an unauthenticated caller learns nothing, not even whether the
-            // named agent exists.
+            // any work is scheduled. A bad token gets a log line and nothing
+            // else: no dialog, no window, no distinguishable timing — an
+            // unauthenticated caller learns nothing, not even whether the
+            // named agent exists. The presented token itself is never logged.
             let request = match parse_restart_agent_deep_link(&url) {
                 Ok(request) => request,
                 Err(error) => {
-                    eprintln!("buzz-desktop: rejecting restart-agent deep link: {error}");
+                    tracing::warn!(
+                        event = "restart_agent_rejected",
+                        error = %error,
+                        "rejecting malformed restart-agent deep link"
+                    );
                     return;
                 }
             };
             if !crate::managed_agents::control_token::verify_control_token(app, &request.token) {
                 let prefix: String = request.pubkey.chars().take(8).collect();
-                eprintln!(
-                    "buzz-desktop: rejecting restart-agent deep link for {prefix}: invalid control token"
+                tracing::warn!(
+                    event = "restart_agent_unauthenticated",
+                    agent = %prefix,
+                    "rejecting restart-agent deep link with invalid control token"
                 );
                 return;
             }

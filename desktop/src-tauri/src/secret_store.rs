@@ -43,17 +43,35 @@ pub enum KeyringProbe {
 /// itself, or — once the map outgrows one entry — a small chunk header.
 const BLOB_KEY: &str = "secrets";
 
-/// Largest payload written to one keychain entry.
+/// Largest payload written to one keychain entry, in **UTF-16 code units**.
 ///
-/// Windows Credential Manager rejects a credential longer than 2560 UTF-16
-/// characters. The stored JSON is ASCII (hex pubkeys, bech32 secrets), so
-/// characters and UTF-16 units are one to one; 2000 leaves room for the entry
-/// name and encoding overhead without needing to model either exactly.
-const MAX_ENTRY_CHARS: usize = 2_000;
+/// The unit matters and is easy to get wrong. Windows' constant
+/// `CRED_MAX_CREDENTIAL_BLOB_SIZE` is 2560 **bytes**, and the keyring crate
+/// rejects a password when `encode_utf16().count() * 2` exceeds it
+/// (`keyring-3.6.3/src/windows.rs:224`). So the real ceiling is **1280 UTF-16
+/// units**, not 2560 — the crate's own maximum-length test uses
+/// `CRED_MAX_CREDENTIAL_BLOB_SIZE / 2`.
+///
+/// The error text the backend produces says "longer than platform limit of
+/// 2560 chars", quoting the byte constant. Believing that number yields a
+/// chunk size that still fails every write.
+///
+/// 1200 leaves margin under the 1280 ceiling. (The entry name is charged
+/// against a separate, far larger limit and does not compete for this budget.)
+const MAX_ENTRY_UTF16: usize = 1_200;
 
-/// Upper bound on chunks scanned when clearing an old generation. At 2000
-/// characters per chunk this covers roughly 8 MB of secrets, far beyond any
-/// plausible agent count, and stops a corrupt header causing an endless scan.
+/// Upper bound on a header's declared length, so a corrupt header cannot drive
+/// a huge allocation. Generous: far beyond any plausible secret store.
+const MAX_ASSEMBLED_BYTES: usize = MAX_CHUNKS * MAX_ENTRY_UTF16 * 4;
+
+/// Cost of a string against the backend's budget.
+fn utf16_len(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
+/// Upper bound on chunks scanned when clearing an old generation. Far beyond
+/// any plausible agent count, and it stops a corrupt header driving an endless
+/// scan.
 const MAX_CHUNKS: usize = 4_096;
 
 /// Which set of chunk entries is live. Writes always target the other one, so
@@ -92,23 +110,71 @@ fn chunk_key(generation: Generation, index: usize) -> String {
     format!("{BLOB_KEY}.{}.{index}", generation.as_str())
 }
 
-/// Split on character boundaries, not bytes, so a multi-byte character is
-/// never cut in half. The payload is ASCII today; this keeps it correct if a
-/// secret ever is not.
-fn split_chars(value: &str, max_chars: usize) -> Vec<&str> {
+/// Distinguishes a backend fault from a read that raced a concurrent write.
+///
+/// The distinction drives the retry in `read_blob_raw_keyring`: a torn read is
+/// transient and worth repeating, a backend fault is not.
+///
+/// Note `probe` still maps BOTH arms to `Unreachable` — failing closed on any
+/// unreadable store is deliberate. The retry, not the classification, is what
+/// keeps a raced read from booting the app on an ephemeral identity.
+#[cfg(feature = "system-keyring")]
+enum BlobReadError {
+    Backend(String),
+    Torn(String),
+}
+
+#[cfg(feature = "system-keyring")]
+impl BlobReadError {
+    fn into_message(self) -> String {
+        match self {
+            BlobReadError::Backend(message) => message,
+            BlobReadError::Torn(message) => message,
+        }
+    }
+}
+
+/// Split so that no piece exceeds `max_utf16` UTF-16 code units, cutting only
+/// on character boundaries.
+///
+/// Counting in UTF-16 units rather than characters is what keeps the pieces
+/// actually writable: an astral-plane character costs two units, so a
+/// character-counted split could hand the backend a piece twice its budget.
+/// `store()` is a public API taking arbitrary values, so this has to hold for
+/// more than today's ASCII payload.
+fn split_utf16(value: &str, max_utf16: usize) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut counted = 0;
-    for (offset, _) in value.char_indices() {
-        if counted == max_chars {
+    for (offset, character) in value.char_indices() {
+        let cost = character.len_utf16();
+        if counted + cost > max_utf16 {
             parts.push(&value[start..offset]);
             start = offset;
             counted = 0;
         }
-        counted += 1;
+        counted += cost;
     }
     parts.push(&value[start..]);
     parts
+}
+
+/// Cheap non-cryptographic digest of the assembled payload.
+///
+/// Guards against a **torn read**: reads are not serialised against writes, so
+/// a reader can take the header from one generation and a chunk from the next.
+/// Length alone does not catch that — swapping one secret for another of the
+/// same length leaves the total unchanged — so the header carries a digest of
+/// the exact bytes it describes.
+fn payload_digest(value: &str) -> u64 {
+    // FNV-1a. Not security-relevant: this detects accidental mismatch, and an
+    // attacker who can write the credential store has already won.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Header stored under [`BLOB_KEY`] once the map is chunked.
@@ -117,24 +183,44 @@ struct ChunkHeader {
     generation: Generation,
     chunks: usize,
     len: usize,
+    digest: u64,
 }
 
 impl ChunkHeader {
     /// Returns `None` for anything that is not a chunk header — including the
-    /// original layout, where this entry holds the JSON map. The map's keys are
-    /// `identity` and `agent:<pubkey>`, never `v`, so the two cannot be
-    /// confused.
+    /// original layout, where this entry holds the JSON map. A map serialises
+    /// every value as a JSON string, and `v` is required to be a number, so no
+    /// key name can make a legitimate map parse as a header.
     fn parse(raw: &str) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_str(raw).ok()?;
         let object = value.as_object()?;
         if object.get("v")?.as_u64()? != 2 {
             return None;
         }
+        let len = usize::try_from(object.get("len")?.as_u64()?).ok()?;
+        if len > MAX_ASSEMBLED_BYTES {
+            return None;
+        }
+        let chunks = usize::try_from(object.get("chunks")?.as_u64()?).ok()?;
+        if chunks > MAX_CHUNKS {
+            return None;
+        }
         Some(ChunkHeader {
             generation: Generation::parse(object.get("gen")?.as_str()?)?,
-            chunks: usize::try_from(object.get("chunks")?.as_u64()?).ok()?,
-            len: usize::try_from(object.get("len")?.as_u64()?).ok()?,
+            chunks,
+            len,
+            digest: object.get("digest")?.as_u64()?,
         })
+    }
+
+    fn render(&self) -> String {
+        format!(
+            r#"{{"v":2,"gen":"{}","chunks":{},"len":{},"digest":{}}}"#,
+            self.generation.as_str(),
+            self.chunks,
+            self.len,
+            self.digest
+        )
     }
 }
 
@@ -451,30 +537,50 @@ impl SecretStore {
     /// single-entry format, and the chunked layout described on
     /// [`Self::write_blob_raw_keyring`]. A blob written before this change
     /// reads back unchanged, so the upgrade needs no migration step.
+    /// Reads are not serialised against writes — only `mutate_blob` takes the
+    /// interprocess lock. A concurrent write can therefore flip the header and
+    /// delete the generation this read is part-way through. That is transient,
+    /// so retry once rather than reporting a fault.
     #[cfg(feature = "system-keyring")]
     fn read_blob_raw_keyring(&self) -> Result<Option<Vec<u8>>, String> {
-        let Some(head) = self.read_entry(BLOB_KEY)? else {
+        match self.read_blob_attempt() {
+            Err(BlobReadError::Torn(_)) => self
+                .read_blob_attempt()
+                .map_err(|error| error.into_message()),
+            other => other.map_err(|error| error.into_message()),
+        }
+    }
+
+    #[cfg(feature = "system-keyring")]
+    fn read_blob_attempt(&self) -> Result<Option<Vec<u8>>, BlobReadError> {
+        let head = self.read_entry(BLOB_KEY).map_err(BlobReadError::Backend)?;
+        let Some(head) = head else {
             return Ok(None);
         };
         let Some(header) = ChunkHeader::parse(&head) else {
             // Original layout: the entry *is* the JSON map.
             return Ok(Some(head.into_bytes()));
         };
-        let mut assembled = String::with_capacity(header.len);
+        let mut assembled = String::with_capacity(header.len.min(MAX_ASSEMBLED_BYTES));
         for index in 0..header.chunks {
             let name = chunk_key(header.generation, index);
-            let part = self.read_entry(&name)?.ok_or_else(|| {
-                // Fail loud. Returning a partial map would look like "these
-                // keys were never stored" and the next write would drop them.
-                format!("keyring chunk {name} missing; secret store is incomplete")
-            })?;
-            assembled.push_str(&part);
+            match self.read_entry(&name).map_err(BlobReadError::Backend)? {
+                Some(part) => assembled.push_str(&part),
+                // A chunk the header still references is gone. Either a
+                // concurrent write just discarded this generation, or the store
+                // is genuinely damaged. Never return a partial map: it would
+                // look like "those keys were never stored" and the next write
+                // would drop them for real.
+                None => {
+                    return Err(BlobReadError::Torn(format!(
+                        "secret store chunk {name} is missing"
+                    )))
+                }
+            }
         }
-        if assembled.len() != header.len {
-            return Err(format!(
-                "keyring chunk length mismatch: header says {} bytes, assembled {}",
-                header.len,
-                assembled.len()
+        if assembled.len() != header.len || payload_digest(&assembled) != header.digest {
+            return Err(BlobReadError::Torn(
+                "secret store chunks do not match their header".to_string(),
             ));
         }
         Ok(Some(assembled.into_bytes()))
@@ -594,11 +700,11 @@ impl SecretStore {
     /// Write the blob, splitting it across several entries when it is too large
     /// for one.
     ///
-    /// Windows Credential Manager caps a single credential at 2560 UTF-16
-    /// characters. The whole secret store — the user identity plus every
-    /// managed agent key — lives in one entry, so that cap is a hard ceiling of
-    /// roughly 18 agents, after which EVERY write fails and the identity itself
-    /// can no longer be saved (BUG-013).
+    /// Windows Credential Manager caps a single credential at 1280 UTF-16
+    /// units (2560 bytes). The whole secret store — the user identity plus
+    /// every managed agent key — lived in one entry, so that cap was a hard
+    /// ceiling of about 8 agents, after which EVERY write failed and the
+    /// identity itself could no longer be saved (BUG-013).
     ///
     /// Layout when the blob fits: unchanged from before — `secrets` holds the
     /// JSON map. Nothing is written differently, and macOS keychains keep
@@ -617,36 +723,42 @@ impl SecretStore {
     fn write_blob_raw_keyring(&self, bytes: &[u8]) -> Result<(), String> {
         let value = std::str::from_utf8(bytes).map_err(|e| format!("blob utf8 encode: {e}"))?;
 
-        if value.len() <= MAX_ENTRY_CHARS {
+        if utf16_len(value) <= MAX_ENTRY_UTF16 {
+            // Plain map lands first. A reader can never consult stale chunks
+            // afterwards, because a plain map does not parse as a header.
             self.write_entry(BLOB_KEY, value)?;
-            // Drop any chunks left by a previous larger state so they cannot be
-            // resurrected by a later reader.
+            // Sweep unconditionally. Gating this on a readable previous header
+            // strands plaintext forever: once BLOB_KEY holds a plain map, no
+            // later write can parse a header, so no later write would ever
+            // clean up chunks a failed sweep left behind.
             self.discard_generation(Generation::A);
             self.discard_generation(Generation::B);
             return Ok(());
         }
 
+        // Only the chunked path needs to know the live generation.
         let previous = self
             .read_entry(BLOB_KEY)?
             .as_deref()
             .and_then(ChunkHeader::parse);
+
         let target = match previous {
             Some(header) => header.generation.other(),
             None => Generation::A,
         };
 
-        let parts: Vec<&str> = split_chars(value, MAX_ENTRY_CHARS);
+        let parts: Vec<&str> = split_utf16(value, MAX_ENTRY_UTF16);
         for (index, part) in parts.iter().enumerate() {
             self.write_entry(&chunk_key(target, index), part)?;
         }
-        let header = format!(
-            r#"{{"v":2,"gen":"{}","chunks":{},"len":{}}}"#,
-            target.as_str(),
-            parts.len(),
-            value.len()
-        );
+        let header = ChunkHeader {
+            generation: target,
+            chunks: parts.len(),
+            len: value.len(),
+            digest: payload_digest(value),
+        };
         // The flip. Everything before this was invisible to readers.
-        self.write_entry(BLOB_KEY, &header)?;
+        self.write_entry(BLOB_KEY, &header.render())?;
         self.discard_generation(target.other());
         Ok(())
     }
@@ -659,24 +771,61 @@ impl SecretStore {
             .map_err(|e| format!("keyring write: {e}"))
     }
 
-    /// Best-effort removal of a generation's chunks. Failures are ignored: a
-    /// leftover chunk is unreferenced by the header and therefore harmless,
-    /// and refusing the whole write over it would be worse.
+    /// Remove a generation's chunks.
+    ///
+    /// Each chunk holds a slice of the plaintext secret map, so a leftover is a
+    /// disclosure risk even though the header no longer references it.
+    ///
+    /// The sweep cannot assume a contiguous layout. A previous partial sweep
+    /// deletes from index 0 upward, so the entries most likely to be already
+    /// gone are exactly the low ones — a scan that stops at the first gap would
+    /// walk away from everything above it. `GAP_TOLERANCE` is therefore far
+    /// wider than any real chunk count.
+    ///
+    /// Returns whether every attempted deletion succeeded, so the erasure path
+    /// can report honestly instead of claiming a wipe it did not achieve.
     #[cfg(feature = "system-keyring")]
-    fn discard_generation(&self, generation: Generation) {
+    fn discard_generation(&self, generation: Generation) -> bool {
+        /// Consecutive absent indices that end the scan. Real stores are a few
+        /// dozen chunks at most, so this cannot stop short of live data.
+        const GAP_TOLERANCE: usize = 64;
+        /// Stop after this many failures rather than grinding through the whole
+        /// index space against a backend that is clearly not answering.
+        const ERROR_LIMIT: usize = 32;
+
+        let mut complete = true;
+        let mut gap = 0;
+        let mut errors = 0;
         for index in 0..MAX_CHUNKS {
             let name = chunk_key(generation, index);
             match keyring_entry(&self.service, &name) {
-                Ok(entry) => {
-                    if entry.delete_credential().is_err() {
-                        // Nothing there, or unreachable. Either way, stop —
-                        // chunks are contiguous from 0.
+                Ok(entry) => match entry.delete_credential() {
+                    Ok(()) => gap = 0,
+                    Err(keyring::Error::NoEntry) => {
+                        gap += 1;
+                        if gap >= GAP_TOLERANCE {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        complete = false;
+                        gap = 0;
+                        errors += 1;
+                        if errors >= ERROR_LIMIT {
+                            break;
+                        }
+                    }
+                },
+                Err(_) => {
+                    complete = false;
+                    errors += 1;
+                    if errors >= ERROR_LIMIT {
                         break;
                     }
                 }
-                Err(_) => break,
             }
         }
+        complete
     }
 
     /// Probe whether `key` exists and whether the backend is reachable.
@@ -1034,6 +1183,19 @@ impl SecretStore {
                 }
             }
 
+            // Step 4b: delete every chunk of BOTH generations. Deleting only
+            // the header would leave the complete plaintext map — identity and
+            // all agent keys — sitting in the credential store while the wipe
+            // reported success, because the header is what `read_blob_raw`
+            // consults.
+            let swept_a = self.discard_generation(Generation::A);
+            let swept_b = self.discard_generation(Generation::B);
+            if !swept_a || !swept_b {
+                return Err(
+                    "keyring chunk delete failed; some secret material may remain".to_string(),
+                );
+            }
+
             // Step 5: clear the in-memory cache.
             let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             *guard = None;
@@ -1060,6 +1222,35 @@ impl SecretStore {
                 Ok(None) => {}
                 Ok(Some(_)) => return false,
                 Err(_) => return false,
+            }
+            // 1b. No chunk of either generation may survive. Step 1 only proves
+            // the header is gone, and the header is the sole thing
+            // `read_blob_raw` consults — the chunks behind it hold the complete
+            // plaintext map. Without this, a wipe of a chunked store reports
+            // success while every secret remains on disk.
+            //
+            // Probing index 0 alone is not enough: deletion runs upward from 0,
+            // so index 0 is the entry most likely to be already gone while
+            // higher ones survive. Scan past gaps, matching `discard_generation`.
+            for generation in [Generation::A, Generation::B] {
+                let mut gap = 0;
+                for index in 0..MAX_CHUNKS {
+                    match keyring_entry(&self.service, &chunk_key(generation, index)) {
+                        Ok(entry) => match entry.get_password() {
+                            Err(keyring::Error::NoEntry) => {
+                                gap += 1;
+                                if gap >= 64 {
+                                    break;
+                                }
+                            }
+                            // Any surviving chunk means the wipe is incomplete.
+                            Ok(_) => return false,
+                            // Only explicit absence counts as proof.
+                            Err(_) => return false,
+                        },
+                        Err(_) => return false,
+                    }
+                }
             }
             // 2. Per-key "identity" via legacy keyring must be absent.
             match keyring_entry(&self.service, "identity") {
@@ -1164,52 +1355,122 @@ mod tests {
         serde_json::to_string(&map).unwrap()
     }
 
+    /// The budget the Windows backend actually enforces:
+    /// `encode_utf16().count() * 2 > CRED_MAX_CREDENTIAL_BLOB_SIZE`, where that
+    /// constant is 2560 BYTES (`keyring-3.6.3/src/windows.rs:224`). The error
+    /// text quotes 2560 and says "chars", which is what made the first attempt
+    /// at this fix pick a chunk size that still failed every write.
+    const WINDOWS_CRED_MAX_UTF16_UNITS: usize = 2560 / 2;
+
+    fn windows_would_accept(value: &str) -> bool {
+        value.encode_utf16().count() * 2 <= 2560
+    }
+
     #[test]
-    fn the_real_store_size_that_broke_windows_needs_more_than_one_entry() {
-        // 17 agent keys plus an identity is what was on the affected machine.
-        // It must now be recognised as too large for a single credential.
-        let blob = sample_blob(17);
+    fn every_chunk_is_actually_writable_by_the_windows_backend() {
+        // The test that had to exist. A chunk size chosen from the error
+        // message rather than the enforced rule produces chunks that are
+        // rejected, reproducing the original bug with extra steps.
         assert!(
-            blob.len() > MAX_ENTRY_CHARS,
-            "expected the failing real-world size to exceed one entry, got {}",
-            blob.len()
+            MAX_ENTRY_UTF16 <= WINDOWS_CRED_MAX_UTF16_UNITS,
+            "chunk budget {MAX_ENTRY_UTF16} exceeds the enforced limit of \
+             {WINDOWS_CRED_MAX_UTF16_UNITS} UTF-16 units"
         );
-        let parts = split_chars(&blob, MAX_ENTRY_CHARS);
-        assert!(parts.len() > 1);
-        assert_eq!(parts.concat(), blob, "split must round-trip exactly");
-    }
-
-    #[test]
-    fn a_small_blob_still_fits_one_entry() {
-        // Two agents is well under the cap, so nothing about the storage
-        // layout changes for ordinary users — and macOS keeps one ACL prompt.
-        assert!(sample_blob(2).len() <= MAX_ENTRY_CHARS);
-    }
-
-    #[test]
-    fn split_round_trips_and_respects_the_cap() {
-        for agents in [0, 1, 18, 35, 200] {
+        for agents in [0, 1, 9, 18, 35, 200] {
             let blob = sample_blob(agents);
-            let parts = split_chars(&blob, MAX_ENTRY_CHARS);
-            assert_eq!(parts.concat(), blob, "{agents} agents");
-            for part in &parts {
+            for part in split_utf16(&blob, MAX_ENTRY_UTF16) {
                 assert!(
-                    part.chars().count() <= MAX_ENTRY_CHARS,
-                    "{agents} agents produced an oversized chunk"
+                    windows_would_accept(part),
+                    "{agents} agents produced a chunk Windows would reject"
                 );
             }
         }
     }
 
     #[test]
-    fn split_never_cuts_a_multi_byte_character() {
-        // Chunking on bytes would corrupt this; chunking on chars does not.
-        let value = "é".repeat(MAX_ENTRY_CHARS * 2 + 7);
-        let parts = split_chars(&value, MAX_ENTRY_CHARS);
+    fn the_real_store_size_that_broke_windows_needs_more_than_one_entry() {
+        // 17 agent keys plus an identity is what was on the affected machine.
+        let blob = sample_blob(17);
+        assert!(!windows_would_accept(&blob), "must not fit one credential");
+        let parts = split_utf16(&blob, MAX_ENTRY_UTF16);
+        assert!(parts.len() > 1);
+        assert_eq!(parts.concat(), blob, "split must round-trip exactly");
+    }
+
+    #[test]
+    fn the_true_ceiling_was_about_nine_agents_not_eighteen() {
+        // Documents the real severity: the enforced budget is half what the
+        // error message implies, so the store broke far earlier than it looked.
+        let mut last_ok = 0;
+        for agents in 0..40 {
+            if windows_would_accept(&sample_blob(agents)) {
+                last_ok = agents;
+            } else {
+                break;
+            }
+        }
+        assert!(
+            (5..=12).contains(&last_ok),
+            "expected the single-entry ceiling near 9 agents, measured {last_ok}"
+        );
+    }
+
+    #[test]
+    fn a_small_blob_still_fits_one_entry() {
+        // Two agents is well under the cap, so nothing about the storage layout
+        // changes for ordinary users — and macOS keeps one ACL prompt.
+        let blob = sample_blob(2);
+        assert!(utf16_len(&blob) <= MAX_ENTRY_UTF16);
+        assert!(windows_would_accept(&blob));
+    }
+
+    #[test]
+    fn split_round_trips_and_respects_the_budget() {
+        for agents in [0, 1, 18, 35, 200] {
+            let blob = sample_blob(agents);
+            let parts = split_utf16(&blob, MAX_ENTRY_UTF16);
+            assert_eq!(parts.concat(), blob, "{agents} agents");
+            for part in &parts {
+                assert!(utf16_len(part) <= MAX_ENTRY_UTF16, "{agents} agents");
+            }
+        }
+    }
+
+    #[test]
+    fn split_budgets_surrogate_pairs_as_two_units() {
+        // An astral-plane character costs 2 UTF-16 units. Counting characters
+        // instead would emit chunks at twice the budget — silently rejected.
+        let value = "𝄞".repeat(MAX_ENTRY_UTF16 * 2);
+        let parts = split_utf16(&value, MAX_ENTRY_UTF16);
         assert_eq!(parts.concat(), value);
         for part in &parts {
-            assert!(part.chars().count() <= MAX_ENTRY_CHARS);
+            assert!(utf16_len(part) <= MAX_ENTRY_UTF16);
+            assert!(windows_would_accept(part));
         }
+        // And a 2-unit character is never cut in half.
+        assert!(parts.iter().all(|p| p.chars().all(|c| c == '𝄞')));
+    }
+
+    #[test]
+    fn a_torn_read_is_detected_even_when_the_length_matches() {
+        // Swapping one secret for another of the same length leaves the total
+        // length unchanged, so length alone cannot detect a read that straddled
+        // two writes. The digest can.
+        let before = sample_blob(20);
+        let after = before.replacen("nsec10", "nsec1f", 1);
+        assert_eq!(before.len(), after.len(), "lengths must collide for this test");
+        assert_ne!(payload_digest(&before), payload_digest(&after));
+    }
+
+    #[test]
+    fn a_corrupt_header_cannot_drive_a_huge_allocation() {
+        let absurd = format!(
+            r#"{{"v":2,"gen":"a","chunks":1,"len":{},"digest":1}}"#,
+            u64::MAX
+        );
+        assert!(ChunkHeader::parse(&absurd).is_none());
+        let too_many = r#"{"v":2,"gen":"a","chunks":99999999,"len":10,"digest":1}"#;
+        assert!(ChunkHeader::parse(too_many).is_none());
     }
 
     #[test]
@@ -1220,27 +1481,30 @@ mod tests {
         assert!(ChunkHeader::parse("{}").is_none());
         assert!(ChunkHeader::parse("not json").is_none());
         // A future version must not be read with today's rules.
-        assert!(ChunkHeader::parse(r#"{"v":3,"gen":"a","chunks":1,"len":5}"#).is_none());
+        assert!(ChunkHeader::parse(r#"{"v":3,"gen":"a","chunks":1,"len":5,"digest":1}"#).is_none());
         // Malformed headers are rejected rather than half-trusted.
-        assert!(ChunkHeader::parse(r#"{"v":2,"gen":"z","chunks":1,"len":5}"#).is_none());
-        assert!(ChunkHeader::parse(r#"{"v":2,"gen":"a","chunks":1}"#).is_none());
+        assert!(ChunkHeader::parse(r#"{"v":2,"gen":"z","chunks":1,"len":5,"digest":1}"#).is_none());
+        assert!(ChunkHeader::parse(r#"{"v":2,"gen":"a","chunks":1,"digest":1}"#).is_none());
+        assert!(ChunkHeader::parse(r#"{"v":2,"gen":"a","chunks":1,"len":5}"#).is_none());
     }
 
     #[test]
     fn header_round_trips_through_the_exact_string_the_writer_emits() {
-        let written = format!(
-            r#"{{"v":2,"gen":"{}","chunks":{},"len":{}}}"#,
-            Generation::B.as_str(),
-            3,
-            5_000
-        );
+        let written = ChunkHeader {
+            generation: Generation::B,
+            chunks: 3,
+            len: 5_000,
+            digest: 0xdead_beef,
+        }
+        .render();
         let header = ChunkHeader::parse(&written).expect("writer output must parse");
         assert_eq!(header.generation, Generation::B);
         assert_eq!(header.chunks, 3);
         assert_eq!(header.len, 5_000);
-        // And a header is always small enough to write in one credential, which
-        // is what makes the generation flip atomic.
-        assert!(written.len() <= MAX_ENTRY_CHARS);
+        assert_eq!(header.digest, 0xdead_beef);
+        // A header is always writable in one credential, which is what makes
+        // the generation flip atomic.
+        assert!(windows_would_accept(&written));
     }
 
     #[test]
