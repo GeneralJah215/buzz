@@ -5,6 +5,7 @@ import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 
 import { relayClient } from "@/shared/api/relayClient";
+import { KIND_THREAD_DIRECTORY_BOUNDS } from "@/shared/constants/kinds";
 import {
   threadDirectoryLiveQueryKey,
   threadDirectoryQueryKey,
@@ -162,14 +163,20 @@ const ACTIVE_LIVE = {
   ]),
 };
 
-function Harness({ channelId, state = "active", onDirectory, onItems }) {
+function Harness({
+  channelId,
+  state = "active",
+  enabled = false,
+  onDirectory,
+  onItems,
+}) {
   const directory = useThreadDirectory({
     channelId,
     communityId: COMMUNITY_ID,
     relayUrl: RELAY_URL,
     pubkey: PUBKEY,
     state,
-    enabled: false,
+    enabled,
   });
   onDirectory?.(directory);
   onItems?.(directory.items);
@@ -179,6 +186,160 @@ function Harness({ channelId, state = "active", onDirectory, onItems }) {
 function waitForTask() {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
+
+async function waitForCondition(predicate) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (predicate()) return;
+    await act(async () => waitForTask());
+  }
+  assert.fail("condition was not met");
+}
+
+test("command failure caches fallback until reconnect, then re-probes support", async () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  let currentDirectory;
+  let invokeCount = 0;
+  let generation = 10;
+  let reconnectListener = null;
+  let supportsDirectory = false;
+  const originalGetConnectionGeneration =
+    relayClient.getConnectionGeneration.bind(relayClient);
+  const originalSubscribeToReconnects =
+    relayClient.subscribeToReconnects.bind(relayClient);
+  const originalSubscribeToThreadDirectory =
+    relayClient.subscribeToThreadDirectory.bind(relayClient);
+  relayClient.getConnectionGeneration = () => generation;
+  relayClient.subscribeToReconnects = (listener) => {
+    reconnectListener = listener;
+    return () => {
+      if (reconnectListener === listener) reconnectListener = null;
+    };
+  };
+  relayClient.subscribeToThreadDirectory = () =>
+    Promise.resolve(async () => {});
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke(command, args) {
+      assert.equal(command, "get_thread_directory");
+      invokeCount += 1;
+      if (!supportsDirectory) throw new Error("command failed");
+      return Promise.resolve([
+        {
+          id: "f".repeat(64),
+          pubkey: PUBKEY,
+          created_at: 200,
+          kind: KIND_THREAD_DIRECTORY_BOUNDS,
+          tags: [
+            ["d", `${args.channelId}:active:head`],
+            ["h", args.channelId],
+          ],
+          content: JSON.stringify({
+            has_more: false,
+            next_cursor: null,
+          }),
+          sig: "sig",
+        },
+      ]);
+    },
+  };
+
+  const renderHarness = (channelId) =>
+    root.render(
+      React.createElement(
+        QueryClientProvider,
+        { client },
+        React.createElement(Harness, {
+          channelId,
+          enabled: true,
+          onDirectory(directory) {
+            currentDirectory = directory;
+          },
+        }),
+      ),
+    );
+
+  try {
+    await act(async () => {
+      renderHarness(FIRST_CHANNEL_ID);
+    });
+    await waitForCondition(() => currentDirectory?.isUnsupported === true);
+    assert.equal(currentDirectory.error, null);
+    assert.equal(invokeCount, 1);
+
+    await act(async () => {
+      renderHarness(SIBLING_CHANNEL_ID);
+      await waitForTask();
+    });
+    assert.equal(currentDirectory.isUnsupported, true);
+    assert.equal(invokeCount, 1, "cached verdict must suppress sibling probes");
+
+    supportsDirectory = true;
+    generation += 1;
+    await act(async () => {
+      reconnectListener();
+    });
+    await waitForCondition(
+      () =>
+        currentDirectory?.isUnsupported === false &&
+        currentDirectory?.isSuccess === true,
+    );
+    assert.equal(invokeCount, 2);
+    assert.equal(currentDirectory.error, null);
+  } finally {
+    await act(async () => root.unmount());
+    relayClient.getConnectionGeneration = originalGetConnectionGeneration;
+    relayClient.subscribeToReconnects = originalSubscribeToReconnects;
+    relayClient.subscribeToThreadDirectory = originalSubscribeToThreadDirectory;
+    delete globalThis.window.__TAURI_INTERNALS__;
+    client.clear();
+  }
+});
+
+test("missing bounds selects fallback without surfacing a query error", async () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  let currentDirectory;
+  const originalSubscribeToReconnects =
+    relayClient.subscribeToReconnects.bind(relayClient);
+  relayClient.subscribeToReconnects = () => () => {};
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke(command) {
+      assert.equal(command, "get_thread_directory");
+      return Promise.resolve([]);
+    },
+  };
+  try {
+    await act(async () => {
+      root.render(
+        React.createElement(
+          QueryClientProvider,
+          { client },
+          React.createElement(Harness, {
+            channelId: FIRST_CHANNEL_ID,
+            enabled: true,
+            onDirectory(directory) {
+              currentDirectory = directory;
+            },
+          }),
+        ),
+      );
+    });
+    await waitForCondition(() => currentDirectory?.isUnsupported === true);
+    assert.equal(currentDirectory.error, null);
+    assert.deepEqual(currentDirectory.items, []);
+  } finally {
+    await act(async () => root.unmount());
+    relayClient.subscribeToReconnects = originalSubscribeToReconnects;
+    delete globalThis.window.__TAURI_INTERNALS__;
+    client.clear();
+  }
+});
 
 test("mounted directory hook disposes only its captured exact scope", async () => {
   const client = new QueryClient({

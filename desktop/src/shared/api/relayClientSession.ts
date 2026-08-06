@@ -94,7 +94,6 @@ export class RelayClient {
   private stabilityTimer: number | null = null;
   private visibleChannelId: string | null = null;
   private authOkTracker = new AuthOkTracker();
-
   private terminal = false;
 
   private connectionStateEmitter = new RelayConnectionStateEmitter("idle");
@@ -464,6 +463,11 @@ export class RelayClient {
     return () => {
       this.reconnectListeners.delete(listener);
     };
+  }
+
+  /** Monotonic socket generation used to scope connection-local caches. */
+  getConnectionGeneration(): number {
+    return this.connectionGeneration;
   }
 
   /** Current connection state — synchronous read. */

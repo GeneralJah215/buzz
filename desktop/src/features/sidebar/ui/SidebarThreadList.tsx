@@ -11,7 +11,9 @@ import {
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useAppShell } from "@/app/AppShellContext";
+import type { ThreadActivityItem } from "@/features/channels/threadActivityStorage";
 import { useCommunities } from "@/features/communities/useCommunities";
+import { getThreadReference } from "@/features/messages/lib/threading";
 import {
   resolveThreadDirectoryTitle,
   threadDirectoryUnreadState,
@@ -47,6 +49,76 @@ type RenameDraft = {
   item: ThreadDirectoryItem;
   title: string;
 };
+
+type LegacyThreadItem = {
+  rootId: string;
+  title: string;
+  lastReplyAt: number;
+};
+
+export function legacySidebarThreadItems(
+  activityItems: readonly ThreadActivityItem[],
+  channelId: string,
+): LegacyThreadItem[] {
+  const byRootId = new Map<string, LegacyThreadItem>();
+  for (const item of activityItems) {
+    if (item.channelId !== channelId) continue;
+    const rootId = getThreadReference(item.tags).rootId;
+    if (!rootId) continue;
+    const current = byRootId.get(rootId);
+    if (current && current.lastReplyAt > item.createdAt) continue;
+    byRootId.set(rootId, {
+      rootId,
+      title: item.content.trim().split(/\r?\n/, 1)[0] || "Thread",
+      lastReplyAt: item.createdAt,
+    });
+  }
+  return [...byRootId.values()].sort(
+    (left, right) =>
+      right.lastReplyAt - left.lastReplyAt ||
+      left.rootId.localeCompare(right.rootId),
+  );
+}
+
+export function LegacySidebarThreadList({
+  items,
+  onNavigate,
+}: {
+  items: LegacyThreadItem[];
+  onNavigate: (rootId: string) => void;
+}) {
+  if (items.length === 0) {
+    return (
+      <p className="px-2 py-1 text-xs text-sidebar-foreground/55">
+        No active threads
+      </p>
+    );
+  }
+  return (
+    <ul
+      className="flex min-w-0 flex-col gap-0.5"
+      data-testid="legacy-thread-list"
+    >
+      {items.map((item) => (
+        <li key={item.rootId}>
+          <button
+            className="flex h-8 w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs text-sidebar-foreground/80 outline-hidden transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+            onClick={() => onNavigate(item.rootId)}
+            type="button"
+          >
+            <span className="min-w-0 flex-1 truncate">{item.title}</span>
+            <span
+              className="shrink-0 text-3xs text-sidebar-foreground/45"
+              title={new Date(item.lastReplyAt * 1_000).toLocaleString()}
+            >
+              {formatRelativeTime(item.lastReplyAt)}
+            </span>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 function activityAt(item: ThreadDirectoryItem) {
   return item.lastReplyAt || item.rootCreatedAt;
@@ -331,6 +403,7 @@ export function SidebarThreadList({
   const { activeCommunity } = useCommunities();
   const identityQuery = useIdentityQuery();
   const { goChannel } = useAppNavigation();
+  const { threadActivityItems } = useAppShell();
   const [directoryState, setDirectoryState] =
     React.useState<ThreadDirectoryState>("active");
   const [renameDraft, setRenameDraft] = React.useState<RenameDraft | null>(
@@ -403,6 +476,26 @@ export function SidebarThreadList({
   const renameValidationMessage = threadDirectoryRenameValidationMessage(
     renameDraft?.title ?? "",
   );
+  const legacyItems = React.useMemo(
+    () => legacySidebarThreadItems(threadActivityItems, channelId),
+    [channelId, threadActivityItems],
+  );
+
+  if (directory.isUnsupported) {
+    return (
+      <div
+        className="ml-5 border-l border-sidebar-border/60 pl-2 pr-1 pt-0.5"
+        id={contentId}
+      >
+        <LegacySidebarThreadList
+          items={legacyItems}
+          onNavigate={(rootId) => {
+            void goChannel(channelId, threadDirectoryNavigationSearch(rootId));
+          }}
+        />
+      </div>
+    );
+  }
 
   return (
     <div

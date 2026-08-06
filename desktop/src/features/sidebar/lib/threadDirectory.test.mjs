@@ -16,7 +16,10 @@ import {
   threadDirectoryQueryKey,
   threadDirectoryUnreadState,
 } from "./threadDirectory.ts";
-import { parseThreadDirectoryPage } from "@/shared/api/threadDirectory";
+import {
+  parseThreadDirectoryPage,
+  ThreadDirectoryUnsupportedError,
+} from "@/shared/api/threadDirectory";
 import {
   KIND_THREAD_DIRECTORY_BOUNDS,
   KIND_THREAD_DIRECTORY_ITEM,
@@ -135,6 +138,27 @@ test("binds the bounds overlay to the exact requested cursor", () => {
         cursor,
       ),
     /requested page/i,
+  );
+});
+
+test("classifies a missing bounds overlay as unsupported relay capability", () => {
+  assert.throws(
+    () => parseThreadDirectoryPage([itemEvent()], CHANNEL_ID, "active"),
+    ThreadDirectoryUnsupportedError,
+  );
+});
+
+test("does not disguise duplicate bounds as unsupported capability", () => {
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [boundsEvent(), boundsEvent()],
+        CHANNEL_ID,
+        "active",
+      ),
+    (error) =>
+      !(error instanceof ThreadDirectoryUnsupportedError) &&
+      /exactly one bounds overlay/.test(error.message),
   );
 });
 

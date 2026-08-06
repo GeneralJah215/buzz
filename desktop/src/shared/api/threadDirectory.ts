@@ -47,6 +47,20 @@ export type ThreadDirectoryStateSnapshot = {
   archived: boolean;
 };
 
+/** The connected relay cannot serve the thread-directory protocol. */
+export class ThreadDirectoryUnsupportedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ThreadDirectoryUnsupportedError";
+  }
+}
+
+export function isThreadDirectoryUnsupportedError(
+  error: unknown,
+): error is ThreadDirectoryUnsupportedError {
+  return error instanceof ThreadDirectoryUnsupportedError;
+}
+
 function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
@@ -280,6 +294,11 @@ export function parseThreadDirectoryPage(
       );
     }
   }
+  if (bounds.length === 0) {
+    throw new ThreadDirectoryUnsupportedError(
+      "The relay does not support the thread directory.",
+    );
+  }
   if (bounds.length !== 1) {
     throw new Error(
       "Thread directory response must contain exactly one bounds overlay.",
@@ -295,12 +314,19 @@ export async function getThreadDirectoryPage(
   cursor: string | null = null,
   limitRows = 25,
 ): Promise<ThreadDirectoryPage> {
-  const events = await invokeTauri<RelayEvent[]>("get_thread_directory", {
-    channelId,
-    directoryState: state,
-    cursor,
-    limitRows,
-  });
+  let events: RelayEvent[];
+  try {
+    events = await invokeTauri<RelayEvent[]>("get_thread_directory", {
+      channelId,
+      directoryState: state,
+      cursor,
+      limitRows,
+    });
+  } catch {
+    throw new ThreadDirectoryUnsupportedError(
+      "The relay does not support the thread directory.",
+    );
+  }
   return parseThreadDirectoryPage(events, channelId, state, cursor);
 }
 

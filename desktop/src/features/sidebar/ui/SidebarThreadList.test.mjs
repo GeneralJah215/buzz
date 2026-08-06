@@ -6,9 +6,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { AppShellProvider } from "@/app/AppShellContext";
 
 import {
+  LegacySidebarThreadList,
   SidebarThreadDisclosure,
   ThreadDirectoryRow,
   ThreadDirectoryResults,
+  legacySidebarThreadItems,
   threadDirectoryActionPatch,
   threadDirectoryCanTogglePin,
   threadDirectoryNavigationSearch,
@@ -178,6 +180,62 @@ test("stream disclosure is a separate accessible control and forums omit it", ()
   assert.equal(forumHtml, "");
 });
 
+test("legacy fallback groups local activity by root and renders a plain list", () => {
+  const otherRoot = "e".repeat(64);
+  const items = legacySidebarThreadItems(
+    [
+      {
+        id: "1",
+        channelId: CHANNEL_ID,
+        content: "Older reply",
+        createdAt: 100,
+        tags: [
+          ["e", ROOT_ID, "", "root"],
+          ["e", ROOT_ID, "", "reply"],
+        ],
+      },
+      {
+        id: "2",
+        channelId: CHANNEL_ID,
+        content: "Latest reply\nwith more detail",
+        createdAt: 200,
+        tags: [
+          ["e", ROOT_ID, "", "root"],
+          ["e", ROOT_ID, "", "reply"],
+        ],
+      },
+      {
+        id: "3",
+        channelId: CHANNEL_ID,
+        content: "Another thread",
+        createdAt: 150,
+        tags: [
+          ["e", otherRoot, "", "root"],
+          ["e", otherRoot, "", "reply"],
+        ],
+      },
+    ],
+    CHANNEL_ID,
+  );
+  assert.deepEqual(
+    items.map(({ rootId, title }) => ({ rootId, title })),
+    [
+      { rootId: ROOT_ID, title: "Latest reply" },
+      { rootId: otherRoot, title: "Another thread" },
+    ],
+  );
+
+  const html = renderToStaticMarkup(
+    React.createElement(LegacySidebarThreadList, {
+      items,
+      onNavigate() {},
+    }),
+  );
+  assert.match(html, /data-testid="legacy-thread-list"/);
+  assert.match(html, /Latest reply/);
+  assert.doesNotMatch(html, /role="alert"/);
+});
+
 test("navigation and pointer guards preserve thread routing and channel isolation", () => {
   assert.deepEqual(threadDirectoryNavigationSearch(ROOT_ID), {
     messageId: ROOT_ID,
@@ -206,6 +264,8 @@ test("production JSX wires navigation, drag isolation, and mutation rollback err
   );
   assert.match(
     HOOK_SOURCE,
-    /subscribeToReconnects[\s\S]*subscription\.reconnect\(\)/,
+    /subscribeToReconnects[\s\S]*setConnectionGeneration/,
   );
+  assert.match(HOOK_SOURCE, /capabilityQuery\.data === "supported"/);
+  assert.match(HOOK_SOURCE, /isUnsupported:/);
 });
