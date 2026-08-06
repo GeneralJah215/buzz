@@ -107,6 +107,7 @@ export function useThreadDirectory({
   const [connectionGeneration, setConnectionGeneration] = React.useState(() =>
     relayClient.getConnectionGeneration(),
   );
+  const resetGenerationRef = React.useRef(connectionGeneration);
   const queryKey = React.useMemo(
     () =>
       threadDirectoryQueryKey(communityId, relayUrl, pubkey, channelId, state),
@@ -132,6 +133,9 @@ export function useThreadDirectory({
   );
   const latestScopeRef = React.useRef(currentScope);
   const mountedScopeRef = React.useRef<ThreadDirectoryQueryScope | null>(null);
+  const subscriptionRef = React.useRef<ReturnType<
+    typeof createRetryingThreadDirectorySubscription
+  > | null>(null);
   React.useLayoutEffect(() => {
     latestScopeRef.current = currentScope;
   }, [currentScope]);
@@ -193,8 +197,6 @@ export function useThreadDirectory({
     relayUrl !== null &&
     pubkey !== null;
   const queryEnabled = scopeEnabled && capabilityQuery.data !== "unsupported";
-  const subscriptionEnabled =
-    scopeEnabled && capabilityQuery.data === "supported";
 
   const query = useInfiniteQuery<
     StampedThreadDirectoryPage,
@@ -243,26 +245,50 @@ export function useThreadDirectory({
     if (!scopeEnabled) return;
     return relayClient.subscribeToReconnects(() => {
       setConnectionGeneration(relayClient.getConnectionGeneration());
-      if (!liveScopeCanWriteCache()) return;
-      queryClient.setQueryData<ThreadDirectoryLiveState>(
-        liveQueryKey,
-        (current = EMPTY_LIVE_STATE) => ({
-          nextOrder: current.nextOrder + 1,
-          byRootId: new Map(),
-        }),
-      );
-      void queryClient.resetQueries({ queryKey, exact: true });
+      subscriptionRef.current?.reconnect();
     });
+  }, [scopeEnabled]);
+
+  React.useEffect(() => {
+    if (resetGenerationRef.current === connectionGeneration) return;
+    const previousGeneration = resetGenerationRef.current;
+    resetGenerationRef.current = connectionGeneration;
+    if (!scopeEnabled || !liveScopeCanWriteCache()) return;
+    const previousCapability =
+      queryClient.getQueryData<ThreadDirectoryCapability>([
+        "thread-directory-capability",
+        communityId,
+        relayUrl,
+        pubkey,
+        previousGeneration,
+      ]);
+    queryClient.setQueryData<ThreadDirectoryLiveState>(
+      liveQueryKey,
+      (current = EMPTY_LIVE_STATE) => ({
+        nextOrder: current.nextOrder + 1,
+        byRootId: new Map(),
+      }),
+    );
+    // An unsupported query becomes enabled when the new generation starts at
+    // unknown, so React Query already launches that probe. Supported queries
+    // stay enabled across the generation change and need one explicit reset.
+    if (previousCapability !== "unsupported") {
+      void queryClient.resetQueries({ queryKey, exact: true });
+    }
   }, [
+    communityId,
+    connectionGeneration,
     liveQueryKey,
     liveScopeCanWriteCache,
+    pubkey,
     queryClient,
     queryKey,
+    relayUrl,
     scopeEnabled,
   ]);
 
   React.useEffect(() => {
-    if (!subscriptionEnabled || !channelId) return;
+    if (!queryEnabled || !channelId) return;
     const subscription = createRetryingThreadDirectorySubscription({
       subscribe: () =>
         relayClient.subscribeToThreadDirectory(channelId, (event) => {
@@ -290,13 +316,19 @@ export function useThreadDirectory({
         );
       },
     });
-    return () => subscription.dispose();
+    subscriptionRef.current = subscription;
+    return () => {
+      if (subscriptionRef.current === subscription) {
+        subscriptionRef.current = null;
+      }
+      subscription.dispose();
+    };
   }, [
     channelId,
     liveQueryKey,
     liveScopeCanWriteCache,
     queryClient,
-    subscriptionEnabled,
+    queryEnabled,
   ]);
 
   const mutation = useMutation<

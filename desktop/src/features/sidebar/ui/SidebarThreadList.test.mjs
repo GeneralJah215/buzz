@@ -264,8 +264,7 @@ test("production JSX wires navigation, drag isolation, and mutation rollback err
   );
   assert.match(
     HOOK_SOURCE,
-    /subscribeToReconnects[\s\S]*setConnectionGeneration/,
+    /subscribeToReconnects[\s\S]*subscriptionRef\.current\?\.reconnect\(\)/,
   );
-  assert.match(HOOK_SOURCE, /capabilityQuery\.data === "supported"/);
   assert.match(HOOK_SOURCE, /isUnsupported:/);
 });

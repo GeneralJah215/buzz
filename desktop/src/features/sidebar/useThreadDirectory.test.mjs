@@ -195,7 +195,7 @@ async function waitForCondition(predicate) {
   assert.fail("condition was not met");
 }
 
-test("command failure caches fallback until reconnect, then re-probes support", async () => {
+test("capability cache follows unsupported and supported reconnect transitions", async () => {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -288,6 +288,34 @@ test("command failure caches fallback until reconnect, then re-probes support", 
     );
     assert.equal(invokeCount, 2);
     assert.equal(currentDirectory.error, null);
+
+    generation += 1;
+    await act(async () => {
+      reconnectListener();
+    });
+    await waitForCondition(() => invokeCount === 3);
+    assert.equal(currentDirectory.isUnsupported, false);
+    assert.equal(currentDirectory.error, null);
+
+    supportsDirectory = false;
+    generation += 1;
+    await act(async () => {
+      reconnectListener();
+    });
+    await waitForCondition(() => currentDirectory?.isUnsupported === true);
+    assert.equal(invokeCount, 4);
+    assert.equal(currentDirectory.error, null);
+
+    await act(async () => {
+      renderHarness(FIRST_CHANNEL_ID);
+      await waitForTask();
+    });
+    assert.equal(currentDirectory.isUnsupported, true);
+    assert.equal(
+      invokeCount,
+      4,
+      "current unsupported verdict must suppress sibling probes",
+    );
   } finally {
     await act(async () => root.unmount());
     relayClient.getConnectionGeneration = originalGetConnectionGeneration;
@@ -307,7 +335,11 @@ test("missing bounds selects fallback without surfacing a query error", async ()
   let currentDirectory;
   const originalSubscribeToReconnects =
     relayClient.subscribeToReconnects.bind(relayClient);
+  const originalSubscribeToThreadDirectory =
+    relayClient.subscribeToThreadDirectory.bind(relayClient);
   relayClient.subscribeToReconnects = () => () => {};
+  relayClient.subscribeToThreadDirectory = () =>
+    Promise.resolve(async () => {});
   globalThis.window.__TAURI_INTERNALS__ = {
     invoke(command) {
       assert.equal(command, "get_thread_directory");
@@ -336,6 +368,7 @@ test("missing bounds selects fallback without surfacing a query error", async ()
   } finally {
     await act(async () => root.unmount());
     relayClient.subscribeToReconnects = originalSubscribeToReconnects;
+    relayClient.subscribeToThreadDirectory = originalSubscribeToThreadDirectory;
     delete globalThis.window.__TAURI_INTERNALS__;
     client.clear();
   }
