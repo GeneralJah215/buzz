@@ -9,6 +9,11 @@ import {
   getEdgeRelayBinding,
   type EdgeRelayBinding,
 } from "@/shared/api/relayEdgeRouting";
+import {
+  buildBindFrame,
+  classifyEdgeFrame,
+  edgeRefusal,
+} from "@/shared/api/relayEdgeProtocol";
 import { closeWebSocket } from "@/shared/api/relayWebSocketClose";
 import {
   isWebSocketClose,
@@ -42,10 +47,17 @@ export class RelayEdgeClient {
   private connecting: Promise<boolean> | null = null;
   private messageChannel: Channel<unknown> | null = null;
   private handshake: {
+    stage: "bind" | "auth";
     resolve: () => void;
     reject: (error: Error) => void;
     timeout: number;
   } | null = null;
+  private pendingChallenge: string | null = null;
+  private challengeWaiter: {
+    resolve: (challenge: string) => void;
+    timeout: number;
+  } | null = null;
+  private authEventId: string | null = null;
   private subscriptions = new Map<
     string,
     { filter: RelaySubscriptionFilter; onEvent: (event: RelayEvent) => void }
@@ -106,6 +118,12 @@ export class RelayEdgeClient {
     this.generation += 1;
     this.subscriptions.clear();
     this.rejectHandshake(new Error("Edge session was reset."));
+    if (this.challengeWaiter) {
+      window.clearTimeout(this.challengeWaiter.timeout);
+      this.challengeWaiter = null;
+    }
+    this.pendingChallenge = null;
+    this.authEventId = null;
     this.connecting = null;
     this.messageChannel = null;
     const wsId = this.wsId;
@@ -157,32 +175,64 @@ export class RelayEdgeClient {
   }
 
   /**
-   * Declare the expected `(canonical origin, community)` pair before any REQ.
-   * The sidecar rejects a mismatch, which is what stops a sidecar bound to a
-   * different community from ever answering this client.
+   * Bring the session to "ready for REQ". The sidecar enforces a strict order
+   * (`crates/buzz-edge/src/lib.rs`): BIND must complete before anything else,
+   * NIP-42 must complete after that, and any REQ before both is answered with
+   * a NOTICE rather than data. Getting this order wrong would look exactly
+   * like a healthy connection that never delivers a message.
    */
   private async performHandshake(
     binding: EdgeRelayBinding,
     generation: number,
   ): Promise<void> {
-    const settled = new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(() => {
-        this.handshake = null;
-        reject(new Error("Edge handshake timed out."));
-      }, EDGE_HANDSHAKE_TIMEOUT_MS);
-      this.handshake = { resolve, reject, timeout };
-    });
-    await this.send([
-      "BIND",
-      {
-        canonicalOrigin: binding.canonicalOrigin,
-        communityId: binding.communityId,
-      },
-    ]);
-    await settled;
+    await this.awaitGate("bind", () => this.send(buildBindFrame(binding)));
     if (generation !== this.generation) {
       throw new Error("Edge connection attempt was superseded.");
     }
+    // The challenge arrives immediately on connect, before BIND completes, so
+    // it is buffered and answered here rather than on arrival.
+    await this.awaitGate("auth", () => this.sendAuth(binding, generation));
+    if (generation !== this.generation) {
+      throw new Error("Edge connection attempt was superseded.");
+    }
+  }
+
+  private async awaitGate(
+    stage: "bind" | "auth",
+    send: () => Promise<void>,
+  ): Promise<void> {
+    const settled = new Promise<void>((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        this.handshake = null;
+        reject(new Error(`Edge ${stage} timed out.`));
+      }, EDGE_HANDSHAKE_TIMEOUT_MS);
+      this.handshake = { stage, resolve, reject, timeout };
+    });
+    await send();
+    await settled;
+  }
+
+  private async sendAuth(binding: EdgeRelayBinding, generation: number) {
+    const challenge = this.pendingChallenge ?? (await this.awaitChallenge());
+    this.pendingChallenge = null;
+    const event = await createAuthEvent({
+      challenge,
+      relayUrl: binding.relayUrl,
+    });
+    if (generation !== this.generation) return;
+    this.authEventId = event.id;
+    await this.send(["AUTH", event]);
+  }
+
+  /** The challenge is sent on connect; if BIND won the race, wait for it. */
+  private awaitChallenge(): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        this.challengeWaiter = null;
+        reject(new Error("Edge auth challenge never arrived."));
+      }, EDGE_HANDSHAKE_TIMEOUT_MS);
+      this.challengeWaiter = { resolve, timeout };
+    });
   }
 
   private handleMessage(message: unknown, generation: number) {
@@ -202,38 +252,48 @@ export class RelayEdgeClient {
     }
     if (!Array.isArray(data) || data.length === 0) return;
 
-    const [type, ...rest] = data;
-    if (type === "BOUND") {
-      // Anything other than an explicit accept is a rejected binding, and a
-      // rejected binding must not degrade into an unbound session.
-      if (rest[0] === true) this.resolveHandshake();
-      else this.rejectHandshake(new Error("Edge rejected the community bind."));
-      return;
-    }
-    if (type === "AUTH" && typeof rest[0] === "string") {
-      void this.answerAuthChallenge(rest[0], generation);
-      return;
-    }
-    if (type === "EVENT" && typeof rest[0] === "string" && rest[1]) {
-      this.subscriptions.get(rest[0])?.onEvent(rest[1] as RelayEvent);
-    }
-  }
-
-  private async answerAuthChallenge(challenge: string, generation: number) {
-    try {
-      const relayUrl = this.binding?.relayUrl;
-      if (!relayUrl) return;
-      const event = await createAuthEvent({ challenge, relayUrl });
-      if (generation !== this.generation) return;
-      await this.send(["AUTH", event]);
-    } catch {
-      if (generation === this.generation) this.reset();
+    const frame = classifyEdgeFrame(data, this.authEventId);
+    switch (frame.type) {
+      case "bound":
+        if (frame.accepted) this.resolveHandshake("bind");
+        else
+          this.rejectHandshake(
+            edgeRefusal("Edge rejected the community bind", frame.message),
+          );
+        return;
+      case "challenge":
+        this.acceptChallenge(frame.challenge);
+        return;
+      case "auth-result":
+        if (frame.accepted) this.resolveHandshake("auth");
+        else
+          this.rejectHandshake(
+            edgeRefusal("Edge rejected authentication", frame.message),
+          );
+        return;
+      case "event":
+        this.subscriptions.get(frame.subId)?.onEvent(frame.event);
+        return;
+      default:
+        return;
     }
   }
 
-  private resolveHandshake() {
+  private acceptChallenge(challenge: string) {
+    const waiter = this.challengeWaiter;
+    if (waiter) {
+      this.challengeWaiter = null;
+      window.clearTimeout(waiter.timeout);
+      waiter.resolve(challenge);
+      return;
+    }
+    this.pendingChallenge = challenge;
+  }
+
+  private resolveHandshake(stage: "bind" | "auth") {
     const pending = this.handshake;
-    if (!pending) return;
+    // A frame for a stage we are not waiting on is out of order, not progress.
+    if (pending?.stage !== stage) return;
     this.handshake = null;
     window.clearTimeout(pending.timeout);
     pending.resolve();
