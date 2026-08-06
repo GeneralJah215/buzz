@@ -39,9 +39,104 @@ pub enum KeyringProbe {
     Unreachable,
 }
 
-/// Username used for the single blob keychain entry. All secrets are stored
-/// as a JSON map under this name within the service.
+/// Username used for the primary keychain entry. Holds either the JSON map
+/// itself, or — once the map outgrows one entry — a small chunk header.
 const BLOB_KEY: &str = "secrets";
+
+/// Largest payload written to one keychain entry.
+///
+/// Windows Credential Manager rejects a credential longer than 2560 UTF-16
+/// characters. The stored JSON is ASCII (hex pubkeys, bech32 secrets), so
+/// characters and UTF-16 units are one to one; 2000 leaves room for the entry
+/// name and encoding overhead without needing to model either exactly.
+const MAX_ENTRY_CHARS: usize = 2_000;
+
+/// Upper bound on chunks scanned when clearing an old generation. At 2000
+/// characters per chunk this covers roughly 8 MB of secrets, far beyond any
+/// plausible agent count, and stops a corrupt header causing an endless scan.
+const MAX_CHUNKS: usize = 4_096;
+
+/// Which set of chunk entries is live. Writes always target the other one, so
+/// the previous state stays readable until the header flip commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Generation {
+    A,
+    B,
+}
+
+impl Generation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Generation::A => "a",
+            Generation::B => "b",
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Generation::A => Generation::B,
+            Generation::B => Generation::A,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "a" => Some(Generation::A),
+            "b" => Some(Generation::B),
+            _ => None,
+        }
+    }
+}
+
+fn chunk_key(generation: Generation, index: usize) -> String {
+    format!("{BLOB_KEY}.{}.{index}", generation.as_str())
+}
+
+/// Split on character boundaries, not bytes, so a multi-byte character is
+/// never cut in half. The payload is ASCII today; this keeps it correct if a
+/// secret ever is not.
+fn split_chars(value: &str, max_chars: usize) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut counted = 0;
+    for (offset, _) in value.char_indices() {
+        if counted == max_chars {
+            parts.push(&value[start..offset]);
+            start = offset;
+            counted = 0;
+        }
+        counted += 1;
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+/// Header stored under [`BLOB_KEY`] once the map is chunked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkHeader {
+    generation: Generation,
+    chunks: usize,
+    len: usize,
+}
+
+impl ChunkHeader {
+    /// Returns `None` for anything that is not a chunk header — including the
+    /// original layout, where this entry holds the JSON map. The map's keys are
+    /// `identity` and `agent:<pubkey>`, never `v`, so the two cannot be
+    /// confused.
+    fn parse(raw: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let object = value.as_object()?;
+        if object.get("v")?.as_u64()? != 2 {
+            return None;
+        }
+        Some(ChunkHeader {
+            generation: Generation::parse(object.get("gen")?.as_str()?)?,
+            chunks: usize::try_from(object.get("chunks")?.as_u64()?).ok()?,
+            len: usize::try_from(object.get("len")?.as_u64()?).ok()?,
+        })
+    }
+}
 
 // ── Interprocess advisory lock ─────────────────────────────────────────────
 //
@@ -351,12 +446,46 @@ impl SecretStore {
 
     /// Read blob via the legacy `keyring` crate (Windows, Linux, or macOS dev
     /// builds that lack hardened-runtime entitlements).
+    ///
+    /// Understands both layouts: a plain JSON map written by the original
+    /// single-entry format, and the chunked layout described on
+    /// [`Self::write_blob_raw_keyring`]. A blob written before this change
+    /// reads back unchanged, so the upgrade needs no migration step.
     #[cfg(feature = "system-keyring")]
     fn read_blob_raw_keyring(&self) -> Result<Option<Vec<u8>>, String> {
-        let entry =
-            keyring_entry(&self.service, BLOB_KEY).map_err(|e| format!("keyring entry: {e}"))?;
+        let Some(head) = self.read_entry(BLOB_KEY)? else {
+            return Ok(None);
+        };
+        let Some(header) = ChunkHeader::parse(&head) else {
+            // Original layout: the entry *is* the JSON map.
+            return Ok(Some(head.into_bytes()));
+        };
+        let mut assembled = String::with_capacity(header.len);
+        for index in 0..header.chunks {
+            let name = chunk_key(header.generation, index);
+            let part = self.read_entry(&name)?.ok_or_else(|| {
+                // Fail loud. Returning a partial map would look like "these
+                // keys were never stored" and the next write would drop them.
+                format!("keyring chunk {name} missing; secret store is incomplete")
+            })?;
+            assembled.push_str(&part);
+        }
+        if assembled.len() != header.len {
+            return Err(format!(
+                "keyring chunk length mismatch: header says {} bytes, assembled {}",
+                header.len,
+                assembled.len()
+            ));
+        }
+        Ok(Some(assembled.into_bytes()))
+    }
+
+    /// Read one keyring entry. `Ok(None)` = no such entry.
+    #[cfg(feature = "system-keyring")]
+    fn read_entry(&self, key: &str) -> Result<Option<String>, String> {
+        let entry = keyring_entry(&self.service, key).map_err(|e| format!("keyring entry: {e}"))?;
         match entry.get_password() {
-            Ok(s) => Ok(Some(s.into_bytes())),
+            Ok(s) => Ok(Some(s)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) if is_keyring_availability_error(&e.to_string()) => {
                 Err(format!("keyring unavailable: {e}"))
@@ -462,14 +591,92 @@ impl SecretStore {
         self.write_blob_raw_keyring(bytes)
     }
 
+    /// Write the blob, splitting it across several entries when it is too large
+    /// for one.
+    ///
+    /// Windows Credential Manager caps a single credential at 2560 UTF-16
+    /// characters. The whole secret store — the user identity plus every
+    /// managed agent key — lives in one entry, so that cap is a hard ceiling of
+    /// roughly 18 agents, after which EVERY write fails and the identity itself
+    /// can no longer be saved (BUG-013).
+    ///
+    /// Layout when the blob fits: unchanged from before — `secrets` holds the
+    /// JSON map. Nothing is written differently, and macOS keychains keep
+    /// getting exactly one ACL prompt.
+    ///
+    /// Layout when it does not fit:
+    /// - `secrets` holds a small header, `{"v":2,"gen":"a","chunks":N,"len":L}`
+    /// - `secrets.a.0 … secrets.a.N-1` hold the JSON split into pieces
+    ///
+    /// Writes go to the generation that is NOT live, and the header is written
+    /// last. The header write is a single small entry, so it either lands or it
+    /// does not: a crash part-way through leaves the previous generation intact
+    /// and still referenced. Losing the identity to a torn write is precisely
+    /// the failure this must not have.
     #[cfg(feature = "system-keyring")]
     fn write_blob_raw_keyring(&self, bytes: &[u8]) -> Result<(), String> {
         let value = std::str::from_utf8(bytes).map_err(|e| format!("blob utf8 encode: {e}"))?;
-        let entry =
-            keyring_entry(&self.service, BLOB_KEY).map_err(|e| format!("keyring entry: {e}"))?;
+
+        if value.len() <= MAX_ENTRY_CHARS {
+            self.write_entry(BLOB_KEY, value)?;
+            // Drop any chunks left by a previous larger state so they cannot be
+            // resurrected by a later reader.
+            self.discard_generation(Generation::A);
+            self.discard_generation(Generation::B);
+            return Ok(());
+        }
+
+        let previous = self
+            .read_entry(BLOB_KEY)?
+            .as_deref()
+            .and_then(ChunkHeader::parse);
+        let target = match previous {
+            Some(header) => header.generation.other(),
+            None => Generation::A,
+        };
+
+        let parts: Vec<&str> = split_chars(value, MAX_ENTRY_CHARS);
+        for (index, part) in parts.iter().enumerate() {
+            self.write_entry(&chunk_key(target, index), part)?;
+        }
+        let header = format!(
+            r#"{{"v":2,"gen":"{}","chunks":{},"len":{}}}"#,
+            target.as_str(),
+            parts.len(),
+            value.len()
+        );
+        // The flip. Everything before this was invisible to readers.
+        self.write_entry(BLOB_KEY, &header)?;
+        self.discard_generation(target.other());
+        Ok(())
+    }
+
+    #[cfg(feature = "system-keyring")]
+    fn write_entry(&self, key: &str, value: &str) -> Result<(), String> {
+        let entry = keyring_entry(&self.service, key).map_err(|e| format!("keyring entry: {e}"))?;
         entry
             .set_password(value)
             .map_err(|e| format!("keyring write: {e}"))
+    }
+
+    /// Best-effort removal of a generation's chunks. Failures are ignored: a
+    /// leftover chunk is unreferenced by the header and therefore harmless,
+    /// and refusing the whole write over it would be worse.
+    #[cfg(feature = "system-keyring")]
+    fn discard_generation(&self, generation: Generation) {
+        for index in 0..MAX_CHUNKS {
+            let name = chunk_key(generation, index);
+            match keyring_entry(&self.service, &name) {
+                Ok(entry) => {
+                    if entry.delete_credential().is_err() {
+                        // Nothing there, or unreachable. Either way, stop —
+                        // chunks are contiguous from 0.
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
     }
 
     /// Probe whether `key` exists and whether the backend is reachable.
@@ -933,6 +1140,117 @@ mod tests {
                 cache: Mutex::new(cache),
             }
         }
+    }
+
+    // ── Chunked blob layout (BUG-013) ──────────────────────────────────────
+    //
+    // Windows Credential Manager caps one credential at 2560 UTF-16 chars, so
+    // the single-entry secret store stopped accepting writes at roughly 18
+    // agents — taking the user's identity down with it, because it shares the
+    // entry. These cover the split/reassemble logic and the compatibility rule
+    // that keeps an existing single-entry blob readable.
+
+    /// A realistic blob: one identity plus `agents` agent keys, same shape as
+    /// the real store (64-hex names, 63-char bech32 secrets).
+    fn sample_blob(agents: usize) -> String {
+        let mut map = HashMap::new();
+        map.insert("identity".to_string(), format!("nsec1{}", "0".repeat(58)));
+        for index in 0..agents {
+            map.insert(
+                format!("agent:{:064x}", index),
+                format!("nsec1{:058x}", index),
+            );
+        }
+        serde_json::to_string(&map).unwrap()
+    }
+
+    #[test]
+    fn the_real_store_size_that_broke_windows_needs_more_than_one_entry() {
+        // 17 agent keys plus an identity is what was on the affected machine.
+        // It must now be recognised as too large for a single credential.
+        let blob = sample_blob(17);
+        assert!(
+            blob.len() > MAX_ENTRY_CHARS,
+            "expected the failing real-world size to exceed one entry, got {}",
+            blob.len()
+        );
+        let parts = split_chars(&blob, MAX_ENTRY_CHARS);
+        assert!(parts.len() > 1);
+        assert_eq!(parts.concat(), blob, "split must round-trip exactly");
+    }
+
+    #[test]
+    fn a_small_blob_still_fits_one_entry() {
+        // Two agents is well under the cap, so nothing about the storage
+        // layout changes for ordinary users — and macOS keeps one ACL prompt.
+        assert!(sample_blob(2).len() <= MAX_ENTRY_CHARS);
+    }
+
+    #[test]
+    fn split_round_trips_and_respects_the_cap() {
+        for agents in [0, 1, 18, 35, 200] {
+            let blob = sample_blob(agents);
+            let parts = split_chars(&blob, MAX_ENTRY_CHARS);
+            assert_eq!(parts.concat(), blob, "{agents} agents");
+            for part in &parts {
+                assert!(
+                    part.chars().count() <= MAX_ENTRY_CHARS,
+                    "{agents} agents produced an oversized chunk"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_never_cuts_a_multi_byte_character() {
+        // Chunking on bytes would corrupt this; chunking on chars does not.
+        let value = "é".repeat(MAX_ENTRY_CHARS * 2 + 7);
+        let parts = split_chars(&value, MAX_ENTRY_CHARS);
+        assert_eq!(parts.concat(), value);
+        for part in &parts {
+            assert!(part.chars().count() <= MAX_ENTRY_CHARS);
+        }
+    }
+
+    #[test]
+    fn an_existing_single_entry_blob_is_not_mistaken_for_a_header() {
+        // The upgrade must read a store written by the old code with no
+        // migration step, so a plain JSON map has to parse as "not a header".
+        assert!(ChunkHeader::parse(&sample_blob(3)).is_none());
+        assert!(ChunkHeader::parse("{}").is_none());
+        assert!(ChunkHeader::parse("not json").is_none());
+        // A future version must not be read with today's rules.
+        assert!(ChunkHeader::parse(r#"{"v":3,"gen":"a","chunks":1,"len":5}"#).is_none());
+        // Malformed headers are rejected rather than half-trusted.
+        assert!(ChunkHeader::parse(r#"{"v":2,"gen":"z","chunks":1,"len":5}"#).is_none());
+        assert!(ChunkHeader::parse(r#"{"v":2,"gen":"a","chunks":1}"#).is_none());
+    }
+
+    #[test]
+    fn header_round_trips_through_the_exact_string_the_writer_emits() {
+        let written = format!(
+            r#"{{"v":2,"gen":"{}","chunks":{},"len":{}}}"#,
+            Generation::B.as_str(),
+            3,
+            5_000
+        );
+        let header = ChunkHeader::parse(&written).expect("writer output must parse");
+        assert_eq!(header.generation, Generation::B);
+        assert_eq!(header.chunks, 3);
+        assert_eq!(header.len, 5_000);
+        // And a header is always small enough to write in one credential, which
+        // is what makes the generation flip atomic.
+        assert!(written.len() <= MAX_ENTRY_CHARS);
+    }
+
+    #[test]
+    fn writes_alternate_generations_so_the_live_one_is_never_overwritten() {
+        assert_eq!(Generation::A.other(), Generation::B);
+        assert_eq!(Generation::B.other(), Generation::A);
+        assert_eq!(chunk_key(Generation::A, 0), "secrets.a.0");
+        assert_eq!(chunk_key(Generation::B, 12), "secrets.b.12");
+        // Chunk names must never collide with the header entry.
+        assert_ne!(chunk_key(Generation::A, 0), BLOB_KEY);
     }
 
     #[test]
