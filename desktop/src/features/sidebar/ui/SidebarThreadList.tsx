@@ -56,28 +56,54 @@ type LegacyThreadItem = {
   lastReplyAt: number;
 };
 
+/**
+ * Degraded thread list for relays without the thread-directory server half.
+ *
+ * The only channel-scoped thread data the desktop holds locally is the
+ * notification activity buffer, which is deliberately partial: replies the user
+ * was notified about, capped across all channels. This list is therefore a
+ * recent-activity view, not the complete set of threads — the empty state and
+ * the section copy say so rather than claiming a channel has no threads.
+ *
+ * The title comes from the OLDEST known reply in each thread, not the newest:
+ * the row navigates to the thread root, so a label that changes every time
+ * somebody replies would not identify the thread it opens.
+ */
 export function legacySidebarThreadItems(
   activityItems: readonly ThreadActivityItem[],
   channelId: string,
 ): LegacyThreadItem[] {
-  const byRootId = new Map<string, LegacyThreadItem>();
+  const byRootId = new Map<string, LegacyThreadItem & { titleAt: number }>();
   for (const item of activityItems) {
     if (item.channelId !== channelId) continue;
     const rootId = getThreadReference(item.tags).rootId;
     if (!rootId) continue;
     const current = byRootId.get(rootId);
-    if (current && current.lastReplyAt > item.createdAt) continue;
-    byRootId.set(rootId, {
-      rootId,
-      title: item.content.trim().split(/\r?\n/, 1)[0] || "Thread",
-      lastReplyAt: item.createdAt,
-    });
+    const title = item.content.trim().split(/\r?\n/, 1)[0] || "Thread";
+    if (!current) {
+      byRootId.set(rootId, {
+        rootId,
+        title,
+        titleAt: item.createdAt,
+        lastReplyAt: item.createdAt,
+      });
+      continue;
+    }
+    if (item.createdAt < current.titleAt) {
+      current.title = title;
+      current.titleAt = item.createdAt;
+    }
+    if (item.createdAt > current.lastReplyAt) {
+      current.lastReplyAt = item.createdAt;
+    }
   }
-  return [...byRootId.values()].sort(
-    (left, right) =>
-      right.lastReplyAt - left.lastReplyAt ||
-      left.rootId.localeCompare(right.rootId),
-  );
+  return [...byRootId.values()]
+    .map(({ rootId, title, lastReplyAt }) => ({ rootId, title, lastReplyAt }))
+    .sort(
+      (left, right) =>
+        right.lastReplyAt - left.lastReplyAt ||
+        left.rootId.localeCompare(right.rootId),
+    );
 }
 
 export function LegacySidebarThreadList({
@@ -90,7 +116,7 @@ export function LegacySidebarThreadList({
   if (items.length === 0) {
     return (
       <p className="px-2 py-1 text-xs text-sidebar-foreground/55">
-        No active threads
+        No recent thread activity
       </p>
     );
   }
@@ -487,6 +513,11 @@ export function SidebarThreadList({
         className="ml-5 border-l border-sidebar-border/60 pl-2 pr-1 pt-0.5"
         id={contentId}
       >
+        {/* Names the degraded list for what it is. The relay cannot serve the
+            directory, so this shows local activity only — not every thread. */}
+        <p className="px-2 pb-0.5 text-3xs text-sidebar-foreground/45">
+          Recent activity
+        </p>
         <LegacySidebarThreadList
           items={legacyItems}
           onNavigate={(rootId) => {

@@ -220,7 +220,12 @@ export function useThreadDirectory({
         );
         return { ...page, requestOrder };
       } catch (error) {
-        if (!isThreadDirectoryUnsupportedError(error)) throw error;
+        // Only the first page may select the fallback. A later page failing on
+        // a relay that already served page one is an ordinary error: swapping
+        // the whole list for the degraded view mid-pagination would discard a
+        // working directory.
+        if (!isThreadDirectoryUnsupportedError(error) || pageParam !== null)
+          throw error;
         queryClient.setQueryData<ThreadDirectoryCapability>(
           capabilityQueryKey,
           "unsupported",
@@ -244,16 +249,30 @@ export function useThreadDirectory({
   React.useEffect(() => {
     if (!scopeEnabled) return;
     return relayClient.subscribeToReconnects(() => {
-      setConnectionGeneration(relayClient.getConnectionGeneration());
+      // Clear the live overlays before re-subscribing, exactly as the
+      // pre-fallback listener did: overlays delivered between reconnect() and
+      // a deferred clear would be merged and then wiped.
+      if (liveScopeCanWriteCache()) {
+        queryClient.setQueryData<ThreadDirectoryLiveState>(
+          liveQueryKey,
+          (current = EMPTY_LIVE_STATE) => ({
+            nextOrder: current.nextOrder + 1,
+            byRootId: new Map(),
+          }),
+        );
+      }
       subscriptionRef.current?.reconnect();
+      setConnectionGeneration(relayClient.getConnectionGeneration());
     });
-  }, [scopeEnabled]);
+  }, [liveQueryKey, liveScopeCanWriteCache, queryClient, scopeEnabled]);
 
   React.useEffect(() => {
     if (resetGenerationRef.current === connectionGeneration) return;
+    // The generation is only consumed once the scope can act on it, so a
+    // reconnect seen while the scope is disabled is replayed rather than lost.
+    if (!scopeEnabled) return;
     const previousGeneration = resetGenerationRef.current;
     resetGenerationRef.current = connectionGeneration;
-    if (!scopeEnabled || !liveScopeCanWriteCache()) return;
     const previousCapability =
       queryClient.getQueryData<ThreadDirectoryCapability>([
         "thread-directory-capability",
@@ -262,13 +281,6 @@ export function useThreadDirectory({
         pubkey,
         previousGeneration,
       ]);
-    queryClient.setQueryData<ThreadDirectoryLiveState>(
-      liveQueryKey,
-      (current = EMPTY_LIVE_STATE) => ({
-        nextOrder: current.nextOrder + 1,
-        byRootId: new Map(),
-      }),
-    );
     // An unsupported query becomes enabled when the new generation starts at
     // unknown, so React Query already launches that probe. Supported queries
     // stay enabled across the generation change and need one explicit reset.
@@ -278,8 +290,6 @@ export function useThreadDirectory({
   }, [
     communityId,
     connectionGeneration,
-    liveQueryKey,
-    liveScopeCanWriteCache,
     pubkey,
     queryClient,
     queryKey,

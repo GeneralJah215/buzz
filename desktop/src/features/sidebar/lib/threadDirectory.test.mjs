@@ -17,6 +17,7 @@ import {
   threadDirectoryUnreadState,
 } from "./threadDirectory.ts";
 import {
+  isTransientRelayFailure,
   parseThreadDirectoryPage,
   ThreadDirectoryUnsupportedError,
 } from "@/shared/api/threadDirectory";
@@ -146,6 +147,30 @@ test("classifies a missing bounds overlay as unsupported relay capability", () =
     () => parseThreadDirectoryPage([itemEvent()], CHANNEL_ID, "active"),
     ThreadDirectoryUnsupportedError,
   );
+});
+
+test("transient relay failures are never read as a missing capability", () => {
+  for (const message of [
+    "relay unreachable: request timed out",
+    "relay unreachable: could not connect to relay",
+    "relay unreachable: relay host not found",
+    "relay rate-limited: retry in 4s",
+    "relay rate-limited: quota exceeded",
+    "relay returned 500 Internal Server Error",
+    "relay returned 502",
+  ]) {
+    assert.equal(isTransientRelayFailure(new Error(message)), true, message);
+  }
+  for (const message of [
+    "relay returned 400: unknown filter field",
+    "relay returned 404 Not Found",
+    "relay returned 422: thread_index is not supported",
+    "command failed",
+  ]) {
+    assert.equal(isTransientRelayFailure(new Error(message)), false, message);
+  }
+  assert.equal(isTransientRelayFailure("relay unreachable: nope"), true);
+  assert.equal(isTransientRelayFailure(undefined), false);
 });
 
 test("does not disguise duplicate bounds as unsupported capability", () => {

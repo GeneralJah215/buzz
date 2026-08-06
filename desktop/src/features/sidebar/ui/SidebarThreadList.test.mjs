@@ -217,13 +217,12 @@ test("legacy fallback groups local activity by root and renders a plain list", (
     ],
     CHANNEL_ID,
   );
-  assert.deepEqual(
-    items.map(({ rootId, title }) => ({ rootId, title })),
-    [
-      { rootId: ROOT_ID, title: "Latest reply" },
-      { rootId: otherRoot, title: "Another thread" },
-    ],
-  );
+  // The row opens the thread root, so the label is the oldest known message in
+  // the thread — not whatever was said last. Ordering still uses the newest.
+  assert.deepEqual(items, [
+    { rootId: ROOT_ID, title: "Older reply", lastReplyAt: 200 },
+    { rootId: otherRoot, title: "Another thread", lastReplyAt: 150 },
+  ]);
 
   const html = renderToStaticMarkup(
     React.createElement(LegacySidebarThreadList, {
@@ -232,8 +231,63 @@ test("legacy fallback groups local activity by root and renders a plain list", (
     }),
   );
   assert.match(html, /data-testid="legacy-thread-list"/);
-  assert.match(html, /Latest reply/);
-  assert.doesNotMatch(html, /role="alert"/);
+  assert.match(html, /Older reply/);
+  assert.doesNotMatch(html, /Latest reply/);
+});
+
+test("legacy fallback ignores other channels and reply-less events", () => {
+  assert.deepEqual(
+    legacySidebarThreadItems(
+      [
+        {
+          id: "1",
+          channelId: "another-channel",
+          content: "Elsewhere",
+          createdAt: 100,
+          tags: [
+            ["e", ROOT_ID, "", "root"],
+            ["e", ROOT_ID, "", "reply"],
+          ],
+        },
+        {
+          id: "2",
+          channelId: CHANNEL_ID,
+          content: "A thread root, not a reply",
+          createdAt: 120,
+          tags: [],
+        },
+      ],
+      CHANNEL_ID,
+    ),
+    [],
+  );
+});
+
+test("legacy fallback empty state does not claim the channel has no threads", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(LegacySidebarThreadList, {
+      items: [],
+      onNavigate() {},
+    }),
+  );
+  // The activity buffer is partial, so "No active threads" would be a claim the
+  // fallback cannot support.
+  assert.match(html, /No recent thread activity/);
+  assert.doesNotMatch(html, /No active threads/);
+});
+
+test("the unsupported branch returns the fallback before any error UI", () => {
+  const unsupportedBranch = UI_SOURCE.indexOf("if (directory.isUnsupported)");
+  assert.ok(unsupportedBranch > 0, "unsupported branch is missing");
+  assert.match(
+    UI_SOURCE.slice(unsupportedBranch),
+    /^[\s\S]{0,900}LegacySidebarThreadList/,
+    "the unsupported branch must render the fallback list",
+  );
+  assert.ok(
+    unsupportedBranch < UI_SOURCE.indexOf("error={directory.error"),
+    "the fallback must short-circuit before the directory error surface",
+  );
 });
 
 test("navigation and pointer guards preserve thread routing and channel isolation", () => {

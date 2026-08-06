@@ -374,6 +374,125 @@ test("missing bounds selects fallback without surfacing a query error", async ()
   }
 });
 
+function boundsResponse(channelId, { hasMore = false, cursor = null } = {}) {
+  return [
+    {
+      id: "f".repeat(64),
+      pubkey: PUBKEY,
+      created_at: 200,
+      kind: KIND_THREAD_DIRECTORY_BOUNDS,
+      tags: [
+        ["d", `${channelId}:active:${cursor ?? "head"}`],
+        ["h", channelId],
+      ],
+      content: JSON.stringify({
+        has_more: hasMore,
+        next_cursor: hasMore ? "cursor-2" : null,
+      }),
+      sig: "sig",
+    },
+  ];
+}
+
+async function renderDirectoryHarness({ invoke, onDirectory }) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  const originalSubscribeToReconnects =
+    relayClient.subscribeToReconnects.bind(relayClient);
+  const originalSubscribeToThreadDirectory =
+    relayClient.subscribeToThreadDirectory.bind(relayClient);
+  relayClient.subscribeToReconnects = () => () => {};
+  relayClient.subscribeToThreadDirectory = () =>
+    Promise.resolve(async () => {});
+  globalThis.window.__TAURI_INTERNALS__ = { invoke };
+  await act(async () => {
+    root.render(
+      React.createElement(
+        QueryClientProvider,
+        { client },
+        React.createElement(Harness, {
+          channelId: FIRST_CHANNEL_ID,
+          enabled: true,
+          onDirectory,
+        }),
+      ),
+    );
+  });
+  return async () => {
+    await act(async () => root.unmount());
+    relayClient.subscribeToReconnects = originalSubscribeToReconnects;
+    relayClient.subscribeToThreadDirectory = originalSubscribeToThreadDirectory;
+    delete globalThis.window.__TAURI_INTERNALS__;
+    client.clear();
+  };
+}
+
+test("a transient relay failure stays an error and never latches unsupported", async () => {
+  for (const message of [
+    "relay unreachable: request timed out",
+    "relay rate-limited: retry in 4s",
+    "relay returned 503 Service Unavailable",
+  ]) {
+    let currentDirectory;
+    const cleanup = await renderDirectoryHarness({
+      invoke() {
+        return Promise.reject(new Error(message));
+      },
+      onDirectory(directory) {
+        currentDirectory = directory;
+      },
+    });
+    try {
+      await waitForCondition(() => currentDirectory?.isError === true);
+      assert.equal(
+        currentDirectory.isUnsupported,
+        false,
+        `${message} must not be read as a missing feature`,
+      );
+      assert.match(currentDirectory.error.message, /relay/);
+    } finally {
+      await cleanup();
+    }
+  }
+});
+
+test("a later page failure keeps the working directory instead of falling back", async () => {
+  let currentDirectory;
+  let pageRequests = 0;
+  const cleanup = await renderDirectoryHarness({
+    invoke(_command, args) {
+      pageRequests += 1;
+      if (args.cursor === null) {
+        return Promise.resolve(
+          boundsResponse(args.channelId, { hasMore: true }),
+        );
+      }
+      return Promise.reject(new Error("relay returned 400: bad cursor"));
+    },
+    onDirectory(directory) {
+      currentDirectory = directory;
+    },
+  });
+  try {
+    await waitForCondition(() => currentDirectory?.isSuccess === true);
+    assert.equal(currentDirectory.isUnsupported, false);
+    await act(async () => {
+      await currentDirectory.fetchNextPage().catch(() => {});
+    });
+    await waitForCondition(() => pageRequests === 2);
+    assert.equal(
+      currentDirectory.isUnsupported,
+      false,
+      "page two failing must not discard a supported directory",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
 test("mounted directory hook disposes only its captured exact scope", async () => {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
