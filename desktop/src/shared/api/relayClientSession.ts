@@ -130,9 +130,11 @@ export class RelayClient {
       this.stabilityTimer = null;
     }
     this.stallWatchdog.stop();
-    // Community switch: the sidecar is bound to one community, so its socket
-    // and every subscription on it must go with the canonical session.
-    this.edge.reset();
+    // Community switch: the sidecar is bound to one community, so its socket,
+    // its subscriptions, and its binding all go with the canonical session.
+    // Deliberately no fail-over — these subscriptions are being discarded, not
+    // lost, and re-routing them would resurrect the old community's traffic.
+    this.edge.reset({ notifyLost: false });
     this.connectionGeneration++;
     this.keepAliveRequested = false;
     this.relayUrl = null;

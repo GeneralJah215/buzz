@@ -32,6 +32,8 @@ export type EdgeFrame =
   | { type: "challenge"; challenge: string }
   | { type: "auth-result"; accepted: boolean; message: string }
   | { type: "event"; subId: string; event: RelayEvent }
+  | { type: "closed"; subId: string; message: string }
+  | { type: "notice"; message: string }
   | { type: "other" };
 
 /**
@@ -68,6 +70,21 @@ export function classifyEdgeFrame(
   }
   if (type === "EVENT" && typeof rest[0] === "string" && rest[1]) {
     return { type: "event", subId: rest[0], event: rest[1] as RelayEvent };
+  }
+  // The sidecar refuses a REQ it cannot serve — an unselected channel, a
+  // not-yet-ready routing table, a local query failure. This is a rejection,
+  // not an absence of data, and the caller has to re-route rather than wait.
+  if (type === "CLOSED" && typeof rest[0] === "string") {
+    return {
+      type: "closed",
+      subId: rest[0],
+      message: typeof rest[1] === "string" ? rest[1] : "",
+    };
+  }
+  // A NOTICE is not subscription-scoped, so it cannot say which REQ was
+  // dropped. It still means this connection rejected something we sent.
+  if (type === "NOTICE" && typeof rest[0] === "string") {
+    return { type: "notice", message: rest[0] };
   }
   return { type: "other" };
 }

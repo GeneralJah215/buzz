@@ -95,12 +95,32 @@ export async function subscribeWithEdgeSplit(
   onEvent: (event: RelayEvent) => void,
 ): Promise<() => Promise<void>> {
   const split = edge.currentBinding() ? splitEdgeMessageFilter(filter) : null;
-  const edgeUnsubscribe = split
-    ? await edge.subscribe(split.edge, onEvent)
-    : null;
-  if (!split || !edgeUnsubscribe) {
-    return subscribeCanonical(port, filter, onEvent);
-  }
+  if (!split) return subscribeCanonical(port, filter, onEvent);
+
+  let disposed = false;
+  // Set when the edge half stops being served after it was accepted — the
+  // sidecar refused the REQ, or the socket dropped. Phase 1 has no edge
+  // reconnect, so canonical takes the message half over for good. Going quiet
+  // instead would be invisible: the canonical half keeps delivering reactions
+  // and edits while messages simply stop arriving.
+  let failover: Promise<() => Promise<void>> | null = null;
+  const onLost = () => {
+    if (disposed || failover) return;
+    failover = subscribeCanonical(port, split.edge, onEvent).catch(
+      // A failed failover leaves the channel without its message half, but
+      // there is nothing further to fall back to and throwing here would
+      // reject inside a socket callback.
+      () => async () => {},
+    );
+  };
+  const closeFailover = async () => {
+    const pending = failover;
+    failover = null;
+    if (pending) await (await pending)();
+  };
+
+  const edgeUnsubscribe = await edge.subscribe(split.edge, onEvent, onLost);
+  if (!edgeUnsubscribe) return subscribeCanonical(port, filter, onEvent);
 
   let canonicalUnsubscribe: (() => Promise<void>) | null = null;
   if (split.canonical) {
@@ -112,13 +132,18 @@ export async function subscribeWithEdgeSplit(
       );
     } catch (error) {
       // Never leave the edge half running alone: the caller asked for both.
+      disposed = true;
       await edgeUnsubscribe();
+      await closeFailover();
       throw error;
     }
   }
 
   return async () => {
+    disposed = true;
     await edgeUnsubscribe();
     await canonicalUnsubscribe?.();
+    // A failover may have opened while this unsubscribe was in flight.
+    await closeFailover();
   };
 }

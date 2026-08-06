@@ -37,15 +37,19 @@ function makeEdge({ binding = { communityId: "c" }, subscribe } = {}) {
   const calls = [];
   return {
     calls,
+    /** Fire the "this half is no longer served" signal for the Nth subscribe. */
+    lose: (index = 0) => calls[index].onLost(),
     edge: {
       currentBinding: () => binding,
-      subscribe: async (filter, onEvent) => {
-        calls.push({ filter, onEvent });
+      subscribe: async (filter, onEvent, onLost) => {
+        calls.push({ filter, onEvent, onLost });
         return subscribe ? subscribe(filter, onEvent) : async () => {};
       },
     },
   };
 }
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 test("an edge-eligible filter splits: kind 9 to the edge, the rest canonical", async () => {
   const { sent, port } = makePort();
@@ -167,6 +171,95 @@ test("unsubscribing closes both halves", async () => {
 
   assert.equal(edgeClosed, true);
   assert.equal(closed.length, 1);
+});
+
+test("a rejected edge half fails over to canonical instead of going quiet", async () => {
+  const { sent, port } = makePort();
+  const { lose, edge } = makeEdge();
+
+  await subscribeWithEdgeSplit(
+    port,
+    edge,
+    { kinds: [KIND_MESSAGE, 40099], "#h": [CHANNEL], limit: 50 },
+    () => {},
+  );
+  assert.equal(sent.length, 1, "only the canonical half so far");
+
+  // The sidecar refused the REQ, or the socket dropped.
+  lose();
+  await flush();
+
+  assert.equal(sent.length, 2, "the message half must be re-routed");
+  assert.deepEqual(sent[1].filter.kinds, [KIND_MESSAGE]);
+});
+
+test("a message-only subscription still recovers when the edge drops it", async () => {
+  const { sent, port } = makePort();
+  const { lose, edge } = makeEdge();
+
+  await subscribeWithEdgeSplit(
+    port,
+    edge,
+    { kinds: [KIND_MESSAGE], "#h": [CHANNEL], limit: 50 },
+    () => {},
+  );
+  assert.equal(sent.length, 0);
+
+  lose();
+  await flush();
+
+  assert.deepEqual(sent[0].filter.kinds, [KIND_MESSAGE]);
+});
+
+test("a repeated loss signal does not open a second canonical subscription", async () => {
+  const { sent, port } = makePort();
+  const { lose, edge } = makeEdge();
+
+  await subscribeWithEdgeSplit(
+    port,
+    edge,
+    { kinds: [KIND_MESSAGE], "#h": [CHANNEL], limit: 50 },
+    () => {},
+  );
+  lose();
+  lose();
+  await flush();
+
+  assert.equal(sent.length, 1);
+});
+
+test("a loss after unsubscribe opens nothing", async () => {
+  const { sent, port } = makePort();
+  const { lose, edge } = makeEdge();
+
+  const unsubscribe = await subscribeWithEdgeSplit(
+    port,
+    edge,
+    { kinds: [KIND_MESSAGE], "#h": [CHANNEL], limit: 50 },
+    () => {},
+  );
+  await unsubscribe();
+  lose();
+  await flush();
+
+  assert.equal(sent.length, 0, "a disposed subscription must not resurrect");
+});
+
+test("unsubscribing after a failover closes the failover too", async () => {
+  const { sent, closed, port } = makePort();
+  const { lose, edge } = makeEdge();
+
+  const unsubscribe = await subscribeWithEdgeSplit(
+    port,
+    edge,
+    { kinds: [KIND_MESSAGE], "#h": [CHANNEL], limit: 50 },
+    () => {},
+  );
+  lose();
+  await flush();
+  await unsubscribe();
+
+  assert.deepEqual(closed, [sent[0].subId], "the failover must not leak");
 });
 
 test("canonical subscribe registers, sends, and cleans up on unsubscribe", async () => {

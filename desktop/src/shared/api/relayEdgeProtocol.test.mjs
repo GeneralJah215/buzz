@@ -132,12 +132,42 @@ test("EVENT frames carry the subscription id and payload", () => {
   });
 });
 
-test("NOTICE, CLOSED, malformed, and empty frames are inert", () => {
+test("CLOSED is a rejection, not silence", () => {
+  // lib.rs answers CLOSED when a channel is not selected, the routing table is
+  // not ready, the sub id is duplicated, or the local query fails. Treating it
+  // as inert leaves the channel with no message half and no error.
+  assert.deepEqual(
+    classifyEdgeFrame(
+      ["CLOSED", "edge-1", "restricted: channel is not selected"],
+      null,
+    ),
+    {
+      type: "closed",
+      subId: "edge-1",
+      message: "restricted: channel is not selected",
+    },
+  );
+});
+
+test("NOTICE is surfaced so a dropped REQ is not mistaken for quiet", () => {
+  assert.deepEqual(
+    classifyEdgeFrame(
+      ["NOTICE", "binding-required: complete BUZZ-EDGE BIND first"],
+      null,
+    ),
+    {
+      type: "notice",
+      message: "binding-required: complete BUZZ-EDGE BIND first",
+    },
+  );
+});
+
+test("malformed and empty frames are inert", () => {
   for (const frame of [
-    ["NOTICE", "binding-required: complete BUZZ-EDGE BIND first"],
-    ["CLOSED", "edge-1", "nope"],
     ["EVENT", "edge-1"],
     ["AUTH"],
+    ["CLOSED"],
+    ["NOTICE"],
     [],
     null,
     "not an array",

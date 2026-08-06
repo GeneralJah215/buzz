@@ -58,9 +58,16 @@ export class RelayEdgeClient {
     timeout: number;
   } | null = null;
   private authEventId: string | null = null;
+  /** True only once BIND and AUTH have both completed. A REQ before that is
+   * answered with a NOTICE and dropped, so `wsId` alone is not "usable". */
+  private ready = false;
   private subscriptions = new Map<
     string,
-    { filter: RelaySubscriptionFilter; onEvent: (event: RelayEvent) => void }
+    {
+      filter: RelaySubscriptionFilter;
+      onEvent: (event: RelayEvent) => void;
+      onLost: () => void;
+    }
   >();
 
   /**
@@ -77,7 +84,9 @@ export class RelayEdgeClient {
       next = null;
     }
     if (!sameBinding(this.binding, next)) {
-      this.reset();
+      // Teardown, not loss: the old community's subscriptions must not fail
+      // over to canonical, because the whole session is being replaced.
+      this.reset({ notifyLost: false });
       this.binding = next;
     }
     return this.binding;
@@ -92,15 +101,23 @@ export class RelayEdgeClient {
    * Subscribe one already-split, edge-eligible filter. Returns an unsubscribe
    * function, or null when the edge is unavailable — null is the caller's
    * signal to route the whole filter canonically.
+   *
+   * `onLost` fires when this subscription stops being served after it was
+   * accepted: the sidecar answered CLOSED for it, or the socket dropped. The
+   * caller MUST re-route to canonical on that signal. Without it the channel
+   * simply goes quiet, which is the worst possible failure here — the UI still
+   * looks connected because the canonical half keeps delivering reactions and
+   * edits while messages stop.
    */
   async subscribe(
     filter: RelaySubscriptionFilter,
     onEvent: (event: RelayEvent) => void,
+    onLost: () => void,
   ): Promise<(() => Promise<void>) | null> {
     if (!(await this.ensureConnected())) return null;
 
     const subId = `edge-${crypto.randomUUID()}`;
-    this.subscriptions.set(subId, { filter, onEvent });
+    this.subscriptions.set(subId, { filter, onEvent, onLost });
     try {
       await this.send(["REQ", subId, filter]);
     } catch {
@@ -113,9 +130,21 @@ export class RelayEdgeClient {
     };
   }
 
-  /** Close the socket and forget every subscription. Fail-closed teardown. */
-  reset() {
+  /**
+   * Close the socket and forget every subscription.
+   *
+   * `notifyLost` distinguishes the two reasons this happens. A dropped socket
+   * loses subscriptions the caller still wants, so each one is told to fail
+   * over to canonical. An explicit teardown — community switch, rebind — is
+   * discarding those subscriptions on purpose, and failing them over would
+   * resurrect the previous community's traffic on the canonical relay.
+   */
+  reset({ notifyLost = false }: { notifyLost?: boolean } = {}) {
     this.generation += 1;
+    this.ready = false;
+    const lost = notifyLost
+      ? [...this.subscriptions.values()].map((entry) => entry.onLost)
+      : [];
     this.subscriptions.clear();
     this.rejectHandshake(new Error("Edge session was reset."));
     if (this.challengeWaiter) {
@@ -128,18 +157,27 @@ export class RelayEdgeClient {
     this.messageChannel = null;
     const wsId = this.wsId;
     this.wsId = null;
+    // A stale binding is a live cross-community hazard: `currentBinding()` is
+    // read synchronously when a subscription opens, and re-reading it is an
+    // async round trip that the next subscribe may not have made yet.
+    this.binding = null;
     if (wsId !== null) void closeWebSocket(wsId, "edge session reset");
+    for (const notify of lost) notify();
   }
 
   private async ensureConnected(): Promise<boolean> {
-    if (this.wsId !== null) return true;
+    // Connect-in-flight is checked FIRST. A socket exists well before the
+    // handshake completes, and a REQ sent in that window is dropped by the
+    // sidecar with a NOTICE.
+    if (this.connecting) return this.connecting;
+    if (this.ready) return true;
     if (!this.binding && !(await this.rebind())) return false;
-    if (!this.connecting) {
-      this.connecting = this.connect().finally(() => {
-        this.connecting = null;
-      });
-    }
-    return this.connecting;
+    const attempt = this.connect().finally(() => {
+      // Identity-guarded: a reset may have already installed a newer attempt.
+      if (this.connecting === attempt) this.connecting = null;
+    });
+    this.connecting = attempt;
+    return attempt;
   }
 
   private async connect(): Promise<boolean> {
@@ -166,9 +204,12 @@ export class RelayEdgeClient {
       }
       this.wsId = wsId;
       await this.performHandshake(binding, generation);
-      return this.wsId !== null;
+      if (generation !== this.generation) return false;
+      this.ready = true;
+      return true;
     } catch {
       // Never surface an edge failure. The caller falls back to canonical.
+      // Nothing was accepted yet, so there is nothing to fail over.
       if (generation === this.generation) this.reset();
       return false;
     }
@@ -238,7 +279,9 @@ export class RelayEdgeClient {
   private handleMessage(message: unknown, generation: number) {
     if (generation !== this.generation) return;
     if (isWebSocketClose(message) || isWebSocketError(message)) {
-      this.reset();
+      // The socket carried subscriptions the caller still wants. There is no
+      // edge reconnect in phase 1, so canonical is the recovery path.
+      this.reset({ notifyLost: true });
       return;
     }
     const payload = getTextPayload(message);
@@ -274,9 +317,26 @@ export class RelayEdgeClient {
       case "event":
         this.subscriptions.get(frame.subId)?.onEvent(frame.event);
         return;
+      case "closed":
+        this.loseSubscription(frame.subId);
+        return;
+      case "notice":
+        // Not subscription-scoped, so the safe reading is that this connection
+        // rejected something we sent. Anything already accepted on it is
+        // suspect; drop the session and let every half fail over.
+        this.reset({ notifyLost: true });
+        return;
       default:
         return;
     }
+  }
+
+  /** Hand one rejected subscription back to the caller for canonical re-route. */
+  private loseSubscription(subId: string) {
+    const entry = this.subscriptions.get(subId);
+    if (!entry) return;
+    this.subscriptions.delete(subId);
+    entry.onLost();
   }
 
   private acceptChallenge(challenge: string) {

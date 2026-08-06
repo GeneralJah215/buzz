@@ -1,6 +1,5 @@
 import { KIND_STREAM_MESSAGE } from "@/shared/constants/kinds";
 import { invokeTauri } from "@/shared/api/tauri";
-import type { RelayEvent } from "@/shared/api/types";
 import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 
 /**
@@ -46,15 +45,6 @@ export function splitEdgeMessageFilter(
     canonical:
       canonicalKinds.length > 0 ? { ...filter, kinds: canonicalKinds } : null,
   };
-}
-
-export function mergeRelayEvents(
-  edge: RelayEvent[],
-  canonical: RelayEvent[],
-): RelayEvent[] {
-  const unique = new Map<string, RelayEvent>();
-  for (const event of [...edge, ...canonical]) unique.set(event.id, event);
-  return [...unique.values()].sort((a, b) => b.created_at - a.created_at);
 }
 
 function isUuid(value: unknown): value is string {
