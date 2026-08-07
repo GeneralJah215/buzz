@@ -521,11 +521,57 @@ fn advance_query_cursor(
 pub struct BuzzClient {
     http: reqwest::Client,
     relay_url: String, // base URL, no trailing slash, e.g. "https://relay.buzz.place"
+    edge_route: Option<EdgeRoute>,
     keys: Keys,
     /// Optional NIP-OA auth tag injected into every signed event.
     auth_tag: Option<Tag>,
     /// Raw JSON of the auth tag for the `x-auth-tag` HTTP header.
     auth_tag_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EdgeRoute {
+    relay_url: String,
+    canonical_origin: String,
+    community_id: uuid::Uuid,
+}
+
+impl EdgeRoute {
+    fn from_env(canonical_relay_url: &str) -> Option<Self> {
+        let edge_url = std::env::var("BUZZ_EDGE_RELAY_URL").ok()?;
+        let community_id = std::env::var("BUZZ_COMMUNITY_ID")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Self::new(&edge_url, canonical_relay_url, community_id)
+    }
+
+    fn new(edge_url: &str, canonical_relay_url: &str, community_id: uuid::Uuid) -> Option<Self> {
+        let parsed = url::Url::parse(edge_url.trim()).ok()?;
+        let is_loopback = match parsed.host() {
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+            None => false,
+        };
+        if !matches!(parsed.scheme(), "ws" | "http")
+            || !is_loopback
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || (parsed.path() != "" && parsed.path() != "/")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+
+        Some(Self {
+            relay_url: normalize_relay_url(parsed.as_str()),
+            canonical_origin: to_ws_url(canonical_relay_url),
+            community_id,
+        })
+    }
 }
 
 impl BuzzClient {
@@ -538,11 +584,35 @@ impl BuzzClient {
     /// - `BUZZ_TIMEOUT_SECS` — per-request total timeout (default 30 s)
     ///
     /// A value of zero for either variable is treated as invalid and falls back to the default.
+    #[allow(dead_code)]
     pub fn new(
         relay_url: String,
         keys: Keys,
         auth_tag: Option<Tag>,
         auth_tag_json: Option<String>,
+    ) -> Result<Self, CliError> {
+        Self::new_with_edge_route(relay_url, keys, auth_tag, auth_tag_json, None)
+    }
+
+    /// Create a client with the optional local kind-9 route supplied by the
+    /// managed environment. Incomplete or invalid edge configuration leaves
+    /// the client canonical-only.
+    pub fn new_with_edge_from_env(
+        relay_url: String,
+        keys: Keys,
+        auth_tag: Option<Tag>,
+        auth_tag_json: Option<String>,
+    ) -> Result<Self, CliError> {
+        let edge_route = EdgeRoute::from_env(&relay_url);
+        Self::new_with_edge_route(relay_url, keys, auth_tag, auth_tag_json, edge_route)
+    }
+
+    fn new_with_edge_route(
+        relay_url: String,
+        keys: Keys,
+        auth_tag: Option<Tag>,
+        auth_tag_json: Option<String>,
+        edge_route: Option<EdgeRoute>,
     ) -> Result<Self, CliError> {
         let http = reqwest::Client::builder()
             .timeout(env_duration_secs("BUZZ_TIMEOUT_SECS", 30))
@@ -552,6 +622,7 @@ impl BuzzClient {
         Ok(Self {
             http,
             relay_url,
+            edge_route,
             keys,
             auth_tag,
             auth_tag_json,
@@ -771,6 +842,20 @@ impl BuzzClient {
     /// Execute a one-shot query with multiple filters via the HTTP bridge.
     /// Each filter is ORed by the relay (standard Nostr REQ behavior).
     pub async fn query_multi(&self, filters: &[serde_json::Value]) -> Result<String, CliError> {
+        if filters_are_edge_message_only(filters) {
+            if let Some(edge) = self.edge_route.as_ref() {
+                if let Ok(response) = self.edge_bridge_post(edge, "/query", filters).await {
+                    return Ok(response);
+                }
+            }
+        }
+        self.query_multi_canonical(filters).await
+    }
+
+    async fn query_multi_canonical(
+        &self,
+        filters: &[serde_json::Value],
+    ) -> Result<String, CliError> {
         let url = format!("{}/query", self.relay_url);
         let body = bytes::Bytes::from(
             serde_json::to_vec(filters)
@@ -801,6 +886,20 @@ impl BuzzClient {
     /// Returns the count as a JSON string.
     #[allow(dead_code)]
     pub async fn count(&self, filter: &serde_json::Value) -> Result<String, CliError> {
+        if filters_are_edge_message_only(std::slice::from_ref(filter)) {
+            if let Some(edge) = self.edge_route.as_ref() {
+                if let Ok(response) = self
+                    .edge_bridge_post(edge, "/count", std::slice::from_ref(filter))
+                    .await
+                {
+                    return Ok(response);
+                }
+            }
+        }
+        self.count_canonical(filter).await
+    }
+
+    async fn count_canonical(&self, filter: &serde_json::Value) -> Result<String, CliError> {
         let url = format!("{}/count", self.relay_url);
         let body = bytes::Bytes::from(
             serde_json::to_vec(&[filter])
@@ -862,11 +961,73 @@ impl BuzzClient {
     /// All other event kinds retain the standard retry policy.
     pub async fn submit_event(&self, event: nostr::Event) -> Result<String, CliError> {
         let kind = event.kind.as_u16();
-        if is_moderation_kind(kind) {
+        if kind == 9 {
+            if let Some(edge) = self.edge_route.as_ref() {
+                if let Ok(response) = self.edge_submit_event(edge, &event).await {
+                    return Ok(response);
+                }
+            }
+            self.submit_stored_event(event).await
+        } else if is_moderation_kind(kind) {
             self.submit_moderation_event(event).await
         } else {
             self.submit_stored_event(event).await
         }
+    }
+
+    async fn edge_bridge_post(
+        &self,
+        edge: &EdgeRoute,
+        path: &str,
+        filters: &[serde_json::Value],
+    ) -> Result<String, CliError> {
+        let url = format!("{}{path}", edge.relay_url);
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(filters)
+                .map_err(|e| CliError::Other(format!("filter serialization failed: {e}")))?,
+        );
+        let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+        let request = self
+            .with_auth_tag(
+                self.http
+                    .post(&url)
+                    .timeout(Duration::from_secs(2))
+                    .header("Authorization", auth)
+                    .header("Content-Type", "application/json")
+                    .header("x-buzz-canonical-origin", &edge.canonical_origin)
+                    .header("x-buzz-community-id", edge.community_id.to_string())
+                    .body(body),
+            )
+            .send()
+            .await?;
+        self.handle_response(request).await
+    }
+
+    async fn edge_submit_event(
+        &self,
+        edge: &EdgeRoute,
+        event: &nostr::Event,
+    ) -> Result<String, CliError> {
+        let url = format!("{}/events", edge.relay_url);
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(event)
+                .map_err(|e| CliError::Other(format!("event serialization failed: {e}")))?,
+        );
+        let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+        let request = self
+            .with_auth_tag(
+                self.http
+                    .post(&url)
+                    .timeout(Duration::from_secs(2))
+                    .header("Authorization", auth)
+                    .header("Content-Type", "application/json")
+                    .header("x-buzz-canonical-origin", &edge.canonical_origin)
+                    .header("x-buzz-community-id", edge.community_id.to_string())
+                    .body(body),
+            )
+            .send()
+            .await?;
+        self.handle_response(request).await
     }
 
     /// Submit a moderation command (kinds 9040–9044) with non-idempotent retry policy.
@@ -1300,6 +1461,31 @@ fn to_ws_url(http_url: &str) -> String {
     http_url
         .replace("https://", "wss://")
         .replace("http://", "ws://")
+}
+
+fn filters_are_edge_message_only(filters: &[serde_json::Value]) -> bool {
+    !filters.is_empty()
+        && filters.iter().all(|filter| {
+            let Some(object) = filter.as_object() else {
+                return false;
+            };
+            let kinds_are_message_only = object
+                .get("kinds")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|kinds| kinds.len() == 1 && kinds[0].as_u64() == Some(9));
+            let channels_are_scoped = object
+                .get("#h")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|channels| {
+                    !channels.is_empty()
+                        && channels.iter().all(|channel| {
+                            channel
+                                .as_str()
+                                .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
+                        })
+                });
+            kinds_are_message_only && channels_are_scoped
+        })
 }
 
 /// Normalize raw event JSON array into consistent shape.
@@ -2297,6 +2483,177 @@ mod retry_policy_tests {
             3,
             "all 3 attempts must fire before surfacing DeliveryUnknown"
         );
+    }
+}
+
+#[cfg(test)]
+mod edge_routing_tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, Response, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use tokio::net::TcpListener;
+    use uuid::Uuid;
+
+    use super::{BuzzClient, EdgeRoute};
+
+    #[derive(Clone)]
+    struct Captures {
+        requests: Arc<Mutex<Vec<(String, HeaderMap)>>>,
+        status: StatusCode,
+    }
+
+    async fn test_server(status: StatusCode) -> (String, Arc<Mutex<Vec<(String, HeaderMap)>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = Captures {
+            requests: Arc::clone(&requests),
+            status,
+        };
+        let app = Router::new()
+            .route(
+                "/query",
+                post(
+                    |State(state): State<Captures>, headers: HeaderMap, _body: Body| async move {
+                        state
+                            .requests
+                            .lock()
+                            .unwrap()
+                            .push(("/query".to_string(), headers));
+                        Response::builder()
+                            .status(state.status)
+                            .header("content-type", "application/json")
+                            .body(Body::from(if state.status.is_success() {
+                                "[]"
+                            } else {
+                                r#"{"error":"binding rejected"}"#
+                            }))
+                            .unwrap()
+                    },
+                ),
+            )
+            .route(
+                "/events",
+                post(
+                    |State(state): State<Captures>, headers: HeaderMap, _body: Body| async move {
+                        state
+                            .requests
+                            .lock()
+                            .unwrap()
+                            .push(("/events".to_string(), headers));
+                        Response::builder()
+                            .status(state.status)
+                            .header("content-type", "application/json")
+                            .body(Body::from(if state.status.is_success() {
+                                r#"{"event_id":"accepted","accepted":true,"message":""}"#
+                            } else {
+                                r#"{"error":"binding rejected"}"#
+                            }))
+                            .unwrap()
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), requests)
+    }
+
+    fn routed_client(canonical: &str, edge: &str, community: Uuid) -> BuzzClient {
+        let route = EdgeRoute::new(edge, canonical, community).expect("valid edge route");
+        BuzzClient::new_with_edge_route(
+            canonical.to_string(),
+            Keys::generate(),
+            None,
+            None,
+            Some(route),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn kind_nine_query_uses_bound_edge_and_non_message_query_stays_canonical() {
+        let (canonical, canonical_requests) = test_server(StatusCode::OK).await;
+        let (edge, edge_requests) = test_server(StatusCode::OK).await;
+        let community = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        let client = routed_client(&canonical, &edge, community);
+
+        client
+            .query(&serde_json::json!({"kinds":[9], "#h":[channel]}))
+            .await
+            .unwrap();
+        client
+            .query(&serde_json::json!({"kinds":[39000], "#d":[channel]}))
+            .await
+            .unwrap();
+
+        let edge_requests = edge_requests.lock().unwrap();
+        assert_eq!(edge_requests.len(), 1);
+        assert_eq!(edge_requests[0].0, "/query");
+        assert_eq!(
+            edge_requests[0].1["x-buzz-community-id"],
+            community.to_string()
+        );
+        assert_eq!(
+            edge_requests[0].1["x-buzz-canonical-origin"],
+            super::to_ws_url(&canonical)
+        );
+        let canonical_requests = canonical_requests.lock().unwrap();
+        assert_eq!(canonical_requests.len(), 1);
+        assert_eq!(canonical_requests[0].0, "/query");
+    }
+
+    #[tokio::test]
+    async fn edge_rejection_falls_back_to_canonical_without_routing_non_kind_nine_writes() {
+        let (canonical, canonical_requests) = test_server(StatusCode::OK).await;
+        let (edge, edge_requests) = test_server(StatusCode::MISDIRECTED_REQUEST).await;
+        let community = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        let client = routed_client(&canonical, &edge, community);
+        let message = EventBuilder::new(Kind::Custom(9), "hello")
+            .tags([Tag::parse(["h", channel.to_string().as_str()]).unwrap()])
+            .sign_with_keys(client.keys())
+            .unwrap();
+        client.submit_event(message).await.unwrap();
+
+        let metadata = EventBuilder::new(Kind::Metadata, "{}")
+            .sign_with_keys(client.keys())
+            .unwrap();
+        client.submit_event(metadata).await.unwrap();
+
+        let edge_requests = edge_requests.lock().unwrap();
+        assert_eq!(edge_requests.len(), 1);
+        assert_eq!(edge_requests[0].0, "/events");
+        let canonical_requests = canonical_requests.lock().unwrap();
+        assert_eq!(
+            canonical_requests
+                .iter()
+                .filter(|(path, _)| path == "/events")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn edge_route_requires_a_plain_loopback_origin() {
+        let community = Uuid::new_v4();
+        assert!(
+            EdgeRoute::new("ws://127.0.0.1:3031", "https://relay.example", community).is_some()
+        );
+        assert!(
+            EdgeRoute::new("wss://127.0.0.1:3031", "https://relay.example", community).is_none()
+        );
+        assert!(EdgeRoute::new(
+            "ws://relay.example:3031",
+            "https://relay.example",
+            community
+        )
+        .is_none());
     }
 }
 

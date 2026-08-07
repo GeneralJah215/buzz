@@ -6524,6 +6524,7 @@ mod tests {
                 base_url: "http://127.0.0.1:0".to_string(),
                 keys: agent_keys.clone(),
                 auth_tag_json: None,
+                edge_binding: None,
             },
             channel_info: ChannelInfoResolver::new(
                 std::collections::HashMap::new(),
@@ -6532,6 +6533,7 @@ mod tests {
                     base_url: "http://127.0.0.1:0".to_string(),
                     keys: agent_keys.clone(),
                     auth_tag_json: None,
+                    edge_binding: None,
                 },
             ),
             context_message_limit: 0,
@@ -6894,6 +6896,7 @@ mod tests {
             base_url,
             keys: nostr::Keys::generate(),
             auth_tag_json: None,
+            edge_binding: None,
         };
         (
             ChannelInfoResolver::new(std::collections::HashMap::new(), rest),

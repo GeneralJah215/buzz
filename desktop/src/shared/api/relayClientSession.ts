@@ -30,6 +30,11 @@ import {
   handleSubscriptionEose,
   prepareSubscriptionEvent,
 } from "@/shared/api/relayClosedRecovery";
+import { RelayEdgeClient } from "@/shared/api/relayEdgeSession";
+import {
+  subscribeWithEdgeSplit,
+  type LiveSubscriptionPort,
+} from "@/shared/api/relayLiveSubscription";
 import { replayLiveSubscriptions } from "@/shared/api/relayReconnectReplay";
 import {
   activateRateLimit,
@@ -94,6 +99,8 @@ export class RelayClient {
   private stabilityTimer: number | null = null;
   private visibleChannelId: string | null = null;
   private authOkTracker = new AuthOkTracker();
+  /** Loopback message lane. Inert unless a sidecar binding resolves. */
+  private edge = new RelayEdgeClient();
   private terminal = false;
 
   private connectionStateEmitter = new RelayConnectionStateEmitter("idle");
@@ -122,6 +129,11 @@ export class RelayClient {
       this.stabilityTimer = null;
     }
     this.stallWatchdog.stop();
+    // Community switch: the sidecar is bound to one community, so its socket,
+    // its subscriptions, and its binding all go with the canonical session.
+    // Deliberately no fail-over — these subscriptions are being discarded, not
+    // lost, and re-routing them would resurrect the old community's traffic.
+    this.edge.reset({ notifyLost: false });
     this.connectionGeneration++;
     this.keepAliveRequested = false;
     this.relayUrl = null;
@@ -428,6 +440,9 @@ export class RelayClient {
     this.terminal = false;
     this.authOkTracker.reset();
     this.keepAliveRequested = true;
+    // Re-evaluate the §14 binding here, not lazily: this is the one call site
+    // a community switch always passes through.
+    await this.edge.rebind();
     await this.connectBypassingBackoff();
   }
 
@@ -600,50 +615,19 @@ export class RelayClient {
     filter: RelaySubscriptionFilter,
     onEvent: (event: RelayEvent) => void,
   ) {
-    await this.ensureConnected();
+    return subscribeWithEdgeSplit(this.livePort, this.edge, filter, onEvent);
+  }
 
-    const subId = `live-${crypto.randomUUID()}`;
-    let resolveReady = () => {
-      return;
-    };
-    const ready = new Promise<void>((resolve) => {
-      resolveReady = () => {
-        window.clearTimeout(fallbackTimeout);
-        resolve();
-      };
-    });
-    const fallbackTimeout = window.setTimeout(() => {
-      resolveReady();
-    }, 250);
-
-    this.subscriptions.set(subId, {
-      mode: "live",
-      filter,
-      onEvent,
-      resolveReady,
-    });
-
-    try {
-      await this.sendRawWithReconnectRetry(
-        ["REQ", subId, filter],
-        "Failed to restore relay subscription.",
-      );
-    } catch (error) {
-      window.clearTimeout(fallbackTimeout);
-      this.subscriptions.delete(subId);
-      throw error;
-    }
-    await ready;
-
-    return async () => {
-      const active = this.subscriptions.get(subId);
-      if (active?.mode !== "live") {
-        return;
-      }
-
-      this.subscriptions.delete(subId);
-      clearClosedRetry(active);
-      await this.closeSubscription(subId);
+  private get livePort(): LiveSubscriptionPort {
+    return {
+      ensureConnected: () => this.ensureConnected(),
+      subscriptions: this.subscriptions,
+      sendReq: (subId, filter) =>
+        this.sendRawWithReconnectRetry(
+          ["REQ", subId, filter],
+          "Failed to restore relay subscription.",
+        ),
+      closeSubscription: (subId) => this.closeSubscription(subId),
     };
   }
 

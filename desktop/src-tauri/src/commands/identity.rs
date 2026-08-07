@@ -105,6 +105,13 @@ pub fn get_relay_ws_url(state: State<'_, AppState>) -> String {
 }
 
 #[tauri::command]
+pub fn get_edge_relay_binding(
+    state: State<'_, AppState>,
+) -> Option<crate::relay::EdgeRelayBinding> {
+    crate::relay::edge_relay_binding(&state)
+}
+
+#[tauri::command]
 pub fn get_relay_http_url(state: State<'_, AppState>) -> String {
     relay_api_base_url_with_override(&state)
 }

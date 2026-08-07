@@ -1,0 +1,47 @@
+[package]
+name = "buzz-edge"
+description = "Loopback continuity relay for Buzz channel messages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "buzz_edge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buzz-edge"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+base64 = { workspace = true }
+buzz-auth = { workspace = true }
+buzz-core = { workspace = true }
+buzz-sdk = { workspace = true }
+buzz-ws-client = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+nostr = { workspace = true }
+parking_lot = "0.12"
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native", "vendored"] }

@@ -2,6 +2,7 @@
 
 mod acp;
 mod config;
+mod edge;
 mod engram_fetch;
 mod filter;
 mod observer;
@@ -4317,6 +4318,17 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                     });
                 }
             }
+            // The nested Buzz CLI shares ACP's optional edge route and binding.
+            for name in ["BUZZ_EDGE_RELAY_URL", "BUZZ_COMMUNITY_ID"] {
+                if let Ok(value) = std::env::var(name) {
+                    if !value.is_empty() {
+                        env.push(EnvVar {
+                            name: name.into(),
+                            value,
+                        });
+                    }
+                }
+            }
             // Forward the agent's display name so dev-mcp can use it as the git
             // author name instead of the raw npub. Read from the process env
             // rather than Config: this is a pass-through of a contract owned
@@ -4530,6 +4542,7 @@ mod author_gate_tests {
             base_url: "http://localhost:0".into(),
             keys: nostr::Keys::generate(),
             auth_tag_json: None,
+            edge_binding: None,
         }
     }
 
@@ -4828,6 +4841,7 @@ mod author_gate_tests {
             base_url,
             keys: nostr::Keys::generate(),
             auth_tag_json: None,
+            edge_binding: None,
         };
         (
             pool::ChannelInfoResolver::new(HashMap::new(), rest),
@@ -5174,6 +5188,27 @@ mod build_mcp_servers_tests {
             "BUZZ_AUTH_TAG should be forwarded when set"
         );
         assert_eq!(auth_tag_env.unwrap().value, "test-attestation-tag");
+    }
+
+    #[test]
+    fn session_new_mcp_server_forwards_edge_binding_as_a_pair() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BUZZ_EDGE_RELAY_URL", "ws://127.0.0.1:3031");
+        std::env::set_var("BUZZ_COMMUNITY_ID", "550e8400-e29b-41d4-a716-446655440000");
+        let servers = build_mcp_servers(&test_config());
+        std::env::remove_var("BUZZ_EDGE_RELAY_URL");
+        std::env::remove_var("BUZZ_COMMUNITY_ID");
+
+        let env: std::collections::HashMap<_, _> = servers[0]
+            .env
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.value.as_str()))
+            .collect();
+        assert_eq!(env.get("BUZZ_EDGE_RELAY_URL"), Some(&"ws://127.0.0.1:3031"));
+        assert_eq!(
+            env.get("BUZZ_COMMUNITY_ID"),
+            Some(&"550e8400-e29b-41d4-a716-446655440000")
+        );
     }
 
     #[test]

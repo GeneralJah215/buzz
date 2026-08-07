@@ -215,6 +215,7 @@ export function useCommunityInit(
       // legacy entries; this site refuses to apply one even if present.
       try {
         await applyCommunity(
+          activeCommunity.id,
           activeCommunity.relayUrl,
           undefined,
           activeCommunity.token,

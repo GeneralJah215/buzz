@@ -156,11 +156,17 @@ _ensure-sidecar-stubs:
     TARGET=$(rustc -vV | sed -n 's|host: ||p')
     mkdir -p desktop/src-tauri/binaries
     SIDECARS=(buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz)
-    if [[ "$TARGET" != *windows* ]]; then
+    # Tauri resolves an externalBin as `<name>-<triple><EXE_SUFFIX>`, so on
+    # Windows the stub needs `.exe` or the build fails with
+    # "resource path ... doesn't exist" as if this recipe had never run.
+    EXE=""
+    if [[ "$TARGET" == *windows* ]]; then
+        EXE=".exe"
+    else
         SIDECARS+=(buzz-backend-kubernetes)
     fi
     for bin in "${SIDECARS[@]}"; do
-        touch "desktop/src-tauri/binaries/${bin}-${TARGET}"
+        touch "desktop/src-tauri/binaries/${bin}-${TARGET}${EXE}"
     done
 
 # Ensure Docker dev services (Postgres, Redis, etc.) are running and healthy
@@ -237,14 +243,18 @@ desktop-release-build target="aarch64-apple-darwin":
     set -euo pipefail
     TARGET={{target}}
     mkdir -p desktop/src-tauri/binaries
-    touch "desktop/src-tauri/binaries/buzz-acp-$TARGET"
-    touch "desktop/src-tauri/binaries/buzz-agent-$TARGET"
-    if [[ "$TARGET" != *windows* ]]; then
+    # Same `.exe` rule as _ensure-sidecar-stubs; see the comment there.
+    EXE=""
+    if [[ "$TARGET" == *windows* ]]; then
+        EXE=".exe"
+    else
         touch "desktop/src-tauri/binaries/buzz-backend-kubernetes-$TARGET"
     fi
-    touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET"
-    touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
-    touch "desktop/src-tauri/binaries/buzz-$TARGET"
+    touch "desktop/src-tauri/binaries/buzz-acp-$TARGET$EXE"
+    touch "desktop/src-tauri/binaries/buzz-agent-$TARGET$EXE"
+    touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET$EXE"
+    touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET$EXE"
+    touch "desktop/src-tauri/binaries/buzz-$TARGET$EXE"
     pnpm install
     cd {{desktop_dir}} && pnpm tauri build --features mesh-llm --target {{target}}
 
@@ -306,6 +316,9 @@ test-unit:
         # because nothing in CI runs `cargo test --workspace` — workspace
         # membership alone buys clippy/check, not a single executed test.
         cargo nextest run -p buzz-backend-kubernetes
+        # Local continuity sidecar: protocol, SQLite durability, authorization
+        # lease, and loopback fan-out are all infra-free.
+        cargo nextest run -p buzz-edge
     else
         ./scripts/run-tests.sh unit
     fi

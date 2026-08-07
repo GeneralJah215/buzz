@@ -24,6 +24,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
+use crate::edge::{filters_are_message_only, EdgeBinding};
+
 /// Default capacity of the event channel from background task to harness.
 /// Override with `BUZZ_ACP_EVENT_BUFFER` env var at startup.
 const EVENT_CHANNEL_CAPACITY_DEFAULT: usize = 256;
@@ -236,6 +238,8 @@ pub struct RestClient {
     pub keys: Keys,
     /// Optional NIP-OA auth tag JSON for `x-auth-tag` header (relay membership delegation).
     pub auth_tag_json: Option<String>,
+    /// Optional loopback route for persistent kind-9 channel traffic.
+    pub(crate) edge_binding: Option<EdgeBinding>,
 }
 
 /// Whether an HTTP status code is retriable (transient server/rate-limit errors).
@@ -392,6 +396,41 @@ impl RestClient {
         .await
     }
 
+    /// Single-attempt edge request. Any failure falls back to canonical at the
+    /// call site; retries remain the canonical bridge's responsibility.
+    async fn edge_bridge_post(
+        &self,
+        edge: &EdgeBinding,
+        path: &str,
+        body_bytes: &[u8],
+    ) -> Result<reqwest::Response, RelayError> {
+        let url = format!("{}{}", edge.http_url(), path);
+        let auth = self.nip98_header("POST", &url, Some(body_bytes))?;
+        let mut request = self
+            .http
+            .post(&url)
+            .timeout(Duration::from_secs(2))
+            .header("Authorization", auth)
+            .header("Content-Type", "application/json")
+            .header("x-buzz-canonical-origin", edge.canonical_origin())
+            .header("x-buzz-community-id", edge.community_id().to_string());
+        if let Some(ref tag) = self.auth_tag_json {
+            request = request.header("x-auth-tag", tag);
+        }
+        let response = request
+            .body(body_bytes.to_vec())
+            .send()
+            .await
+            .map_err(|error| RelayError::Http(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(RelayError::Http(format!(
+                "POST {path} returned HTTP {}",
+                response.status()
+            )));
+        }
+        Ok(response)
+    }
+
     /// Query events via the HTTP bridge: `POST /query` with NIP-98 auth.
     ///
     /// Accepts a slice of `nostr::Filter` (serialized as JSON array).
@@ -399,6 +438,15 @@ impl RestClient {
     pub async fn query(&self, filters: &[nostr::Filter]) -> Result<Value, RelayError> {
         let body_bytes = serde_json::to_vec(filters)
             .map_err(|e| RelayError::Http(format!("filter serialize error: {e}")))?;
+        if filters_are_message_only(filters) {
+            if let Some(edge) = self.edge_binding.as_ref() {
+                if let Ok(response) = self.edge_bridge_post(edge, "/query", &body_bytes).await {
+                    if let Ok(value) = response.json().await {
+                        return Ok(value);
+                    }
+                }
+            }
+        }
         let resp = self.bridge_post("/query", &body_bytes).await?;
         resp.json()
             .await
@@ -412,6 +460,15 @@ impl RestClient {
     pub async fn count(&self, filters: &[nostr::Filter]) -> Result<Value, RelayError> {
         let body_bytes = serde_json::to_vec(filters)
             .map_err(|e| RelayError::Http(format!("filter serialize error: {e}")))?;
+        if filters_are_message_only(filters) {
+            if let Some(edge) = self.edge_binding.as_ref() {
+                if let Ok(response) = self.edge_bridge_post(edge, "/count", &body_bytes).await {
+                    if let Ok(value) = response.json().await {
+                        return Ok(value);
+                    }
+                }
+            }
+        }
         let resp = self.bridge_post("/count", &body_bytes).await?;
         resp.json()
             .await
@@ -424,6 +481,20 @@ impl RestClient {
     pub async fn submit_event(&self, event: &Event) -> Result<Value, RelayError> {
         let body_bytes = serde_json::to_vec(event)
             .map_err(|e| RelayError::Http(format!("event serialize error: {e}")))?;
+        if event.kind.as_u16() == buzz_core::kind::KIND_STREAM_MESSAGE as u16 {
+            if let Some(edge) = self.edge_binding.as_ref() {
+                if let Ok(response) = self.edge_bridge_post(edge, "/events", &body_bytes).await {
+                    if let Ok(text) = response.text().await {
+                        if text.is_empty() {
+                            return Ok(Value::Null);
+                        }
+                        if let Ok(value) = serde_json::from_str(&text) {
+                            return Ok(value);
+                        }
+                    }
+                }
+            }
+        }
         let resp = self.bridge_post("/events", &body_bytes).await?;
         let text = resp
             .text()
@@ -504,6 +575,10 @@ enum RelayMessage {
     Auth {
         challenge: String,
     },
+    Bound {
+        accepted: bool,
+        message: String,
+    },
 }
 
 /// Subscription ID for the global membership notification subscription.
@@ -551,6 +626,11 @@ pub struct HarnessRelay {
     observer_control_rx: Option<mpsc::Receiver<Event>>,
     /// Sender for commands to the background task.
     cmd_tx: mpsc::Sender<RelayCommand>,
+    /// Optional second client dedicated to bound kind-9 channel traffic.
+    edge_event_rx: Option<mpsc::Receiver<Option<BuzzEvent>>>,
+    edge_cmd_tx: Option<mpsc::Sender<RelayCommand>>,
+    edge_active: bool,
+    routed_channels: HashMap<Uuid, (ChannelFilter, Option<u64>)>,
     /// HTTP client for HTTP bridge calls.
     http: reqwest::Client,
     /// WebSocket URL of the relay.
@@ -563,6 +643,9 @@ pub struct HarnessRelay {
     /// Wrapped in `Option` so `shutdown()` can take ownership without conflicting
     /// with `Drop` (which only has `&mut self`).
     bg_handle: Option<tokio::task::JoinHandle<()>>,
+    edge_bg_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Keeps the edge task's unused observer channel open.
+    _edge_observer_control_rx: Option<mpsc::Receiver<Event>>,
 }
 
 /// Cloneable publisher handle for signed events on the relay background socket.
@@ -618,7 +701,7 @@ impl HarnessRelay {
         // rejected/invalid signing key) fails immediately — see
         // `is_terminal_connect_error`.
         let (ws, handshake_buffer) =
-            retry_initial_connect(|| do_connect(relay_url, keys, auth_tag.as_ref())).await?;
+            retry_initial_connect(|| do_connect(relay_url, keys, auth_tag.as_ref(), None)).await?;
 
         let (event_tx, event_rx) = mpsc::channel::<Option<BuzzEvent>>(event_channel_capacity());
         let (observer_control_tx, observer_control_rx) =
@@ -641,14 +724,80 @@ impl HarnessRelay {
                 bg_relay_url,
                 bg_agent_pubkey_hex,
                 bg_auth_tag,
+                None,
             )
             .await;
         });
+
+        let edge_binding = EdgeBinding::from_env(relay_url);
+        let (edge_event_rx, edge_cmd_tx, edge_bg_handle, edge_observer_control_rx) =
+            if let Some(binding) = edge_binding.clone() {
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    do_connect(
+                        binding.websocket_url(),
+                        keys,
+                        auth_tag.as_ref(),
+                        Some(&binding),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok((edge_ws, edge_buffer))) => {
+                        let (edge_event_tx, edge_event_rx) =
+                            mpsc::channel::<Option<BuzzEvent>>(event_channel_capacity());
+                        let (edge_observer_tx, edge_observer_rx) =
+                            mpsc::channel::<Event>(event_channel_capacity());
+                        let (edge_cmd_tx, edge_cmd_rx) =
+                            mpsc::channel::<RelayCommand>(CMD_CHANNEL_CAPACITY);
+                        let edge_keys = keys.clone();
+                        let edge_url = binding.websocket_url().to_string();
+                        let edge_agent = agent_pubkey_hex.to_string();
+                        let edge_auth_tag = auth_tag.clone();
+                        let edge_handle = tokio::spawn(async move {
+                            run_background_task(
+                                edge_ws,
+                                edge_buffer,
+                                edge_event_tx,
+                                edge_observer_tx,
+                                edge_cmd_rx,
+                                edge_keys,
+                                edge_url,
+                                edge_agent,
+                                edge_auth_tag,
+                                Some(binding),
+                            )
+                            .await;
+                        });
+                        (
+                            Some(edge_event_rx),
+                            Some(edge_cmd_tx),
+                            Some(edge_handle),
+                            Some(edge_observer_rx),
+                        )
+                    }
+                    Ok(Err(error)) => {
+                        warn!("edge handshake failed; using canonical-only routing: {error}");
+                        (None, None, None, None)
+                    }
+                    Err(_) => {
+                        warn!("edge handshake timed out; using canonical-only routing");
+                        (None, None, None, None)
+                    }
+                }
+            } else {
+                (None, None, None, None)
+            };
+        let edge_active = edge_cmd_tx.is_some();
 
         Ok(Self {
             event_rx,
             observer_control_rx: Some(observer_control_rx),
             cmd_tx,
+            edge_event_rx,
+            edge_cmd_tx,
+            edge_active,
+            routed_channels: HashMap::new(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .connect_timeout(std::time::Duration::from_secs(5))
@@ -658,6 +807,8 @@ impl HarnessRelay {
             keys: keys.clone(),
             auth_tag,
             bg_handle: Some(bg_handle),
+            edge_bg_handle,
+            _edge_observer_control_rx: edge_observer_control_rx,
         })
     }
 
@@ -738,6 +889,7 @@ impl HarnessRelay {
                 .auth_tag
                 .as_ref()
                 .and_then(|t| serde_json::to_string(t.as_slice()).ok()),
+            edge_binding: EdgeBinding::from_env(&self.relay_url),
         }
     }
 
@@ -765,15 +917,54 @@ impl HarnessRelay {
         filter: ChannelFilter,
         replay_since: Option<u64>,
     ) -> Result<(), RelayError> {
-        self.cmd_tx
-            .send(RelayCommand::Subscribe {
+        self.routed_channels
+            .insert(channel_id, (filter.clone(), replay_since));
+        self.route_channel(channel_id, filter, replay_since).await?;
+        debug!("queued subscribe for channel {channel_id}");
+        Ok(())
+    }
+
+    async fn route_channel(
+        &self,
+        channel_id: Uuid,
+        filter: ChannelFilter,
+        replay_since: Option<u64>,
+    ) -> Result<(), RelayError> {
+        let edge_filter = edge_message_filter(&filter);
+        if let (Some(edge_tx), Some(edge_filter)) = (&self.edge_cmd_tx, edge_filter) {
+            edge_tx
+                .send(RelayCommand::Subscribe {
+                    channel_id,
+                    filter: edge_filter,
+                    replay_since,
+                })
+                .await
+                .map_err(|_| RelayError::ConnectionClosed)?;
+        }
+
+        let canonical_filter = if self.edge_active {
+            canonical_channel_filter(&filter)
+        } else {
+            Some(filter)
+        };
+        let command = match canonical_filter {
+            Some(filter) => RelayCommand::Subscribe {
                 channel_id,
                 filter,
                 replay_since,
-            })
+            },
+            None => RelayCommand::Unsubscribe { channel_id },
+        };
+        self.cmd_tx
+            .send(command)
             .await
-            .map_err(|_| RelayError::ConnectionClosed)?;
-        debug!("queued subscribe for channel {channel_id}");
+            .map_err(|_| RelayError::ConnectionClosed)
+    }
+
+    async fn reroute_channels(&self) -> Result<(), RelayError> {
+        for (channel_id, (filter, replay_since)) in self.routed_channels.clone() {
+            self.route_channel(channel_id, filter, replay_since).await?;
+        }
         Ok(())
     }
 
@@ -809,10 +1000,17 @@ impl HarnessRelay {
 
     /// Unsubscribe from a channel.
     pub async fn unsubscribe_channel(&mut self, channel_id: Uuid) -> Result<(), RelayError> {
+        self.routed_channels.remove(&channel_id);
         self.cmd_tx
             .send(RelayCommand::Unsubscribe { channel_id })
             .await
             .map_err(|_| RelayError::ConnectionClosed)?;
+        if let Some(edge_tx) = &self.edge_cmd_tx {
+            edge_tx
+                .send(RelayCommand::Unsubscribe { channel_id })
+                .await
+                .map_err(|_| RelayError::ConnectionClosed)?;
+        }
         debug!("queued unsubscribe for channel {channel_id}");
         Ok(())
     }
@@ -822,8 +1020,47 @@ impl HarnessRelay {
     /// Reads from the background task's event channel. Returns `None` on
     /// connection loss — the caller should call [`reconnect`](Self::reconnect).
     pub async fn next_event(&mut self) -> Option<BuzzEvent> {
-        // The background task sends `None` to signal connection loss.
-        self.event_rx.recv().await.flatten()
+        loop {
+            let Some(edge_rx) = self.edge_event_rx.as_mut() else {
+                return self.event_rx.recv().await.flatten();
+            };
+            enum Source {
+                Canonical(Option<Option<BuzzEvent>>),
+                Edge(Option<Option<BuzzEvent>>),
+            }
+            let source = tokio::select! {
+                event = self.event_rx.recv() => Source::Canonical(event),
+                event = edge_rx.recv() => Source::Edge(event),
+            };
+            match source {
+                Source::Canonical(event) => return event.flatten(),
+                Source::Edge(Some(Some(event))) => {
+                    if !self.edge_active {
+                        self.edge_active = true;
+                        if let Err(error) = self.reroute_channels().await {
+                            warn!("failed to restore edge routing: {error}");
+                        }
+                    }
+                    return Some(event);
+                }
+                Source::Edge(Some(None)) => {
+                    if self.edge_active {
+                        self.edge_active = false;
+                        if let Err(error) = self.reroute_channels().await {
+                            warn!("failed to restore canonical routing: {error}");
+                        }
+                    }
+                }
+                Source::Edge(None) => {
+                    self.edge_event_rx = None;
+                    self.edge_cmd_tx = None;
+                    self.edge_active = false;
+                    if let Err(error) = self.reroute_channels().await {
+                        warn!("failed to restore canonical routing: {error}");
+                    }
+                }
+            }
+        }
     }
 
     /// Publish a signed event to the relay via the background WebSocket task.
@@ -902,6 +1139,12 @@ impl HarnessRelay {
             .send(RelayCommand::Reconnect)
             .await
             .map_err(|_| RelayError::ConnectionClosed)?;
+        if let Some(edge_tx) = &self.edge_cmd_tx {
+            edge_tx
+                .send(RelayCommand::Reconnect)
+                .await
+                .map_err(|_| RelayError::ConnectionClosed)?;
+        }
         Ok(())
     }
 }
@@ -912,6 +1155,9 @@ impl HarnessRelay {
     /// relying on `Drop` (which aborts immediately).
     pub async fn shutdown(mut self) {
         let _ = self.cmd_tx.send(RelayCommand::Shutdown).await;
+        if let Some(edge_tx) = &self.edge_cmd_tx {
+            let _ = edge_tx.send(RelayCommand::Shutdown).await;
+        }
         if let Some(handle) = self.bg_handle.take() {
             let abort_handle = handle.abort_handle();
             if tokio::time::timeout(Duration::from_secs(5), handle)
@@ -922,6 +1168,16 @@ impl HarnessRelay {
                 abort_handle.abort();
             }
         }
+        if let Some(handle) = self.edge_bg_handle.take() {
+            let abort_handle = handle.abort_handle();
+            if tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!("edge background task did not finish in 5s — aborting");
+                abort_handle.abort();
+            }
+        }
     }
 }
 
@@ -929,10 +1185,42 @@ impl Drop for HarnessRelay {
     fn drop(&mut self) {
         // Best-effort shutdown signal; ignore errors (task may already be done).
         let _ = self.cmd_tx.try_send(RelayCommand::Shutdown);
+        if let Some(edge_tx) = &self.edge_cmd_tx {
+            let _ = edge_tx.try_send(RelayCommand::Shutdown);
+        }
         if let Some(handle) = self.bg_handle.take() {
             handle.abort();
         }
+        if let Some(handle) = self.edge_bg_handle.take() {
+            handle.abort();
+        }
     }
+}
+
+fn edge_message_filter(filter: &ChannelFilter) -> Option<ChannelFilter> {
+    filter.kinds.as_ref().and_then(|kinds| {
+        kinds
+            .contains(&buzz_core::kind::KIND_STREAM_MESSAGE)
+            .then(|| ChannelFilter {
+                kinds: Some(vec![buzz_core::kind::KIND_STREAM_MESSAGE]),
+                require_mention: filter.require_mention,
+            })
+    })
+}
+
+fn canonical_channel_filter(filter: &ChannelFilter) -> Option<ChannelFilter> {
+    let Some(kinds) = filter.kinds.as_ref() else {
+        return Some(filter.clone());
+    };
+    let canonical_kinds: Vec<u32> = kinds
+        .iter()
+        .copied()
+        .filter(|kind| *kind != buzz_core::kind::KIND_STREAM_MESSAGE)
+        .collect();
+    (!canonical_kinds.is_empty()).then_some(ChannelFilter {
+        kinds: Some(canonical_kinds),
+        require_mention: filter.require_mention,
+    })
 }
 
 /// Two-generation dedup set with bounded memory.
@@ -1554,6 +1842,7 @@ async fn run_background_task(
     relay_url: String,
     agent_pubkey_hex: String,
     auth_tag: Option<nostr::Tag>,
+    edge_binding: Option<EdgeBinding>,
 ) {
     let mut state = BgState::new();
 
@@ -1584,6 +1873,7 @@ async fn run_background_task(
             &event_tx,
             &observer_control_tx,
             auth_tag.as_ref(),
+            edge_binding.as_ref(),
         )
         .await
         {
@@ -1609,6 +1899,7 @@ async fn run_background_task(
                         &observer_control_tx,
                         true,
                         auth_tag.as_ref(),
+                        edge_binding.as_ref(),
                     )
                     .await,
                     ReconnectOutcome::Shutdown
@@ -1667,6 +1958,7 @@ async fn run_background_task(
                         &event_tx,
                         &observer_control_tx,
                         auth_tag.as_ref(),
+                        edge_binding.as_ref(),
                     )
                     .await
                     {
@@ -1698,6 +1990,7 @@ async fn run_background_task(
                                     &observer_control_tx,
                                     true,
                                     auth_tag.as_ref(),
+                                    edge_binding.as_ref(),
                                 )
                                 .await,
                                 ReconnectOutcome::Shutdown
@@ -1843,6 +2136,7 @@ async fn run_background_task(
                                &event_tx,
                            &observer_control_tx,
             auth_tag.as_ref(),
+            edge_binding.as_ref(),
                            )
                            .await;
                            match outcome {
@@ -1864,6 +2158,7 @@ async fn run_background_task(
                                        &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
         &agent_pubkey_hex, &event_tx, &observer_control_tx, true,
                         auth_tag.as_ref(),
+                        edge_binding.as_ref(),
                                    ).await,
                                    ReconnectOutcome::Shutdown
                                ) { return; }
@@ -1884,6 +2179,7 @@ async fn run_background_task(
                                        &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
         &agent_pubkey_hex, &event_tx, &observer_control_tx, true,
                         auth_tag.as_ref(),
+                        edge_binding.as_ref(),
                                    ).await,
                                    ReconnectOutcome::Shutdown
                                ) { return; }
@@ -1919,6 +2215,7 @@ async fn run_background_task(
         &agent_pubkey_hex, &event_tx,
                                    &observer_control_tx,
             auth_tag.as_ref(),
+            edge_binding.as_ref(),
                                    ).await {
                                        ReconnectOutcome::Shutdown => return,
                                        ReconnectOutcome::Ok => {
@@ -1933,6 +2230,7 @@ async fn run_background_task(
                                                    &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
         &agent_pubkey_hex, &event_tx, &observer_control_tx, true,
                         auth_tag.as_ref(),
+                        edge_binding.as_ref(),
                                                ).await,
                                                ReconnectOutcome::Shutdown
                                            ) { return; }
@@ -1958,6 +2256,7 @@ async fn run_background_task(
         &agent_pubkey_hex, &event_tx,
                            &observer_control_tx,
             auth_tag.as_ref(),
+            edge_binding.as_ref(),
                            ).await {
                                ReconnectOutcome::Shutdown => return,
                                ReconnectOutcome::Ok => {
@@ -1972,6 +2271,7 @@ async fn run_background_task(
                                            &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
         &agent_pubkey_hex, &event_tx, &observer_control_tx, true,
                         auth_tag.as_ref(),
+                        edge_binding.as_ref(),
                                        ).await,
                                        ReconnectOutcome::Shutdown
                                    ) { return; }
@@ -1991,6 +2291,7 @@ async fn run_background_task(
         &agent_pubkey_hex, &event_tx,
                                &observer_control_tx,
             auth_tag.as_ref(),
+            edge_binding.as_ref(),
                                ).await {
                                    ReconnectOutcome::Shutdown => return,
                                    ReconnectOutcome::Ok => {
@@ -2005,6 +2306,7 @@ async fn run_background_task(
                                                &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
         &agent_pubkey_hex, &event_tx, &observer_control_tx, true,
                         auth_tag.as_ref(),
+                        edge_binding.as_ref(),
                                            ).await,
                                            ReconnectOutcome::Shutdown
                                        ) { return; }
@@ -2364,6 +2666,7 @@ async fn handle_ws_message(
                         return false;
                     }
                 }
+                RelayMessage::Bound { .. } => {}
                 RelayMessage::Ok {
                     event_id,
                     accepted,
@@ -2444,6 +2747,7 @@ async fn process_handshake_buffer(
             } => serde_json::to_string(&json!(["OK", event_id, accepted, message])).ok(),
             // AUTH in the buffer is stale — skip it.
             RelayMessage::Auth { .. } => None,
+            RelayMessage::Bound { .. } => None,
         };
         if let Some(text) = text {
             let should_continue = handle_ws_message(
@@ -2913,6 +3217,7 @@ async fn try_autonomous_reconnect(
     event_tx: &mpsc::Sender<Option<BuzzEvent>>,
     observer_control_tx: &mpsc::Sender<Event>,
     auth_tag: Option<&nostr::Tag>,
+    edge_binding: Option<&EdgeBinding>,
 ) -> ReconnectOutcome {
     state.requeue_observer_in_flight();
     // 5 attempts, up to 16s base backoff. Shares delay values with the
@@ -2934,7 +3239,7 @@ async fn try_autonomous_reconnect(
             attempt + 1,
             backoffs.len()
         );
-        match do_connect(relay_url, keys, auth_tag).await {
+        match do_connect(relay_url, keys, auth_tag, edge_binding).await {
             Ok((new_ws, handshake_buffer)) => {
                 *ws = new_ws;
                 info!("autonomous reconnect succeeded (attempt {})", attempt + 1);
@@ -3043,6 +3348,7 @@ async fn wait_for_reconnect(
     observer_control_tx: &mpsc::Sender<Event>,
     skip_drain: bool,
     auth_tag: Option<&nostr::Tag>,
+    edge_binding: Option<&EdgeBinding>,
 ) -> ReconnectOutcome {
     state.requeue_observer_in_flight();
     if !skip_drain {
@@ -3072,7 +3378,7 @@ async fn wait_for_reconnect(
     let mut attempt = state.backoff_step;
     loop {
         info!("attempting relay reconnect to {relay_url}…");
-        match do_connect(relay_url, keys, auth_tag).await {
+        match do_connect(relay_url, keys, auth_tag, edge_binding).await {
             Ok((new_ws, handshake_buffer)) => {
                 *ws = new_ws;
                 info!("relay reconnected to {relay_url}");
@@ -3628,6 +3934,12 @@ pub(crate) fn parse_relay_message(text: &str) -> Result<RelayMessage, RelayError
                 .to_string();
             Ok(RelayMessage::Auth { challenge })
         }
+        "BUZZ-EDGE" if arr.get(1).and_then(Value::as_str) == Some("BOUND") => {
+            Ok(RelayMessage::Bound {
+                accepted: arr.get(2).and_then(Value::as_bool).unwrap_or(false),
+                message: arr.get(3).and_then(Value::as_str).unwrap_or("").to_string(),
+            })
+        }
         other => Err(RelayError::UnexpectedMessage(format!(
             "unknown message type: {other}"
         ))),
@@ -3839,6 +4151,7 @@ async fn do_connect(
     relay_url: &str,
     keys: &Keys,
     auth_tag: Option<&nostr::Tag>,
+    edge_binding: Option<&EdgeBinding>,
 ) -> Result<(WsStream, VecDeque<RelayMessage>), RelayError> {
     let parsed = relay_url
         .parse::<url::Url>()
@@ -3854,6 +4167,16 @@ async fn do_connect(
     let mut buffer: VecDeque<RelayMessage> = VecDeque::new();
 
     let challenge = wait_for_auth_challenge(&mut ws, &mut buffer, AUTH_TIMEOUT).await?;
+
+    if let Some(binding) = edge_binding {
+        ws_send_timeout(
+            &mut ws,
+            Message::Text(binding.handshake_frame().into()),
+            WS_SEND_TIMEOUT_SECS,
+        )
+        .await?;
+        wait_for_edge_bound(&mut ws, &mut buffer, AUTH_TIMEOUT).await?;
+    }
 
     send_auth_response(&mut ws, &challenge, relay_url, keys, auth_tag).await?;
 
@@ -3872,6 +4195,44 @@ async fn do_connect(
 
     debug!("NIP-42 authentication successful (event {event_id})");
     Ok((ws, buffer))
+}
+
+async fn wait_for_edge_bound(
+    ws: &mut WsStream,
+    buffer: &mut VecDeque<RelayMessage>,
+    timeout_dur: Duration,
+) -> Result<(), RelayError> {
+    let deadline = tokio::time::Instant::now() + timeout_dur;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            return Err(RelayError::Timeout);
+        }
+        let raw = timeout(remaining, ws.next())
+            .await
+            .map_err(|_| RelayError::Timeout)?
+            .ok_or(RelayError::ConnectionClosed)?
+            .map_err(|e| RelayError::WebSocket(Box::new(e)))?;
+        match raw {
+            Message::Text(text) => match parse_relay_message(&text)? {
+                RelayMessage::Bound { accepted: true, .. } => return Ok(()),
+                RelayMessage::Bound {
+                    accepted: false,
+                    message,
+                } => return Err(RelayError::AuthFailed(message)),
+                other => buffer.push_back(other),
+            },
+            Message::Ping(data) => {
+                ws_send_timeout(ws, Message::Pong(data), WS_SEND_TIMEOUT_SECS)
+                    .await
+                    .map_err(|_| RelayError::Timeout)?;
+            }
+            Message::Close(_) => return Err(RelayError::ConnectionClosed),
+            _ => {}
+        }
+    }
 }
 
 /// Wait for an `AUTH` challenge from the relay, buffering any other messages.
@@ -4007,6 +4368,53 @@ async fn wait_for_any_ok(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_message_kind_is_split_from_canonical_subscription() {
+        let filter = ChannelFilter {
+            kinds: Some(vec![9, 39001, 24200]),
+            require_mention: true,
+        };
+        let edge = edge_message_filter(&filter).expect("message route");
+        assert_eq!(edge.kinds, Some(vec![9]));
+        assert!(edge.require_mention);
+        let canonical = canonical_channel_filter(&filter).expect("canonical route");
+        assert_eq!(canonical.kinds, Some(vec![39001, 24200]));
+        assert!(canonical.require_mention);
+    }
+
+    #[test]
+    fn message_only_subscription_has_no_canonical_half() {
+        let filter = ChannelFilter {
+            kinds: Some(vec![9]),
+            require_mention: false,
+        };
+        assert!(edge_message_filter(&filter).is_some());
+        assert!(canonical_channel_filter(&filter).is_none());
+    }
+
+    #[test]
+    fn wildcard_subscription_stays_canonical_only() {
+        let filter = ChannelFilter {
+            kinds: None,
+            require_mention: false,
+        };
+        assert!(edge_message_filter(&filter).is_none());
+        assert!(canonical_channel_filter(&filter).is_some());
+    }
+
+    #[test]
+    fn parses_edge_bound_response() {
+        let message = parse_relay_message(r#"["BUZZ-EDGE","BOUND",false,"binding mismatch"]"#)
+            .expect("valid edge response");
+        assert!(matches!(
+            message,
+            RelayMessage::Bound {
+                accepted: false,
+                ref message
+            } if message == "binding mismatch"
+        ));
+    }
 
     #[test]
     fn relay_ws_to_http_plain() {
@@ -4377,6 +4785,64 @@ mod tests {
             .expect("read test websocket frame");
         serde_json::from_str(message.to_text().expect("expected text frame"))
             .expect("parse test websocket frame")
+    }
+
+    #[tokio::test]
+    async fn edge_connect_binds_before_authentication() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind edge websocket");
+        let address = listener.local_addr().expect("edge address");
+        let edge_url = format!("ws://{address}");
+        let community_id = Uuid::new_v4();
+        let binding = EdgeBinding::new(&edge_url, "wss://canonical.example", community_id)
+            .expect("valid binding");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept edge client");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("edge websocket handshake");
+            websocket
+                .send(Message::Text(
+                    serde_json::json!(["AUTH", "edge-challenge"])
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("send challenge");
+
+            let bind = next_test_frame(&mut websocket).await;
+            assert_eq!(bind[0], "BUZZ-EDGE");
+            assert_eq!(bind[1], "BIND");
+            assert_eq!(bind[2]["canonical_origin"], "wss://canonical.example");
+            assert_eq!(bind[2]["community_id"], community_id.to_string());
+            websocket
+                .send(Message::Text(
+                    serde_json::json!(["BUZZ-EDGE", "BOUND", true, ""])
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("confirm binding");
+
+            let auth = next_test_frame(&mut websocket).await;
+            assert_eq!(auth[0], "AUTH");
+            let event_id = auth[1]["id"].as_str().expect("auth event id");
+            websocket
+                .send(Message::Text(
+                    serde_json::json!(["OK", event_id, true, ""])
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("accept auth");
+        });
+
+        let keys = Keys::generate();
+        do_connect(&edge_url, &keys, None, Some(&binding))
+            .await
+            .expect("bound edge connection");
+        server.await.expect("edge server task");
     }
 
     fn test_channel_filter() -> ChannelFilter {
@@ -5561,7 +6027,7 @@ mod tests {
     #[tokio::test]
     async fn do_connect_wrong_scheme_is_terminal() {
         let keys = nostr::Keys::generate();
-        let err = do_connect("https://example.com", &keys, None)
+        let err = do_connect("https://example.com", &keys, None, None)
             .await
             .unwrap_err();
         assert!(
