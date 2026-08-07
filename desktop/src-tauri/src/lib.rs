@@ -542,6 +542,17 @@ pub fn run() {
             // has no relay override to the localhost fallback. Preserve the
             // boot-time repos and identity recovery safety gates by only marking
             // restoration pending when both allow it.
+            // Log both gates. "No agents started" has three possible causes —
+            // repos unresolved, recovery mode, or the frontend never applying a
+            // workspace — and they are indistinguishable from the outside.
+            tracing::info!(
+                event = "agent_restore_gate",
+                restore_agents,
+                recovery_mode,
+                identity_lost,
+                keyring_locked,
+                "evaluated launch-time agent restore"
+            );
             if restore_agents && !recovery_mode {
                 state
                     .managed_agent_restore_pending

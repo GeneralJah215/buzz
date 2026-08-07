@@ -237,6 +237,15 @@ pub async fn apply_workspace(
         .managed_agent_restore_pending
         .swap(false, Ordering::AcqRel);
 
+    // Proves the frontend reached this call at all. Without it, "no agents"
+    // looks the same whether the gate was closed at boot or the frontend never
+    // applied a workspace.
+    tracing::info!(
+        event = "workspace_applied",
+        restore_pending,
+        "workspace applied; agent restore decision made"
+    );
+
     // The coordinator starts before React applies the selected workspace, so
     // its startup publication may have used the fallback relay and placeholder
     // identity. Correct it off the command path so an unavailable relay cannot
