@@ -60,7 +60,50 @@ pub(crate) fn process_is_running(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
-#[cfg(not(unix))]
+/// Windows equivalent of the `kill(pid, 0)` probe above.
+///
+/// This was previously a `#[cfg(not(unix))]` stub returning `false`
+/// unconditionally, which made every caller believe no agent was ever running
+/// (BUG-015). The damage was worst in `stop_managed_agent_runtime`, which reads:
+///
+/// ```ignore
+/// if process_is_running(child.id()) { terminate_process(child.id()) } else { Ok(()) }
+/// ```
+///
+/// A hardcoded `false` skipped the kill entirely and then waited on a process
+/// nothing had touched — so agent restart could never work on Windows, while
+/// working fine on macOS. `taskkill /T /F` was never at fault; it was never run.
+///
+/// Opening with only `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE` keeps
+/// this a probe: enough to ask whether the process is alive, not enough to
+/// modify it. A failed open means gone or not ours, which is the same `false`
+/// the Unix path returns for ESRCH and EPERM.
+#[cfg(windows)]
+pub(crate) fn process_is_running(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // `windows-sys` only exposes SYNCHRONIZE as a FILE_ACCESS_RIGHTS constant,
+    // which will not combine with PROCESS_ACCESS_RIGHTS. The value is the same
+    // standard access right for every object type.
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        // A zero timeout makes this a poll. Still signalled = still running;
+        // anything else means it has exited (or the wait itself failed, which
+        // is treated as "not running" so callers fail closed).
+        let alive = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+        CloseHandle(handle);
+        alive
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn process_is_running(_pid: u32) -> bool {
     false
 }
