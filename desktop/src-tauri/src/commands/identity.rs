@@ -40,6 +40,18 @@ pub fn get_identity(state: State<'_, AppState>) -> Result<IdentityInfo, String> 
         .reset_failed
         .load(std::sync::atomic::Ordering::Acquire);
 
+    // The frontend caches this answer with `staleTime: Infinity` — it asks once
+    // per launch and never asks again. So if the recovery screen appears, this
+    // single call is why, and it is worth being able to see it after the fact.
+    tracing::info!(
+        event = "identity_reported",
+        lost,
+        locked,
+        reset_failed,
+        storage = %state.identity_storage().as_str(),
+        "reported identity state to the frontend"
+    );
+
     Ok(IdentityInfo {
         pubkey: pubkey_hex,
         display_name,

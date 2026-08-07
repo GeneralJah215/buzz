@@ -226,6 +226,15 @@ pub async fn restore_managed_agents_on_launch(
         }
     }
 
+    // "No agents started" has several possible causes that look identical from
+    // outside: none flagged for launch, all believed already running, or every
+    // spawn refused. Record which one it was.
+    tracing::info!(
+        event = "agent_restore_selected",
+        selected = agents_to_start.len(),
+        "selected agents for launch restore"
+    );
+
     if agents_to_start.is_empty() {
         return Ok(());
     }
