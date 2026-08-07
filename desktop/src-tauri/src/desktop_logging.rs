@@ -337,6 +337,18 @@ pub(crate) fn install_and_announce_startup(app_identifier: &str) {
     }
 }
 
+/// A duplicate launch handed its arguments to the running instance. This is the
+/// hop the restart deep link depends on, and nothing recorded it before.
+pub(crate) fn log_second_instance(argv: &[String]) {
+    tracing::info!(
+        event = "second_instance",
+        args = argv.len(),
+        // Scheme only. The full URL carries the control token.
+        buzz_links = argv.iter().filter(|a| a.starts_with("buzz://")).count(),
+        "duplicate launch forwarded its arguments"
+    );
+}
+
 pub(crate) fn log_window_created(window_label: &str) {
     tracing::info!(
         event = "window_created",

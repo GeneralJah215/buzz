@@ -116,6 +116,7 @@ pub fn run() {
     }
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            desktop_logging::log_second_instance(&argv);
             // Focus the existing window when a duplicate instance launches.
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_focus();

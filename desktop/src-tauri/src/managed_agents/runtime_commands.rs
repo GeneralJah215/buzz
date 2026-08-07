@@ -309,6 +309,46 @@ fn start_pair(
     Ok(status)
 }
 
+/// How long a stop waits for a signalled child before giving up.
+///
+/// `terminate_process` already escalates to a forced kill, so a child still
+/// alive after this is not going to exit on its own.
+const CHILD_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait for `child` to exit, bounded.
+///
+/// The unbounded `Child::wait()` this replaces is why agent restart never
+/// worked and never explained itself (BUG-009): the stop signalled the harness,
+/// then blocked forever on a child that did not exit. No error, no timeout, no
+/// log — the restart task simply parked a thread and was never heard from
+/// again, 1,316 times.
+///
+/// A timeout here is not a lost cause: the caller treats `Err` as a failed
+/// teardown, keeps the child tracked, and reports it. A visible failure the
+/// supervisor can act on beats an invisible hang every time.
+fn wait_for_child_exit(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "agent process {} did not exit within {}s of being terminated",
+                        child.id(),
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
 #[tauri::command]
 pub fn stop_managed_agent_runtime(
     pubkey: String,
@@ -316,10 +356,15 @@ pub fn stop_managed_agent_runtime(
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     let state = app.state::<AppState>();
+    // Three blocking std mutexes with no timeout. A restart that reports
+    // nothing at all is stalled on one of them, and from outside they are
+    // indistinguishable — so name each one as it is acquired.
+    tracing::info!(event = "agent_stop_lock", step = "transition", "acquiring");
     let _transition = state
         .managed_agent_runtime_transition
         .lock()
         .map_err(|e| e.to_string())?;
+    tracing::info!(event = "agent_stop_lock", step = "store", "acquiring");
     let _store = state
         .managed_agents_store_lock
         .lock()
@@ -327,17 +372,19 @@ pub fn stop_managed_agent_runtime(
     let mut records = load_managed_agents(&app)?;
     let record = find_managed_agent_mut(&mut records, &pubkey)?;
     let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+    tracing::info!(event = "agent_stop_lock", step = "processes", "acquiring");
     let mut runtimes = state
         .managed_agent_processes
         .lock()
         .map_err(|e| e.to_string())?;
+    tracing::info!(event = "agent_stop_lock", step = "all_acquired", "proceeding");
     if let Some(mut runtime) = runtimes.remove(&key) {
         let stop_result = if process_is_running(runtime.child.id()) {
             terminate_process(runtime.child.id())
         } else {
             Ok(())
         }
-        .and_then(|()| runtime.child.wait().map_err(|e| e.to_string()));
+        .and_then(|()| wait_for_child_exit(&mut runtime.child, CHILD_EXIT_TIMEOUT));
         match stop_result {
             Ok(status) => {
                 record.last_exit_code = status.code();

@@ -346,6 +346,15 @@ fn parse_restart_agent_deep_link(url: &Url) -> Result<RestartAgentRequest, Strin
 ///   persona re-snapshot included.
 async fn run_restart_agent_deep_link(app: tauri::AppHandle, request: RestartAgentRequest) {
     let prefix: String = request.pubkey.chars().take(8).collect();
+    // Every later branch logs, yet a real restart produced nothing at all, so
+    // the task was stalling before reaching any of them. These two bracket the
+    // registry lock — a blocking std mutex taken on an async worker — which is
+    // the only thing between entry and the first logged branch.
+    tracing::info!(
+        event = "restart_agent_task_entered",
+        agent = %prefix,
+        "restart task started"
+    );
 
     let relay_urls: Vec<String> = match request.relay_url.clone() {
         Some(relay_url) => vec![relay_url],
@@ -365,6 +374,12 @@ async fn run_restart_agent_deep_link(app: tauri::AppHandle, request: RestartAgen
                 .collect()
         }
     };
+    tracing::info!(
+        event = "restart_agent_resolved_relays",
+        agent = %prefix,
+        relays = relay_urls.len(),
+        "resolved relays for restart"
+    );
 
     if relay_urls.is_empty() {
         let state = app.state::<crate::app_state::AppState>();
@@ -426,6 +441,18 @@ async fn run_restart_agent_deep_link(app: tauri::AppHandle, request: RestartAgen
 /// Currently supports:
 /// - `buzz://connect?relay=<ws(s)://...>` — emits `deep-link-connect` to the frontend
 pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
+    // Proves a deep link actually reached the running instance. Without this,
+    // "the restart did nothing" cannot be told apart from "the link never
+    // arrived" — which is exactly where the 1,316 silent failures sat.
+    // The action only; the query string carries the control token.
+    tracing::info!(
+        event = "deep_link_received",
+        action = Url::parse(url_str)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_else(|| "<unparsable>".to_owned()),
+        "deep link received"
+    );
     let url = match Url::parse(url_str) {
         Ok(u) => u,
         Err(e) => {
