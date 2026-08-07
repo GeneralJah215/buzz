@@ -16,7 +16,11 @@ import {
   threadDirectoryQueryKey,
   threadDirectoryUnreadState,
 } from "./threadDirectory.ts";
-import { parseThreadDirectoryPage } from "@/shared/api/threadDirectory";
+import {
+  isTransientRelayFailure,
+  parseThreadDirectoryPage,
+  ThreadDirectoryUnsupportedError,
+} from "@/shared/api/threadDirectory";
 import {
   KIND_THREAD_DIRECTORY_BOUNDS,
   KIND_THREAD_DIRECTORY_ITEM,
@@ -135,6 +139,51 @@ test("binds the bounds overlay to the exact requested cursor", () => {
         cursor,
       ),
     /requested page/i,
+  );
+});
+
+test("classifies a missing bounds overlay as unsupported relay capability", () => {
+  assert.throws(
+    () => parseThreadDirectoryPage([itemEvent()], CHANNEL_ID, "active"),
+    ThreadDirectoryUnsupportedError,
+  );
+});
+
+test("transient relay failures are never read as a missing capability", () => {
+  for (const message of [
+    "relay unreachable: request timed out",
+    "relay unreachable: could not connect to relay",
+    "relay unreachable: relay host not found",
+    "relay rate-limited: retry in 4s",
+    "relay rate-limited: quota exceeded",
+    "relay returned 500 Internal Server Error",
+    "relay returned 502",
+  ]) {
+    assert.equal(isTransientRelayFailure(new Error(message)), true, message);
+  }
+  for (const message of [
+    "relay returned 400: unknown filter field",
+    "relay returned 404 Not Found",
+    "relay returned 422: thread_index is not supported",
+    "command failed",
+  ]) {
+    assert.equal(isTransientRelayFailure(new Error(message)), false, message);
+  }
+  assert.equal(isTransientRelayFailure("relay unreachable: nope"), true);
+  assert.equal(isTransientRelayFailure(undefined), false);
+});
+
+test("does not disguise duplicate bounds as unsupported capability", () => {
+  assert.throws(
+    () =>
+      parseThreadDirectoryPage(
+        [boundsEvent(), boundsEvent()],
+        CHANNEL_ID,
+        "active",
+      ),
+    (error) =>
+      !(error instanceof ThreadDirectoryUnsupportedError) &&
+      /exactly one bounds overlay/.test(error.message),
   );
 });
 

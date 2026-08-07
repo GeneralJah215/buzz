@@ -1,6 +1,7 @@
 import { invokeTauri, signRelayEvent } from "@/shared/api/tauri";
 import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
+import { isRelayUnreachableError } from "@/shared/lib/relayError";
 import {
   KIND_THREAD_DIRECTORY_BOUNDS,
   KIND_THREAD_DIRECTORY_ITEM,
@@ -46,6 +47,39 @@ export type ThreadDirectoryStateSnapshot = {
   pinned: boolean;
   archived: boolean;
 };
+
+/** The connected relay cannot serve the thread-directory protocol. */
+export class ThreadDirectoryUnsupportedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ThreadDirectoryUnsupportedError";
+  }
+}
+
+export function isThreadDirectoryUnsupportedError(
+  error: unknown,
+): error is ThreadDirectoryUnsupportedError {
+  return error instanceof ThreadDirectoryUnsupportedError;
+}
+
+/**
+ * A capability verdict is cached for the whole relay connection, so reading a
+ * transient failure as "missing feature" would strand the sidebar on the
+ * degraded fallback list until the next reconnect — and an HTTP-layer failure
+ * leaves the websocket healthy, so no reconnect ever arrives. Connectivity,
+ * rate-limit, and relay 5xx errors are therefore re-thrown unchanged and
+ * retried as ordinary query errors. A 4xx on a request the client always builds
+ * from a valid channel id and a literal directory state means the relay itself
+ * rejects the directory filter, which is a genuine capability signal.
+ */
+export function isTransientRelayFailure(error: unknown): boolean {
+  if (isRelayUnreachableError(error)) return true;
+  if (!(error instanceof Error)) return false;
+  return (
+    error.message.startsWith("relay rate-limited:") ||
+    /^relay returned 5\d\d\b/.test(error.message)
+  );
+}
 
 function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -280,6 +314,11 @@ export function parseThreadDirectoryPage(
       );
     }
   }
+  if (bounds.length === 0) {
+    throw new ThreadDirectoryUnsupportedError(
+      "The relay does not support the thread directory.",
+    );
+  }
   if (bounds.length !== 1) {
     throw new Error(
       "Thread directory response must contain exactly one bounds overlay.",
@@ -295,12 +334,21 @@ export async function getThreadDirectoryPage(
   cursor: string | null = null,
   limitRows = 25,
 ): Promise<ThreadDirectoryPage> {
-  const events = await invokeTauri<RelayEvent[]>("get_thread_directory", {
-    channelId,
-    directoryState: state,
-    cursor,
-    limitRows,
-  });
+  let events: RelayEvent[];
+  try {
+    events = await invokeTauri<RelayEvent[]>("get_thread_directory", {
+      channelId,
+      directoryState: state,
+      cursor,
+      limitRows,
+    });
+  } catch (error) {
+    if (isTransientRelayFailure(error)) throw error;
+    throw new ThreadDirectoryUnsupportedError(
+      "The relay does not support the thread directory.",
+      { cause: error },
+    );
+  }
   return parseThreadDirectoryPage(events, channelId, state, cursor);
 }
 

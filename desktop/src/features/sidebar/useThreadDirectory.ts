@@ -10,6 +10,7 @@ import {
 import { relayClient } from "@/shared/api/relayClient";
 import {
   getThreadDirectoryPage,
+  isThreadDirectoryUnsupportedError,
   parseThreadDirectoryItemOverlay,
   publishThreadDirectoryState,
   type ThreadDirectoryItem,
@@ -53,6 +54,7 @@ type ThreadDirectoryMutationVariables = ThreadDirectoryMutationInput & {
 };
 
 type DirectoryData = InfiniteData<StampedThreadDirectoryPage, string | null>;
+type ThreadDirectoryCapability = "unknown" | "supported" | "unsupported";
 
 const EMPTY_LIVE_STATE: ThreadDirectoryLiveState = {
   nextOrder: 0,
@@ -102,6 +104,10 @@ export function useThreadDirectory({
   enabled,
 }: UseThreadDirectoryOptions) {
   const queryClient = useQueryClient();
+  const [connectionGeneration, setConnectionGeneration] = React.useState(() =>
+    relayClient.getConnectionGeneration(),
+  );
+  const resetGenerationRef = React.useRef(connectionGeneration);
   const queryKey = React.useMemo(
     () =>
       threadDirectoryQueryKey(communityId, relayUrl, pubkey, channelId, state),
@@ -111,12 +117,25 @@ export function useThreadDirectory({
     () => threadDirectoryLiveQueryKey(communityId, relayUrl, pubkey, channelId),
     [channelId, communityId, pubkey, relayUrl],
   );
+  const capabilityQueryKey = React.useMemo(
+    () => [
+      "thread-directory-capability",
+      communityId,
+      relayUrl,
+      pubkey,
+      connectionGeneration,
+    ],
+    [communityId, connectionGeneration, pubkey, relayUrl],
+  );
   const currentScope = React.useMemo<ThreadDirectoryQueryScope>(
     () => ({ client: queryClient, queryKey, liveQueryKey }),
     [liveQueryKey, queryClient, queryKey],
   );
   const latestScopeRef = React.useRef(currentScope);
   const mountedScopeRef = React.useRef<ThreadDirectoryQueryScope | null>(null);
+  const subscriptionRef = React.useRef<ReturnType<
+    typeof createRetryingThreadDirectorySubscription
+  > | null>(null);
   React.useLayoutEffect(() => {
     latestScopeRef.current = currentScope;
   }, [currentScope]);
@@ -164,12 +183,20 @@ export function useThreadDirectory({
     enabled: false,
     staleTime: Number.POSITIVE_INFINITY,
   });
-  const queryEnabled =
+  const capabilityQuery = useQuery<ThreadDirectoryCapability>({
+    queryKey: capabilityQueryKey,
+    queryFn: () => Promise.resolve("unknown"),
+    initialData: "unknown",
+    enabled: false,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const scopeEnabled =
     enabled &&
     channelId !== null &&
     communityId !== null &&
     relayUrl !== null &&
     pubkey !== null;
+  const queryEnabled = scopeEnabled && capabilityQuery.data !== "unsupported";
 
   const query = useInfiniteQuery<
     StampedThreadDirectoryPage,
@@ -185,12 +212,90 @@ export function useThreadDirectory({
       if (!channelId)
         throw new Error("A channel is required for its thread directory.");
       const requestOrder = reserveSourceOrder(queryClient, liveQueryKey);
-      const page = await getThreadDirectoryPage(channelId, state, pageParam);
-      return { ...page, requestOrder };
+      try {
+        const page = await getThreadDirectoryPage(channelId, state, pageParam);
+        queryClient.setQueryData<ThreadDirectoryCapability>(
+          capabilityQueryKey,
+          "supported",
+        );
+        return { ...page, requestOrder };
+      } catch (error) {
+        // Only the first page may select the fallback. A later page failing on
+        // a relay that already served page one is an ordinary error: swapping
+        // the whole list for the degraded view mid-pagination would discard a
+        // working directory.
+        if (!isThreadDirectoryUnsupportedError(error) || pageParam !== null)
+          throw error;
+        queryClient.setQueryData<ThreadDirectoryCapability>(
+          capabilityQueryKey,
+          "unsupported",
+        );
+        return {
+          items: [],
+          bounds: {
+            channelId,
+            state,
+            hasMore: false,
+            nextCursor: null,
+          },
+          requestOrder,
+        };
+      }
     },
     getNextPageParam: (lastPage) =>
       lastPage.bounds.hasMore ? lastPage.bounds.nextCursor : undefined,
   });
+
+  React.useEffect(() => {
+    if (!scopeEnabled) return;
+    return relayClient.subscribeToReconnects(() => {
+      // Clear the live overlays before re-subscribing, exactly as the
+      // pre-fallback listener did: overlays delivered between reconnect() and
+      // a deferred clear would be merged and then wiped.
+      if (liveScopeCanWriteCache()) {
+        queryClient.setQueryData<ThreadDirectoryLiveState>(
+          liveQueryKey,
+          (current = EMPTY_LIVE_STATE) => ({
+            nextOrder: current.nextOrder + 1,
+            byRootId: new Map(),
+          }),
+        );
+      }
+      subscriptionRef.current?.reconnect();
+      setConnectionGeneration(relayClient.getConnectionGeneration());
+    });
+  }, [liveQueryKey, liveScopeCanWriteCache, queryClient, scopeEnabled]);
+
+  React.useEffect(() => {
+    if (resetGenerationRef.current === connectionGeneration) return;
+    // The generation is only consumed once the scope can act on it, so a
+    // reconnect seen while the scope is disabled is replayed rather than lost.
+    if (!scopeEnabled) return;
+    const previousGeneration = resetGenerationRef.current;
+    resetGenerationRef.current = connectionGeneration;
+    const previousCapability =
+      queryClient.getQueryData<ThreadDirectoryCapability>([
+        "thread-directory-capability",
+        communityId,
+        relayUrl,
+        pubkey,
+        previousGeneration,
+      ]);
+    // An unsupported query becomes enabled when the new generation starts at
+    // unknown, so React Query already launches that probe. Supported queries
+    // stay enabled across the generation change and need one explicit reset.
+    if (previousCapability !== "unsupported") {
+      void queryClient.resetQueries({ queryKey, exact: true });
+    }
+  }, [
+    communityId,
+    connectionGeneration,
+    pubkey,
+    queryClient,
+    queryKey,
+    relayUrl,
+    scopeEnabled,
+  ]);
 
   React.useEffect(() => {
     if (!queryEnabled || !channelId) return;
@@ -221,20 +326,11 @@ export function useThreadDirectory({
         );
       },
     });
-    const unsubscribeReconnect = relayClient.subscribeToReconnects(() => {
-      if (!liveScopeCanWriteCache()) return;
-      queryClient.setQueryData<ThreadDirectoryLiveState>(
-        liveQueryKey,
-        (current = EMPTY_LIVE_STATE) => ({
-          nextOrder: current.nextOrder + 1,
-          byRootId: new Map(),
-        }),
-      );
-      void queryClient.resetQueries({ queryKey, exact: true });
-      subscription.reconnect();
-    });
+    subscriptionRef.current = subscription;
     return () => {
-      unsubscribeReconnect();
+      if (subscriptionRef.current === subscription) {
+        subscriptionRef.current = null;
+      }
       subscription.dispose();
     };
   }, [
@@ -243,7 +339,6 @@ export function useThreadDirectory({
     liveScopeCanWriteCache,
     queryClient,
     queryEnabled,
-    queryKey,
   ]);
 
   const mutation = useMutation<
@@ -369,6 +464,7 @@ export function useThreadDirectory({
 
   return {
     ...query,
+    isUnsupported: capabilityQuery.data === "unsupported",
     items,
     updateThread,
     updateError: mutation.error,
