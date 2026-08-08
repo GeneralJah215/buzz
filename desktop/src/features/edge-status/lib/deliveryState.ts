@@ -12,9 +12,11 @@
 import type { VariantProps } from "class-variance-authority";
 
 import {
-  EDGE_DELIVERY_STATES,
-  isEdgeDeliveryState,
+  EDGE_DELIVERY_STATE_KEYS,
+  EDGE_DELIVERY_STATE_WIRE_NAMES,
+  edgeDeliveryStateKey,
   type EdgeDeliveryState,
+  type EdgeDeliveryStateKey,
 } from "@/features/edge-status/api/edgeStatus";
 import type { badgeVariants } from "@/shared/ui/badge";
 
@@ -31,10 +33,18 @@ export type DeliveryTone = NonNullable<
 export const UNKNOWN_DELIVERY_LABEL = "Sync state unknown";
 export const UNKNOWN_DELIVERY_TONE: DeliveryTone = "outline";
 
-const DELIVERY_LABELS: Record<EdgeDeliveryState, string> = {
+// Every map below is keyed on the INTERNAL state name, never on the wire
+// spelling. The wire spelling lives in exactly one place —
+// `EDGE_DELIVERY_STATE_WIRE_NAMES` in `api/edgeStatus.ts` — so a sidecar
+// rename is a one-line edit there and nothing in this file moves.
+const DELIVERY_LABELS: Record<EdgeDeliveryStateKey, string> = {
   // Queued in the local store and fanned out to every local client. This is
   // the "delivered locally" half of the pair — NOT "sent".
   pending: "Delivered locally",
+  // Still local only, but off the author's path: this machine's edge identity
+  // will carry it upstream inside a catch-up digest. Nobody is waiting on the
+  // author, so it must not read like `pending`.
+  pendingViaDigest: "Sync deferred",
   // An author drain has leased the event and is republishing it upstream.
   claimed: "Syncing",
   // The original event id landed in canonical history.
@@ -46,16 +56,19 @@ const DELIVERY_LABELS: Record<EdgeDeliveryState, string> = {
   quarantined: "Sync failed",
 };
 
-const DELIVERY_TONES: Record<EdgeDeliveryState, DeliveryTone> = {
+const DELIVERY_TONES: Record<EdgeDeliveryStateKey, DeliveryTone> = {
   pending: "outline",
+  pendingViaDigest: "warning",
   claimed: "secondary",
   syncedExact: "success",
   syncedViaDigest: "info",
   quarantined: "destructive",
 };
 
-const DELIVERY_DESCRIPTIONS: Record<EdgeDeliveryState, string> = {
+const DELIVERY_DESCRIPTIONS: Record<EdgeDeliveryStateKey, string> = {
   pending: "Everyone on this machine has it. Not in canonical history yet.",
+  pendingViaDigest:
+    "Its author can no longer replay it, so this machine will carry it to canonical history inside a catch-up digest.",
   claimed: "Its author is republishing it to canonical history now.",
   syncedExact: "In canonical history under its original event id.",
   syncedViaDigest:
@@ -70,7 +83,8 @@ const DELIVERY_DESCRIPTIONS: Record<EdgeDeliveryState, string> = {
  * badge, not take the timeline down with it.
  */
 export function coerceDeliveryState(value: unknown): EdgeDeliveryState | null {
-  return isEdgeDeliveryState(value) ? value : null;
+  const key = edgeDeliveryStateKey(value);
+  return key === null ? null : EDGE_DELIVERY_STATE_WIRE_NAMES[key];
 }
 
 /**
@@ -79,22 +93,37 @@ export function coerceDeliveryState(value: unknown): EdgeDeliveryState | null {
  * the upstream sync has not.
  */
 export function deliveryLabel(state: unknown): string {
-  const known = coerceDeliveryState(state);
-  return known === null ? UNKNOWN_DELIVERY_LABEL : DELIVERY_LABELS[known];
+  const key = edgeDeliveryStateKey(state);
+  return key === null ? UNKNOWN_DELIVERY_LABEL : DELIVERY_LABELS[key];
 }
 
 /** Badge tone for a delivery state, from the repo's existing variant set. */
 export function deliveryTone(state: unknown): DeliveryTone {
-  const known = coerceDeliveryState(state);
-  return known === null ? UNKNOWN_DELIVERY_TONE : DELIVERY_TONES[known];
+  const key = edgeDeliveryStateKey(state);
+  return key === null ? UNKNOWN_DELIVERY_TONE : DELIVERY_TONES[key];
 }
 
-/** Longer hover copy explaining what the label means. */
-export function deliveryDescription(state: unknown): string {
-  const known = coerceDeliveryState(state);
-  return known === null
-    ? "This build does not recognise the state the edge sidecar reported."
-    : DELIVERY_DESCRIPTIONS[known];
+/**
+ * Longer hover copy explaining what the label means.
+ *
+ * `demotionReason` is appended when the sidecar sent one. A grey "Sync
+ * deferred" with no reason is barely better than no badge at all: the label
+ * says where the event went, and only the reason says whether that is routine
+ * ("older than the relay drift window") or something the operator has to act
+ * on ("permanently rejected upstream").
+ */
+export function deliveryDescription(
+  state: unknown,
+  demotionReason?: string | null,
+): string {
+  const key = edgeDeliveryStateKey(state);
+  const base =
+    key === null
+      ? "This build does not recognise the state the edge sidecar reported."
+      : DELIVERY_DESCRIPTIONS[key];
+  const reason =
+    typeof demotionReason === "string" ? demotionReason.trim() : "";
+  return reason.length === 0 ? base : `${base} Reason: ${reason}`;
 }
 
 /**
@@ -102,8 +131,8 @@ export function deliveryDescription(state: unknown): string {
  * sync counts: the content converged, even though the event id did not.
  */
 export function isSyncedToCanonicalHistory(state: unknown): boolean {
-  const known = coerceDeliveryState(state);
-  return known === "syncedExact" || known === "syncedViaDigest";
+  const key = edgeDeliveryStateKey(state);
+  return key === "syncedExact" || key === "syncedViaDigest";
 }
 
 /**
@@ -112,13 +141,25 @@ export function isSyncedToCanonicalHistory(state: unknown): boolean {
  * read would be a lie in the more alarming direction.
  */
 export function isLocalOnly(state: unknown): boolean {
-  const known = coerceDeliveryState(state);
-  return known === "pending" || known === "claimed";
+  const key = edgeDeliveryStateKey(state);
+  return key === "pending" || key === "pendingViaDigest" || key === "claimed";
+}
+
+/**
+ * True when the event is queued but NO author can move it: this machine's edge
+ * identity carries it upstream in a digest instead.
+ *
+ * Kept separate from `isLocalOnly` because the two answer different questions.
+ * Anything summing a "waiting for an author" figure has to exclude these rows
+ * — there is no author to wait for.
+ */
+export function isCarriedByDigest(state: unknown): boolean {
+  return edgeDeliveryStateKey(state) === "pendingViaDigest";
 }
 
 /** Every label this module can produce, for exhaustiveness assertions. */
 export function allDeliveryLabels(): string[] {
-  return EDGE_DELIVERY_STATES.map((state) => DELIVERY_LABELS[state]);
+  return EDGE_DELIVERY_STATE_KEYS.map((key) => DELIVERY_LABELS[key]);
 }
 
 const MINUTE_SECONDS = 60;

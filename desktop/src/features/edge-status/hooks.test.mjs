@@ -2,11 +2,14 @@
  * Lifecycle tests for `useEdgeStatus`, mounting the real hook.
  *
  * The behaviours pinned here are the ones that decide whether an optional,
- * usually-absent sidecar costs the app anything:
- *   - the interval is CLEARED (not merely skipped) after the sidecar reports
- *     it is not running, so a machine without the feature does zero repeat IPC
- *   - an explicit `refresh()` brings polling back
- *   - unmount clears the timer
+ * usually-absent sidecar costs the app anything — and whether a sidecar that
+ * comes back is ever noticed:
+ *   - an absent sidecar drops the fast timer and re-arms a slow one, so a
+ *     machine without the feature does almost no repeat IPC, and a restarted
+ *     sidecar is picked up without the operator doing anything
+ *   - a real fault (503, binding mismatch, SQLite) is an error, not silence
+ *   - an explicit `refresh()` polls now, even mid-poll
+ *   - unmount clears the timer AND stops any surviving callback doing IPC
  *   - a hidden window never polls, and becoming visible catches up once
  *
  * `window.setInterval` / `window.clearInterval` are replaced with a recording
@@ -77,21 +80,26 @@ Object.assign(globalThis, {
 const React = (await import("react")).default;
 const { act } = await import("react");
 const { createRoot } = await import("react-dom/client");
-const { useEdgeStatus, EDGE_STATUS_POLL_INTERVAL_MS } = await import(
-  "./hooks.ts"
-);
+const {
+  useEdgeStatus,
+  EDGE_STATUS_POLL_INTERVAL_MS,
+  EDGE_UNAVAILABLE_RETRY_INTERVAL_MS,
+} = await import("./hooks.ts");
 
 const SUMMARY = {
   pending: 2,
+  pendingViaDigest: 4,
   claimed: 0,
-  deliveredExact: 9,
-  deliveredViaDigest: 1,
+  syncedExact: 9,
+  syncedViaDigest: 1,
   quarantined: 0,
 };
 const WAITING = [
   {
     author: "44b8e82baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     pending: 2,
+    ancestorBlocked: 0,
+    pendingViaDigest: 4,
     oldestPendingAt: 1_780_000_000,
   },
 ];
@@ -192,7 +200,7 @@ test("each tick re-reads both commands", async () => {
 
 // ── Sidecar not running ──────────────────────────────────────────────────────
 
-test("stops polling after a sidecar-not-running rejection", async () => {
+test("an absent sidecar backs off to the slow cadence instead of the fast one", async () => {
   invokeHandler = rejectingHandler("edge sidecar not running");
   await mount();
 
@@ -200,28 +208,79 @@ test("stops polling after a sidecar-not-running rejection", async () => {
   assert.equal(latest.error, null, "an absent sidecar is not an error");
   assert.equal(latest.summary, null);
   assert.deepEqual(latest.waitingAuthors, []);
+
+  assert.equal(activeIntervals.size, 1, "exactly one timer, not two");
   assert.equal(
-    activeIntervals.size,
-    0,
-    "the timer must be cleared, not left ticking against a dead process",
+    [...activeIntervals.values()][0].ms,
+    EDGE_UNAVAILABLE_RETRY_INTERVAL_MS,
+    "the fast timer must be torn down and a slow one armed in its place",
+  );
+  assert.ok(
+    EDGE_UNAVAILABLE_RETRY_INTERVAL_MS > EDGE_STATUS_POLL_INTERVAL_MS * 4,
+    "the retry cadence must actually be a backoff",
   );
 
   const callsAfterGivingUp = invokeCalls.length;
-  await tickAllIntervals();
+  await act(async () => {});
   assert.equal(
     invokeCalls.length,
     callsAfterGivingUp,
-    "no further IPC once the sidecar is known absent",
+    "re-arming the timer must not immediately re-poll a dead process",
   );
 });
 
-test("a community-binding rejection also goes quiet", async () => {
-  invokeHandler = rejectingHandler("community binding does not hold");
+/**
+ * The point of the backoff. A sidecar restart is the common case; before this,
+ * one rejection killed the surface for the rest of the session and nothing
+ * ever called refresh().
+ */
+test("a restarted sidecar is picked up by the slow retry, with no user action", async () => {
+  invokeHandler = rejectingHandler("edge sidecar not running");
+  await mount();
+  assert.equal(latest.unavailable, true);
+
+  invokeHandler = healthyHandler;
+  await tickAllIntervals();
+
+  assert.equal(latest.unavailable, false, "recovered on its own");
+  assert.deepEqual(latest.summary, SUMMARY);
+  assert.equal(activeIntervals.size, 1);
+  assert.equal(
+    [...activeIntervals.values()][0].ms,
+    EDGE_STATUS_POLL_INTERVAL_MS,
+    "and the fast cadence comes back",
+  );
+});
+
+/**
+ * Inverted on purpose (was "a community-binding rejection also goes quiet").
+ * A binding mismatch is a real fault: the sidecar is right there, answering,
+ * and refusing. Reporting it as "no sidecar installed" hid it completely.
+ */
+test("a community-binding rejection is a real error, not silence", async () => {
+  invokeHandler = rejectingHandler(
+    "relay returned 421 Misdirected Request: canonical relay/community binding mismatch",
+  );
   await mount();
 
-  assert.equal(latest.unavailable, true);
-  assert.equal(latest.error, null);
-  assert.equal(activeIntervals.size, 0);
+  assert.equal(latest.unavailable, false, "the sidecar is not absent");
+  assert.ok(latest.error instanceof Error, "the operator must see this");
+  assert.match(latest.error.message, /binding mismatch/);
+  assert.equal(
+    [...activeIntervals.values()][0].ms,
+    EDGE_STATUS_POLL_INTERVAL_MS,
+    "a fault does not slow the cadence",
+  );
+});
+
+test("a 503 from the relay is a real error, not silence", async () => {
+  invokeHandler = rejectingHandler("relay returned 503 Service Unavailable");
+  await mount();
+
+  assert.equal(latest.unavailable, false);
+  assert.ok(latest.error instanceof Error);
+  assert.match(latest.error.message, /503/);
+  assert.equal(activeIntervals.size, 1);
 });
 
 test("stale numbers are dropped when the sidecar disappears mid-session", async () => {
@@ -233,13 +292,19 @@ test("stale numbers are dropped when the sidecar disappears mid-session", async 
 
   assert.equal(latest.summary, null, "must not keep showing dead counters");
   assert.equal(latest.unavailable, true);
-  assert.equal(activeIntervals.size, 0);
+  assert.equal(
+    [...activeIntervals.values()][0].ms,
+    EDGE_UNAVAILABLE_RETRY_INTERVAL_MS,
+  );
 });
 
 test("resumes polling on an explicit refresh", async () => {
   invokeHandler = rejectingHandler("edge sidecar not running");
   await mount();
-  assert.equal(activeIntervals.size, 0);
+  assert.equal(
+    [...activeIntervals.values()][0].ms,
+    EDGE_UNAVAILABLE_RETRY_INTERVAL_MS,
+  );
 
   const callsWhileQuiet = invokeCalls.length;
   invokeHandler = healthyHandler;
@@ -255,6 +320,11 @@ test("resumes polling on an explicit refresh", async () => {
   assert.equal(latest.unavailable, false);
   assert.deepEqual(latest.summary, SUMMARY);
   assert.equal(activeIntervals.size, 1, "the interval must be re-armed");
+  assert.equal(
+    [...activeIntervals.values()][0].ms,
+    EDGE_STATUS_POLL_INTERVAL_MS,
+    "back on the fast cadence",
+  );
 });
 
 test("refresh while already polling does not leak a second timer", async () => {
@@ -263,6 +333,77 @@ test("refresh while already polling does not leak a second timer", async () => {
     latest.refresh();
   });
   assert.equal(activeIntervals.size, 1);
+});
+
+/**
+ * A refresh that lands while a poll is in flight used to be dropped on the
+ * floor by the in-flight latch: the button did nothing, and the numbers on
+ * screen were the ones fetched BEFORE the user asked.
+ */
+test("a refresh during an in-flight poll is honoured, not swallowed", async () => {
+  const gate = { resolve: null };
+  let served = 0;
+  invokeHandler = (command) => {
+    served += 1;
+    // Hold the very first summary call open until the test releases it.
+    if (command === "edge_delivery_summary" && served === 1) {
+      return new Promise((resolve) => {
+        gate.resolve = () => resolve({ ...SUMMARY });
+      });
+    }
+    return healthyHandler(command);
+  };
+
+  await mount();
+  assert.equal(latest.summary, null, "the first poll is still in flight");
+
+  await act(async () => {
+    latest.refresh();
+  });
+  const callsBeforeRelease = countCommandCalls("edge_delivery_summary");
+
+  await act(async () => {
+    gate.resolve();
+  });
+  await act(async () => {});
+
+  assert.equal(
+    countCommandCalls("edge_delivery_summary"),
+    callsBeforeRelease + 1,
+    "the queued refresh must run once the in-flight poll settles",
+  );
+  assert.deepEqual(latest.summary, SUMMARY);
+});
+
+test("an interval tick during an in-flight poll is coalesced, not queued", async () => {
+  // The opposite of the case above: a periodic tick that lands mid-poll is
+  // redundant by definition and must not double the IPC.
+  const gate = { resolve: null };
+  let served = 0;
+  invokeHandler = (command) => {
+    served += 1;
+    if (command === "edge_delivery_summary" && served === 1) {
+      return new Promise((resolve) => {
+        gate.resolve = () => resolve({ ...SUMMARY });
+      });
+    }
+    return healthyHandler(command);
+  };
+
+  await mount();
+  await tickAllIntervals();
+  const callsBeforeRelease = countCommandCalls("edge_delivery_summary");
+
+  await act(async () => {
+    gate.resolve();
+  });
+  await act(async () => {});
+
+  assert.equal(
+    countCommandCalls("edge_delivery_summary"),
+    callsBeforeRelease,
+    "no catch-up poll for a tick that was already covered",
+  );
 });
 
 // ── Genuine faults ───────────────────────────────────────────────────────────
@@ -302,16 +443,26 @@ test("clears its timer on unmount", async () => {
   assert.equal(activeIntervals.size, 0, "no timer may outlive the component");
 });
 
-test("a tick that survives unmount cannot write state back", async () => {
+/**
+ * Replaces a test that was provably vacuous: it asserted "no re-render
+ * happened after unmount" through a harness that only records state DURING a
+ * render, so an unmounted root could never have failed it — it passed with the
+ * mounted-ref guard deleted entirely.
+ *
+ * This asserts something a dead guard genuinely breaks: a surviving callback
+ * must not reach the sidecar at all. The stub throws on any call, so the tick
+ * either issues zero IPC or the recorded call list grows.
+ */
+test("a callback that survives unmount issues no IPC", async () => {
   await mount();
   const callbacks = [...activeIntervals.values()].map((entry) => entry.fn);
-  const frozen = latest;
+  const callsBeforeUnmount = invokeCalls.length;
 
-  invokeHandler = rejectingHandler("sqlite database is locked");
   await unmount();
 
-  // Even if a stray reference to the tick survived teardown, the mounted-ref
-  // guard must swallow the result rather than setState on a dead component.
+  invokeHandler = () => {
+    throw new Error("no command may be issued from an unmounted hook");
+  };
   await act(async () => {
     for (const fn of callbacks) {
       fn();
@@ -319,9 +470,38 @@ test("a tick that survives unmount cannot write state back", async () => {
   });
   await act(async () => {});
 
-  assert.equal(latest, frozen, "no re-render happened after unmount");
-  assert.deepEqual(latest.summary, SUMMARY);
-  assert.equal(latest.error, null);
+  assert.equal(
+    invokeCalls.length,
+    callsBeforeUnmount,
+    "a dead component must not talk to the sidecar",
+  );
+});
+
+/**
+ * The other half: a poll already in flight when the component goes away must
+ * not throw on the way out (an unhandled rejection here would surface as a
+ * crash in dev and a silent error in prod).
+ */
+test("a poll still in flight at unmount settles quietly", async () => {
+  const gate = { reject: null };
+  let served = 0;
+  invokeHandler = (command) => {
+    served += 1;
+    if (command === "edge_delivery_summary" && served === 1) {
+      return new Promise((_resolve, reject) => {
+        gate.reject = () => reject(new Error("sqlite database is locked"));
+      });
+    }
+    return healthyHandler(command);
+  };
+
+  await mount();
+  await unmount();
+
+  await act(async () => {
+    gate.reject();
+  });
+  await act(async () => {});
 });
 
 // ── Visibility ───────────────────────────────────────────────────────────────

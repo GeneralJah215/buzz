@@ -16,6 +16,13 @@ type DeliveryStateBadgeProps = {
    * timeline.
    */
   state: EdgeDeliveryState | string | null | undefined;
+  /**
+   * Why the event left the exact delivery path, straight from the sidecar's
+   * `demotionReason`. It lands in the tooltip: "Sync deferred" with no reason
+   * tells the operator where the event went but not whether that is routine or
+   * a problem, and the second half is the actionable one.
+   */
+  demotionReason?: string | null;
   className?: string;
 } & Omit<React.HTMLAttributes<HTMLSpanElement>, "children">;
 
@@ -29,6 +36,7 @@ type DeliveryStateBadgeProps = {
  */
 export function DeliveryStateBadge({
   state,
+  demotionReason,
   className,
   ...props
 }: DeliveryStateBadgeProps) {
@@ -37,7 +45,7 @@ export function DeliveryStateBadge({
   return (
     <Badge
       className={cn("gap-1", className)}
-      title={deliveryDescription(state)}
+      title={deliveryDescription(state, demotionReason)}
       variant={deliveryTone(state)}
       {...props}
     >

@@ -1,6 +1,6 @@
 //! Durable SQLite storage for locally delivered channel messages.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +24,10 @@ use uuid::Uuid;
 // budget, and files over the budget may not grow.
 #[path = "storage_status.rs"]
 mod storage_status;
-pub use storage_status::{EventDeliveryState, QuarantinedRow, WaitingAuthor, MAX_QUARANTINE_PAGE};
+pub use storage_status::{
+    truncate_quarantine_reason, EventDeliveryRow, EventDeliveryState, QuarantinedRow,
+    RequeueOutcome, WaitingAuthor, MAX_QUARANTINE_PAGE, MAX_QUARANTINE_REASON_BYTES,
+};
 
 const RECEIPT_KIND: u16 = 20_900;
 const AUTHORIZATION_SNAPSHOT_KIND: u16 = 20_901;
@@ -313,19 +316,28 @@ pub enum DrainOutcome {
 
 /// Outbox counts for the Desktop delivery surfaces.
 ///
-/// `delivered_exact` and `delivered_via_digest` are kept apart on purpose:
-/// the spec requires **delivered locally** and **synced to canonical history**
-/// to be labelled separately everywhere they surface (§13).
+/// `synced_exact` and `synced_via_digest` are kept apart on purpose: the spec
+/// requires **delivered locally** and **synced to canonical history** to be
+/// labelled separately everywhere they surface (§13). "Synced" is the word for
+/// the canonical-history states here and in [`EventDeliveryState`] both — one
+/// vocabulary, so a reader never has to work out that `deliveredExact` and
+/// `syncedExact` were the same thing.
+///
+/// The exact/digest split runs through the live states too: a pending row on
+/// the digest path is waiting for the edge identity, not for its author, and
+/// nothing on the waiting-for-author surface explains it otherwise.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxSummary {
-    /// Waiting for an author to drain them.
+    /// Waiting for their author to drain them.
     pub pending: u64,
+    /// Waiting for the edge identity to carry them upstream inside a digest.
+    pub pending_via_digest: u64,
     /// Leased to an author right now.
     pub claimed: u64,
     /// In canonical history under their original event IDs.
-    pub delivered_exact: u64,
+    pub synced_exact: u64,
     /// Represented in canonical history by an edge-authored digest instead.
-    pub delivered_via_digest: u64,
+    pub synced_via_digest: u64,
     /// Permanently refused upstream. Needs a human.
     pub quarantined: u64,
 }
@@ -1865,8 +1877,13 @@ impl EdgeStore {
                   WHERE event_id = ?1 AND state = 'claimed' AND claim_token = ?2",
                 params![event_id.to_hex(), claim_token, now],
             )?,
-            DrainOutcome::Rejected(ref reason) => connection.execute(
-                "UPDATE outbox
+            // The reason is free text from a drain client that ends up in
+            // every local identity's operator list, so it is bounded before it
+            // is ever stored — not only where it is read back.
+            DrainOutcome::Rejected(ref reason) => {
+                let reason = truncate_quarantine_reason(reason);
+                connection.execute(
+                    "UPDATE outbox
                     SET state = 'quarantined',
                         claim_token = NULL,
                         lease_owner_pubkey = NULL,
@@ -1874,35 +1891,56 @@ impl EdgeStore {
                         last_error = ?3,
                         updated_at = ?4
                   WHERE event_id = ?1 AND state = 'claimed' AND claim_token = ?2",
-                params![event_id.to_hex(), claim_token, reason.as_str(), now],
-            )?,
+                    params![event_id.to_hex(), claim_token, reason.as_str(), now],
+                )?
+            }
             // Transient: leave it claimed and let the lease lapse.
             DrainOutcome::Transient => 0,
         };
         Ok(changed > 0)
     }
 
-    /// Counts by state, for the Desktop delivery surfaces (§13).
-    pub fn outbox_summary(&self) -> Result<OutboxSummary, StorageError> {
-        let connection = self.connection.lock();
+    /// Counts by state for the Desktop delivery surfaces, over `channels` (§13).
+    ///
+    /// Scoped to a caller-supplied channel set — normally
+    /// [`EdgeStore::accessible_channels`] — for two reasons. It keeps the
+    /// operator from being told "40 events are pending" about channels they
+    /// cannot see or act on, and it keeps the totals reconcilable with the
+    /// quarantine and waiting-author lists, which are scoped the same way. A
+    /// count nothing on screen can explain is a bug report, not a status.
+    pub fn outbox_summary(&self, channels: &[Uuid]) -> Result<OutboxSummary, StorageError> {
         let mut summary = OutboxSummary::default();
-        let mut statement = connection
-            .prepare("SELECT state, delivery_path, COUNT(*) FROM outbox GROUP BY 1, 2")?;
+        if channels.is_empty() {
+            return Ok(summary);
+        }
+        let scope: HashSet<String> = channels.iter().map(Uuid::to_string).collect();
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT e.channel_id, o.state, o.delivery_path, COUNT(*)
+               FROM outbox o
+               JOIN events e ON e.event_id = o.event_id
+              GROUP BY 1, 2, 3",
+        )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? as u64,
             ))
         })?;
         for row in rows {
-            let (state, path, count) = row?;
+            let (channel, state, path, count) = row?;
+            if !scope.contains(&channel) {
+                continue;
+            }
             match (state.as_str(), path.as_str()) {
+                ("pending", "digest") => summary.pending_via_digest += count,
                 ("pending", _) => summary.pending += count,
                 ("claimed", _) => summary.claimed += count,
                 ("quarantined", _) => summary.quarantined += count,
-                ("delivered", "digest") => summary.delivered_via_digest += count,
-                ("delivered", _) => summary.delivered_exact += count,
+                ("delivered", "digest") => summary.synced_via_digest += count,
+                ("delivered", _) => summary.synced_exact += count,
                 _ => {}
             }
         }
@@ -2742,7 +2780,13 @@ mod tests {
         assert!(store
             .acknowledge_outbox_row("t", &event.id, DrainOutcome::Duplicate)
             .expect("ack"));
-        assert_eq!(store.outbox_summary().expect("summary").delivered_exact, 1);
+        assert_eq!(
+            store
+                .outbox_summary(&[channel])
+                .expect("summary")
+                .synced_exact,
+            1
+        );
         assert_eq!(store.pending_count().expect("pending"), 0);
     }
 
@@ -2762,9 +2806,9 @@ mod tests {
         assert!(!store
             .acknowledge_outbox_row("t", &event.id, DrainOutcome::Transient)
             .expect("ack"));
-        let summary = store.outbox_summary().expect("summary");
+        let summary = store.outbox_summary(&[channel]).expect("summary");
         assert_eq!(summary.claimed, 1, "row stays claimed");
-        assert_eq!(summary.delivered_exact, 0);
+        assert_eq!(summary.synced_exact, 0);
         assert_eq!(summary.quarantined, 0);
     }
 
@@ -2786,7 +2830,13 @@ mod tests {
                 DrainOutcome::Rejected("membership revoked".into())
             )
             .expect("ack"));
-        assert_eq!(store.outbox_summary().expect("summary").quarantined, 1);
+        assert_eq!(
+            store
+                .outbox_summary(&[channel])
+                .expect("summary")
+                .quarantined,
+            1
+        );
         // Quarantined rows are never handed out again.
         assert!(store
             .claim_outbox_batch(&author.public_key(), "t2", 10, 2_000, 60)
@@ -2820,7 +2870,10 @@ mod tests {
                 .expect("renew"),
             1
         );
-        assert_eq!(store.outbox_summary().expect("summary").claimed, 1);
+        assert_eq!(
+            store.outbox_summary(&[channel]).expect("summary").claimed,
+            1
+        );
     }
 
     /// Build a message with an explicit `created_at`, for drift-window tests.
@@ -3091,14 +3144,23 @@ mod tests {
             .acknowledge_digest_part("b1", 1, true, None)
             .expect("ack 1");
         assert!(!after_first.complete, "one of two parts is not delivery");
-        assert_eq!(store.outbox_summary().expect("s").delivered_via_digest, 0);
+        assert_eq!(
+            store
+                .outbox_summary(&[channel])
+                .expect("s")
+                .synced_via_digest,
+            0
+        );
 
         let after_second = store
             .acknowledge_digest_part("b1", 2, true, None)
             .expect("ack 2");
         assert!(after_second.complete);
         assert_eq!(
-            store.outbox_summary().expect("s").delivered_via_digest,
+            store
+                .outbox_summary(&[channel])
+                .expect("s")
+                .synced_via_digest,
             1,
             "source now counts as synced via digest, not as an exact delivery"
         );
@@ -3121,20 +3183,61 @@ mod tests {
             .expect("ack");
         assert!(progress.failed);
         assert!(!progress.complete);
-        assert_eq!(store.outbox_summary().expect("s").quarantined, 1);
+        assert_eq!(store.outbox_summary(&[channel]).expect("s").quarantined, 1);
     }
 
     #[test]
-    fn summary_separates_the_two_delivered_states() {
+    fn summary_separates_the_exact_and_digest_paths_in_every_state() {
         // §13: "delivered locally" and "synced to canonical history" must be
-        // labelled separately everywhere they surface.
-        let summary = OutboxSummary {
-            delivered_exact: 3,
-            delivered_via_digest: 2,
-            ..OutboxSummary::default()
-        };
-        assert_ne!(summary.delivered_exact, summary.delivered_via_digest);
-        assert_eq!(summary.delivered_exact + summary.delivered_via_digest, 5);
+        // labelled separately everywhere they surface — and the split does not
+        // start at the terminal state. A pending row on the digest path is
+        // waiting for the edge identity, not for its author, so a summary that
+        // merges the two describes a queue that does not exist.
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let exact = message(&author, channel, "still exact");
+        let demoted = message(&author, channel, "demoted");
+        store_with_event(&store, &exact, channel, &edge);
+        store_with_event(&store, &demoted, channel, &edge);
+        store
+            .connection
+            .lock()
+            .execute(
+                "UPDATE outbox SET delivery_path = 'digest' WHERE event_id = ?1",
+                [demoted.id.to_hex()],
+            )
+            .expect("demote");
+
+        let summary = store.outbox_summary(&[channel]).expect("summary");
+        assert_eq!(
+            summary.pending, 1,
+            "only the exact-path row awaits an author"
+        );
+        assert_eq!(
+            summary.pending_via_digest, 1,
+            "the demoted row is pending too, but nobody's drain will ever claim it"
+        );
+    }
+
+    #[test]
+    fn the_summary_counts_only_channels_the_caller_may_read() {
+        // The summary is part of the same status surface as the quarantine and
+        // waiting-author lists. Counting a channel the caller cannot read tells
+        // them a private channel exists and how busy it is.
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let mine = Uuid::new_v4();
+        let theirs = Uuid::new_v4();
+        store_with_event(&store, &message(&author, mine, "mine"), mine, &edge);
+        store_with_event(&store, &message(&author, theirs, "theirs"), theirs, &edge);
+
+        assert_eq!(store.outbox_summary(&[mine]).expect("summary").pending, 1);
+        assert_eq!(
+            store.outbox_summary(&[]).expect("summary"),
+            OutboxSummary::default(),
+            "an empty scope counts nothing at all"
+        );
     }
 
     #[test]

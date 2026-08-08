@@ -11,7 +11,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { EDGE_DELIVERY_STATES } from "../api/edgeStatus.ts";
+import {
+  EDGE_DELIVERY_STATE_KEYS,
+  EDGE_DELIVERY_STATE_WIRE_NAMES as WIRE,
+  EDGE_DELIVERY_STATES,
+} from "../api/edgeStatus.ts";
 import {
   allDeliveryLabels,
   coerceDeliveryState,
@@ -19,6 +23,7 @@ import {
   deliveryLabel,
   deliveryTone,
   formatQueuedAge,
+  isCarriedByDigest,
   isLocalOnly,
   isSyncedToCanonicalHistory,
   UNKNOWN_DELIVERY_LABEL,
@@ -45,10 +50,23 @@ test("every delivery state maps to a distinct label", () => {
   );
 });
 
-test("all five contract states are covered (no state falls through to unknown)", () => {
+/**
+ * This file talks about states through `EDGE_DELIVERY_STATE_WIRE_NAMES`, never
+ * by spelling a wire string. The literal strings are pinned once, in
+ * `api/edgeStatus.test.mjs`; here we pin the INTERNAL names, which a sidecar
+ * rename must never move.
+ */
+test("all six contract states are covered (no state falls through to unknown)", () => {
   assert.deepEqual(
-    [...EDGE_DELIVERY_STATES],
-    ["pending", "claimed", "syncedExact", "syncedViaDigest", "quarantined"],
+    [...EDGE_DELIVERY_STATE_KEYS],
+    [
+      "pending",
+      "pendingViaDigest",
+      "claimed",
+      "syncedExact",
+      "syncedViaDigest",
+      "quarantined",
+    ],
   );
   for (const state of EDGE_DELIVERY_STATES) {
     assert.notEqual(
@@ -60,10 +78,10 @@ test("all five contract states are covered (no state falls through to unknown)",
 });
 
 test("delivered-locally is never conflated with synced", () => {
-  const local = deliveryLabel("pending");
+  const local = deliveryLabel(WIRE.pending);
   assert.equal(local, "Delivered locally");
 
-  for (const synced of ["syncedExact", "syncedViaDigest"]) {
+  for (const synced of [WIRE.syncedExact, WIRE.syncedViaDigest]) {
     assert.notEqual(
       deliveryLabel(synced),
       local,
@@ -74,22 +92,71 @@ test("delivered-locally is never conflated with synced", () => {
   // The local label must not claim canonical history, and the synced labels
   // must not claim mere local delivery.
   assert.ok(!/synced|history/i.test(local));
-  assert.ok(/synced/i.test(deliveryLabel("syncedExact")));
-  assert.ok(/synced/i.test(deliveryLabel("syncedViaDigest")));
+  assert.ok(/synced/i.test(deliveryLabel(WIRE.syncedExact)));
+  assert.ok(/synced/i.test(deliveryLabel(WIRE.syncedViaDigest)));
+});
+
+/**
+ * A `pendingViaDigest` row is queued with NO author coming for it: this
+ * machine's edge identity carries it upstream. Wearing `pending`'s label would
+ * put it straight back into the "waiting for an author" story that the split
+ * exists to end.
+ */
+test("a digest-carried row does not read as waiting for its author", () => {
+  const deferred = deliveryLabel(WIRE.pendingViaDigest);
+  assert.notEqual(deferred, deliveryLabel(WIRE.pending));
+  assert.notEqual(deferred, deliveryLabel(WIRE.claimed));
+  assert.notEqual(deferred, UNKNOWN_DELIVERY_LABEL);
+  // It has not reached canonical history, so it must not claim to have.
+  assert.equal(isSyncedToCanonicalHistory(WIRE.pendingViaDigest), false);
+  assert.equal(isCarriedByDigest(WIRE.pendingViaDigest), true);
+  for (const other of EDGE_DELIVERY_STATES) {
+    if (other === WIRE.pendingViaDigest) continue;
+    assert.equal(
+      isCarriedByDigest(other),
+      false,
+      `${other} is not carried by the digest`,
+    );
+  }
+});
+
+/**
+ * "Sync deferred" tells the operator WHERE the event went; only the reason
+ * says whether that is routine or a problem, and a grey badge with no reason
+ * is barely better than no badge at all.
+ */
+test("a demotion reason reaches the description the badge shows", () => {
+  const bare = deliveryDescription(WIRE.pendingViaDigest);
+  const withReason = deliveryDescription(
+    WIRE.pendingViaDigest,
+    "permanently rejected upstream",
+  );
+  assert.notEqual(withReason, bare, "the reason must change what is shown");
+  assert.match(withReason, /permanently rejected upstream/);
+  assert.ok(withReason.startsWith(bare), "and must not replace the meaning");
+
+  // Nothing to add, nothing added.
+  assert.equal(deliveryDescription(WIRE.pendingViaDigest, null), bare);
+  assert.equal(deliveryDescription(WIRE.pendingViaDigest, "   "), bare);
+  // Even an unreadable state still surfaces the reason it came with.
+  assert.match(
+    deliveryDescription("brandNewState", "older than the relay drift window"),
+    /older than the relay drift window/,
+  );
 });
 
 test("exact and digest sync stay distinguishable", () => {
   assert.notEqual(
-    deliveryLabel("syncedExact"),
-    deliveryLabel("syncedViaDigest"),
+    deliveryLabel(WIRE.syncedExact),
+    deliveryLabel(WIRE.syncedViaDigest),
   );
-  assert.ok(/digest/i.test(deliveryLabel("syncedViaDigest")));
+  assert.ok(/digest/i.test(deliveryLabel(WIRE.syncedViaDigest)));
 });
 
 test("quarantined reads as a failure, not as delivered", () => {
-  const label = deliveryLabel("quarantined");
+  const label = deliveryLabel(WIRE.quarantined);
   assert.equal(label, "Sync failed");
-  assert.notEqual(label, deliveryLabel("syncedExact"));
+  assert.notEqual(label, deliveryLabel(WIRE.syncedExact));
 });
 
 test("allDeliveryLabels matches the per-state labels", () => {
@@ -126,6 +193,7 @@ test("an unknown state is reported as neither local-only nor synced", () => {
   // Guessing in either direction would put a false claim on screen.
   assert.equal(isLocalOnly("who-knows"), false);
   assert.equal(isSyncedToCanonicalHistory("who-knows"), false);
+  assert.equal(isCarriedByDigest("who-knows"), false);
 });
 
 // ── Tones ────────────────────────────────────────────────────────────────────
@@ -141,9 +209,9 @@ test("every tone comes from the repo's existing badge variant set", () => {
 });
 
 test("quarantined is the only destructive tone", () => {
-  assert.equal(deliveryTone("quarantined"), "destructive");
+  assert.equal(deliveryTone(WIRE.quarantined), "destructive");
   for (const state of EDGE_DELIVERY_STATES) {
-    if (state === "quarantined") continue;
+    if (state === WIRE.quarantined) continue;
     assert.notEqual(deliveryTone(state), "destructive");
   }
 });
@@ -151,18 +219,19 @@ test("quarantined is the only destructive tone", () => {
 // ── Axis predicates ──────────────────────────────────────────────────────────
 
 test("local-only covers exactly the pre-sync states", () => {
-  assert.equal(isLocalOnly("pending"), true);
-  assert.equal(isLocalOnly("claimed"), true);
-  assert.equal(isLocalOnly("syncedExact"), false);
-  assert.equal(isLocalOnly("syncedViaDigest"), false);
-  assert.equal(isLocalOnly("quarantined"), false);
+  assert.equal(isLocalOnly(WIRE.pending), true);
+  assert.equal(isLocalOnly(WIRE.pendingViaDigest), true);
+  assert.equal(isLocalOnly(WIRE.claimed), true);
+  assert.equal(isLocalOnly(WIRE.syncedExact), false);
+  assert.equal(isLocalOnly(WIRE.syncedViaDigest), false);
+  assert.equal(isLocalOnly(WIRE.quarantined), false);
 });
 
 test("digest sync counts as reaching canonical history", () => {
-  assert.equal(isSyncedToCanonicalHistory("syncedExact"), true);
-  assert.equal(isSyncedToCanonicalHistory("syncedViaDigest"), true);
-  assert.equal(isSyncedToCanonicalHistory("pending"), false);
-  assert.equal(isSyncedToCanonicalHistory("quarantined"), false);
+  assert.equal(isSyncedToCanonicalHistory(WIRE.syncedExact), true);
+  assert.equal(isSyncedToCanonicalHistory(WIRE.syncedViaDigest), true);
+  assert.equal(isSyncedToCanonicalHistory(WIRE.pending), false);
+  assert.equal(isSyncedToCanonicalHistory(WIRE.quarantined), false);
 });
 
 test("coerceDeliveryState passes known states through untouched", () => {

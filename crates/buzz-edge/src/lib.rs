@@ -33,9 +33,10 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use protocol::{
-    auth_challenge, auth_tag_json, binding_result, bounded_filters, closed, count, drain_batch,
-    eose, event_channel, event_message, filter_channels, notice, ok, parse_client_message,
-    requeue_reply, status_payload, status_reply, ClientMessage, MAX_STATUS_PAGE,
+    auth_challenge, auth_tag_json, binding_result, bounded_filters, closed, count,
+    delivery_states_payload, drain_batch, eose, event_channel, event_message, filter_channels,
+    notice, ok, parse_client_message, requeue_payload, requeue_reply, status_payload, status_reply,
+    ClientMessage, MAX_STATUS_PAGE,
 };
 use storage::{
     CommunityBinding, DrainOutcome, EdgeStore, InsertOutcome, OutboxSummary, QuarantinedRow,
@@ -686,6 +687,35 @@ impl EdgeRelay {
             .map_err(EdgeError::from)
     }
 
+    /// The channel scope every status surface runs inside, or a refusal.
+    ///
+    /// This is to `/status`, `/requeue`, and `/delivery-states` what
+    /// [`EdgeRelay::authorize_filters`] is to `REQ` and `COUNT`, and it is
+    /// deliberately built from the same two ingredients: the
+    /// `local_routing_ready` flag, and [`EdgeStore::accessible_channels`],
+    /// which is itself the `REQ` predicate. Callers must hold the
+    /// `authorization_epoch` read lock across this call and the read that
+    /// follows, so a snapshot revoked mid-flight cannot be raced.
+    ///
+    /// The status surface is not filtered to the *calling identity* — the
+    /// operator has to see that an agent's events are stuck — but it is
+    /// filtered to the channels the caller may read. Without that, a principal
+    /// scoped to one channel learns another channel's UUID, who posts there,
+    /// when, and why a post failed.
+    async fn status_scope(&self, principal: PublicKey, now: i64) -> Result<Vec<Uuid>, String> {
+        if !self.state.local_routing_ready.load(Ordering::Acquire) {
+            return Err(
+                "restricted: local routing is not authorized; reconnect to canonical relay"
+                    .to_string(),
+            );
+        }
+        let store = Arc::clone(&self.state.store);
+        tokio::task::spawn_blocking(move || store.accessible_channels(&principal, now))
+            .await
+            .map_err(|_| "error: membership cache unavailable".to_string())?
+            .map_err(|_| "error: membership cache unavailable".to_string())
+    }
+
     async fn authorize_filters(
         &self,
         filters: &[Filter],
@@ -1140,26 +1170,43 @@ async fn handle_websocket(relay: EdgeRelay, socket: WebSocket, _permit: OwnedSem
                         }
                     }
                     ClientMessage::Status { req_id, limit } => {
-                        let frame = match collect_status(&relay.state.store, limit, now_seconds()) {
-                            Ok((summary, quarantined, waiting)) => {
-                                status_reply(&req_id, &summary, &quarantined, &waiting)
+                        // Gated exactly like `Req`: the epoch read lock is held
+                        // across the scope check and the reads, so a snapshot
+                        // revoked mid-flight fails this request closed rather
+                        // than at the next sweep.
+                        let now = now_seconds();
+                        let _authorization = relay.state.authorization_epoch.read().await;
+                        let frame = match relay.status_scope(principal, now).await {
+                            Err(error) => notice(&error),
+                            Ok(_) => {
+                                match collect_status(&relay.state.store, &principal, limit, now) {
+                                    Ok((summary, quarantined, waiting)) => {
+                                        status_reply(&req_id, &summary, &quarantined, &waiting)
+                                    }
+                                    Err(error) => notice(&format!("error: status failed: {error}")),
+                                }
                             }
-                            Err(error) => notice(&format!("error: status failed: {error}")),
                         };
                         let _ = outbound.send(Message::Text(frame.into())).await;
                     }
                     ClientMessage::Requeue { req_id, event_id } => {
                         // `principal` — not the request — decides whose row
                         // this is, exactly as it does for `Drain`. The storage
-                        // layer filters on author, so a client cannot retry
-                        // someone else's quarantined event.
-                        let frame = match relay.state.store.requeue_quarantined(
-                            &event_id,
-                            &principal,
-                            now_seconds(),
-                        ) {
-                            Ok(requeued) => requeue_reply(&req_id, requeued),
-                            Err(error) => notice(&format!("error: requeue failed: {error}")),
+                        // layer filters on author *and* on channel access, so a
+                        // client can neither retry someone else's quarantined
+                        // event nor retry its own in a channel it has lost.
+                        let now = now_seconds();
+                        let _authorization = relay.state.authorization_epoch.read().await;
+                        let frame = match relay.status_scope(principal, now).await {
+                            Err(error) => notice(&error),
+                            Ok(_) => match relay
+                                .state
+                                .store
+                                .requeue_quarantined(&event_id, &principal, now)
+                            {
+                                Ok(outcome) => requeue_reply(&req_id, outcome),
+                                Err(error) => notice(&format!("error: requeue failed: {error}")),
+                            },
                         };
                         let _ = outbound.send(Message::Text(frame.into())).await;
                     }
@@ -1266,35 +1313,49 @@ fn now_seconds() -> i64 {
 
 /// Gather the three operator-facing status reads in one place so the
 /// WebSocket and HTTP surfaces can never drift apart.
+///
+/// All three take the same `principal` and `now`, so all three run inside the
+/// same channel scope. A surface that skipped the principal would be the hole
+/// this function exists to close.
 fn collect_status(
     store: &EdgeStore,
+    principal: &PublicKey,
     limit: usize,
     now: i64,
 ) -> Result<(OutboxSummary, Vec<QuarantinedRow>, Vec<WaitingAuthor>), StorageError> {
+    let channels = store.accessible_channels(principal, now)?;
     Ok((
-        store.outbox_summary()?,
-        store.quarantined_rows(limit)?,
-        store.waiting_authors(now)?,
+        store.outbox_summary(&channels)?,
+        store.quarantined_rows(principal, now, limit)?,
+        store.waiting_authors(principal, now)?,
     ))
 }
 
 /// Operator-facing sync status for the bound community.
 ///
-/// Authenticated like every other route, but deliberately not filtered to the
-/// calling principal: the Desktop operator must be able to see that an agent's
-/// events are stuck. The payload carries identifiers, counts, and failure
-/// reasons only — never message content — so this stays a status surface and
-/// not a way to read another identity's messages.
+/// Deliberately not filtered to the calling *identity* — the Desktop operator
+/// must be able to see that an agent's events are stuck — but filtered to the
+/// channels the caller may read, through the same gate `REQ` uses. The payload
+/// then carries identifiers, counts, and failure reasons only, never message
+/// content, so this stays a status surface and not a way to read another
+/// identity's messages.
 async fn http_status(State(relay): State<EdgeRelay>, headers: HeaderMap, body: Bytes) -> ApiResult {
-    let _principal = authenticate_http(&relay, &headers, &body, "/status").await?;
+    let principal = authenticate_http(&relay, &headers, &body, "/status").await?;
     let limit = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| value.get("limit").and_then(serde_json::Value::as_u64))
         .map(|value| value as usize)
         .unwrap_or(MAX_STATUS_PAGE)
         .clamp(1, MAX_STATUS_PAGE);
-    let (summary, quarantined, waiting) = collect_status(&relay.state.store, limit, now_seconds())
-        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "local status failed"))?;
+    let now = now_seconds();
+    let _authorization = relay.state.authorization_epoch.read().await;
+    relay
+        .status_scope(principal, now)
+        .await
+        .map_err(|error| api_error(StatusCode::FORBIDDEN, &error))?;
+    let (summary, quarantined, waiting) =
+        collect_status(&relay.state.store, &principal, limit, now)
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "local status failed"))?;
     Ok(Json(status_payload(&summary, &quarantined, &waiting)))
 }
 
@@ -1321,12 +1382,18 @@ async fn http_requeue(
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "event_id must be a string"))?;
     let event_id = nostr::EventId::from_hex(&event_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid event_id"))?;
-    let requeued = relay
+    let now = now_seconds();
+    let _authorization = relay.state.authorization_epoch.read().await;
+    relay
+        .status_scope(principal, now)
+        .await
+        .map_err(|error| api_error(StatusCode::FORBIDDEN, &error))?;
+    let outcome = relay
         .state
         .store
-        .requeue_quarantined(&event_id, &principal, now_seconds())
+        .requeue_quarantined(&event_id, &principal, now)
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "local requeue failed"))?;
-    Ok(Json(serde_json::json!({ "requeued": requeued })))
+    Ok(Json(requeue_payload(outcome)))
 }
 
 /// Largest batch of event IDs one delivery-state lookup may ask about.
@@ -1339,13 +1406,15 @@ const MAX_DELIVERY_STATE_BATCH: usize = 500;
 ///
 /// Unknown IDs are simply absent from the reply rather than reported as an
 /// error: an event with no outbox row came from upstream, which is a perfectly
-/// ordinary thing for the caller to have asked about.
+/// ordinary thing for the caller to have asked about. An event in a channel the
+/// caller may not read is absent for the same reason a `REQ` for it would be
+/// refused — otherwise this route is a membership oracle with a smaller payload.
 async fn http_delivery_states(
     State(relay): State<EdgeRelay>,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult {
-    let _principal = authenticate_http(&relay, &headers, &body, "/delivery-states").await?;
+    let principal = authenticate_http(&relay, &headers, &body, "/delivery-states").await?;
     let requested = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| {
@@ -1368,21 +1437,23 @@ async fn http_delivery_states(
                 .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid event_id"))?,
         );
     }
+    let now = now_seconds();
+    let _authorization = relay.state.authorization_epoch.read().await;
+    relay
+        .status_scope(principal, now)
+        .await
+        .map_err(|error| api_error(StatusCode::FORBIDDEN, &error))?;
     let states = relay
         .state
         .store
-        .event_delivery_states(&event_ids)
+        .event_delivery_states(&principal, now, &event_ids)
         .map_err(|_| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "local state lookup failed",
             )
         })?;
-    let payload: Vec<serde_json::Value> = states
-        .into_iter()
-        .map(|(event_id, state)| serde_json::json!([event_id.to_hex(), state]))
-        .collect();
-    Ok(Json(serde_json::json!(payload)))
+    Ok(Json(delivery_states_payload(&states)))
 }
 
 async fn authenticate_http(

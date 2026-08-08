@@ -4,7 +4,10 @@ use nostr::{Alphabet, Event, EventId, Filter, Kind, SingleLetterTag};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::storage::{OutboxSummary, QuarantinedRow, WaitingAuthor};
+use crate::storage::{
+    truncate_quarantine_reason, EventDeliveryRow, OutboxSummary, QuarantinedRow, RequeueOutcome,
+    WaitingAuthor,
+};
 
 const MAX_SUB_ID_LENGTH: usize = 256;
 const MAX_FILTERS: usize = 10;
@@ -164,10 +167,19 @@ fn parse_drain_ack(value: &Value) -> Result<ClientMessage, String> {
     ) {
         return Err(format!("unsupported drain outcome: {outcome}"));
     }
+    // Bounded here, at the edge of the process. `reason` is free text chosen by
+    // a drain client, stored verbatim, and then shown to *every other* local
+    // identity's operator list — so an unbounded one is both a content channel
+    // (ack your own message body and it lands in someone else's UI) and a
+    // memory amplifier (a 1.6 MB frame per row, times a page of rows).
+    //
+    // Truncated, never rejected: refusing the ack would leave the row leased
+    // and the author retrying the same oversized ack forever, which strands the
+    // row instead of bounding it.
     let reason = object
         .get("reason")
         .and_then(Value::as_str)
-        .map(str::to_string);
+        .map(truncate_quarantine_reason);
     if outcome == "rejected" && reason.is_none() {
         return Err("a rejected outcome requires a reason".to_string());
     }
@@ -267,6 +279,8 @@ pub fn status_payload(
                 "createdAt": row.created_at,
                 "attempts": row.attempts,
                 "reason": row.reason,
+                "carriedByDigest": row.carried_by_digest,
+                "demotionReason": row.demotion_reason,
                 "updatedAt": row.updated_at,
             })
         })
@@ -277,6 +291,8 @@ pub fn status_payload(
             serde_json::json!({
                 "author": row.author.to_hex(),
                 "pending": row.pending,
+                "ancestorBlocked": row.ancestor_blocked,
+                "pendingViaDigest": row.pending_via_digest,
                 "oldestPendingAt": row.oldest_pending_at,
             })
         })
@@ -284,9 +300,10 @@ pub fn status_payload(
     serde_json::json!({
         "summary": {
             "pending": summary.pending,
+            "pendingViaDigest": summary.pending_via_digest,
             "claimed": summary.claimed,
-            "deliveredExact": summary.delivered_exact,
-            "deliveredViaDigest": summary.delivered_via_digest,
+            "syncedExact": summary.synced_exact,
+            "syncedViaDigest": summary.synced_via_digest,
             "quarantined": summary.quarantined,
         },
         "quarantined": quarantined,
@@ -294,21 +311,48 @@ pub fn status_payload(
     })
 }
 
+/// The per-event delivery-state body shared by the WebSocket and HTTP surfaces.
+///
+/// Objects rather than `[id, state]` pairs, because a demoted row needs its
+/// `demotionReason` alongside the label: "pendingViaDigest" on its own tells
+/// the operator where the event went but not why, and why is the actionable
+/// half ("older than the relay drift window" is normal; "permanently rejected
+/// upstream" is not).
+pub fn delivery_states_payload(states: &[EventDeliveryRow]) -> Value {
+    let rows: Vec<Value> = states
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "eventId": row.event_id.to_hex(),
+                "state": row.state,
+                "demotionReason": row.demotion_reason,
+            })
+        })
+        .collect();
+    serde_json::json!(rows)
+}
+
 /// Format the reply to a manual quarantine retry.
 ///
 /// `requeued: false` is a normal answer, not an error: the row may already
 /// have been retried from another window, or it may belong to someone else.
-/// The caller is told which, without being told whose it is.
-pub fn requeue_reply(req_id: &str, requeued: bool) -> String {
-    serde_json::json!([
-        "BUZZ-EDGE",
-        "REQUEUE-REPLY",
-        {
-            "req_id": req_id,
-            "requeued": requeued,
-        }
-    ])
-    .to_string()
+/// `outcome` says which of those it was, because "carriedByDigest" is a state
+/// the operator can act on (the edge is already carrying the event upstream;
+/// stop pressing Retry) and a bare `false` looks identical to a lost row.
+pub fn requeue_reply(req_id: &str, outcome: RequeueOutcome) -> String {
+    let mut payload = requeue_payload(outcome);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("req_id".to_string(), Value::String(req_id.to_string()));
+    }
+    serde_json::json!(["BUZZ-EDGE", "REQUEUE-REPLY", payload]).to_string()
+}
+
+/// The requeue body shared by the WebSocket reply and the `/requeue` route.
+pub fn requeue_payload(outcome: RequeueOutcome) -> Value {
+    serde_json::json!({
+        "requeued": outcome.requeued(),
+        "outcome": outcome,
+    })
 }
 
 /// Format a leased batch for the author to submit upstream.
@@ -573,6 +617,7 @@ fn require_len(values: &[Value], expected: usize, verb: &str) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{EventDeliveryState, MAX_QUARANTINE_REASON_BYTES};
     use nostr::{EventBuilder, Keys, Tag};
 
     // ── Author-drain wire format (§11) ──────────────────────────────────────
@@ -905,9 +950,10 @@ mod tests {
         let event = signed_message(&author, channel, "queued");
         let summary = OutboxSummary {
             pending: 3,
+            pending_via_digest: 17,
             claimed: 5,
-            delivered_exact: 7,
-            delivered_via_digest: 11,
+            synced_exact: 7,
+            synced_via_digest: 11,
             quarantined: 13,
         };
         let row = QuarantinedRow {
@@ -917,11 +963,15 @@ mod tests {
             created_at: 1_700_000_001,
             attempts: 4,
             reason: "upstream refused: membership revoked".to_string(),
+            carried_by_digest: true,
+            demotion_reason: Some("permanently rejected upstream".to_string()),
             updated_at: 1_700_000_002,
         };
         let waiting = WaitingAuthor {
             author: waiter.public_key(),
             pending: 9,
+            ancestor_blocked: 19,
+            pending_via_digest: 23,
             oldest_pending_at: 1_699_999_999,
         };
 
@@ -937,10 +987,32 @@ mod tests {
         let body = &parsed[2];
         assert_eq!(body["req_id"], "req-1");
         assert_eq!(body["summary"]["pending"], 3);
+        assert_eq!(body["summary"]["pendingViaDigest"], 17);
         assert_eq!(body["summary"]["claimed"], 5);
-        assert_eq!(body["summary"]["deliveredExact"], 7);
-        assert_eq!(body["summary"]["deliveredViaDigest"], 11);
+        // One vocabulary end to end: the canonical-history counts are named
+        // `synced*` here and in `EventDeliveryState` both, never `delivered*`.
+        assert_eq!(body["summary"]["syncedExact"], 7);
+        assert_eq!(body["summary"]["syncedViaDigest"], 11);
         assert_eq!(body["summary"]["quarantined"], 13);
+        let mut summary_keys: Vec<&str> = body["summary"]
+            .as_object()
+            .expect("summary object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        summary_keys.sort_unstable();
+        assert_eq!(
+            summary_keys,
+            [
+                "claimed",
+                "pending",
+                "pendingViaDigest",
+                "quarantined",
+                "syncedExact",
+                "syncedViaDigest"
+            ],
+            "the summary key set is a contract with Desktop"
+        );
 
         let quarantined = &body["quarantined"][0];
         assert_eq!(quarantined["eventId"], event.id.to_hex());
@@ -953,10 +1025,20 @@ mod tests {
             "upstream refused: membership revoked"
         );
         assert_eq!(quarantined["updatedAt"], 1_700_000_002);
+        assert_eq!(
+            quarantined["carriedByDigest"], true,
+            "a row the edge already carries must say so, or Retry only hides it"
+        );
+        assert_eq!(
+            quarantined["demotionReason"],
+            "permanently rejected upstream"
+        );
 
         let waiting = &body["waitingAuthors"][0];
         assert_eq!(waiting["author"], waiter.public_key().to_hex());
         assert_eq!(waiting["pending"], 9);
+        assert_eq!(waiting["ancestorBlocked"], 19);
+        assert_eq!(waiting["pendingViaDigest"], 23);
         assert_eq!(waiting["oldestPendingAt"], 1_699_999_999);
     }
 
@@ -977,6 +1059,8 @@ mod tests {
             created_at: 1_700_000_001,
             attempts: 1,
             reason: "upstream refused: oversized".to_string(),
+            carried_by_digest: false,
+            demotion_reason: None,
             updated_at: 1_700_000_002,
         };
 
@@ -1007,8 +1091,10 @@ mod tests {
             [
                 "attempts",
                 "author",
+                "carriedByDigest",
                 "channelId",
                 "createdAt",
+                "demotionReason",
                 "eventId",
                 "reason",
                 "updatedAt"
@@ -1017,13 +1103,21 @@ mod tests {
     }
 
     #[test]
-    fn requeue_reply_reports_a_json_boolean() {
-        // Desktop branches on this value directly. A stringified "false" is
+    fn requeue_reply_reports_a_json_boolean_and_a_distinguishable_outcome() {
+        // Desktop branches on `requeued` directly. A stringified "false" is
         // truthy in JavaScript, so it would report a refused retry as a
         // successful one.
-        for requeued in [true, false] {
+        //
+        // `outcome` is the half a boolean cannot carry: "no such row of yours"
+        // and "the edge is already carrying this row upstream, stop pressing
+        // Retry" are the same `false` and completely different advice.
+        for (outcome, requeued, name) in [
+            (RequeueOutcome::Requeued, true, "requeued"),
+            (RequeueOutcome::NotFound, false, "notFound"),
+            (RequeueOutcome::CarriedByDigest, false, "carriedByDigest"),
+        ] {
             let parsed: Value =
-                serde_json::from_str(&requeue_reply("req-2", requeued)).expect("json");
+                serde_json::from_str(&requeue_reply("req-2", outcome)).expect("json");
             assert_eq!(parsed[0], "BUZZ-EDGE");
             assert_eq!(parsed[1], "REQUEUE-REPLY");
             assert!(
@@ -1032,7 +1126,92 @@ mod tests {
                 parsed[2]["requeued"]
             );
             assert_eq!(parsed[2]["requeued"], requeued);
+            assert_eq!(parsed[2]["outcome"], name);
         }
+    }
+
+    #[test]
+    fn delivery_states_carry_the_label_and_the_reason_it_was_demoted() {
+        // A demoted row's label says where the event went; `demotionReason`
+        // says why, and why is the half the operator can act on.
+        let author = Keys::generate();
+        let channel = Uuid::new_v4();
+        let normal = signed_message(&author, channel, "still exact");
+        let demoted = signed_message(&author, channel, "demoted");
+        let payload = delivery_states_payload(&[
+            EventDeliveryRow {
+                event_id: normal.id,
+                state: EventDeliveryState::Pending,
+                demotion_reason: None,
+            },
+            EventDeliveryRow {
+                event_id: demoted.id,
+                state: EventDeliveryState::PendingViaDigest,
+                demotion_reason: Some("older than the relay drift window".to_string()),
+            },
+        ]);
+        assert_eq!(payload[0]["eventId"], normal.id.to_hex());
+        assert_eq!(payload[0]["state"], "pending");
+        assert!(payload[0]["demotionReason"].is_null());
+        assert_eq!(payload[1]["state"], "pendingViaDigest");
+        assert_eq!(
+            payload[1]["demotionReason"],
+            "older than the relay drift window"
+        );
+    }
+
+    #[test]
+    fn a_drain_ack_reason_is_truncated_rather_than_stored_whole() {
+        // The reason is free text that ends up in every other local identity's
+        // operator list. Unbounded, it is both a way to push a message body
+        // into someone else's UI and a way to make one status page hundreds of
+        // megabytes: MAX_MESSAGE_BYTES allows a 1.6 MB reason per row.
+        let event_id = EventId::from_hex(&"ab".repeat(32)).expect("event id");
+        let huge = "x".repeat(MAX_QUARANTINE_REASON_BYTES * 40);
+        let raw = serde_json::json!([
+            "BUZZ-EDGE", "DRAIN-ACK",
+            {
+                "claim_token": "t",
+                "event_id": event_id.to_hex(),
+                "outcome": "rejected",
+                "reason": huge,
+            }
+        ])
+        .to_string();
+        let parsed = parse_client_message(&raw).expect("DRAIN-ACK");
+        let ClientMessage::DrainAck { reason, .. } = parsed else {
+            panic!("expected a DRAIN-ACK");
+        };
+        let reason = reason.expect("a rejected outcome keeps its reason");
+        assert!(
+            reason.len() <= MAX_QUARANTINE_REASON_BYTES,
+            "reason kept {} bytes",
+            reason.len()
+        );
+        // Truncated, not refused: refusing the ack would leave the row leased
+        // and the author retrying the same oversized frame forever.
+        assert!(reason.starts_with("xxx"));
+        assert!(reason.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn truncating_a_reason_never_splits_a_multi_byte_character() {
+        // The cut lands inside a euro sign; splitting it would produce invalid
+        // UTF-8 and panic on the slice.
+        let mut reason = "a".repeat(MAX_QUARANTINE_REASON_BYTES - 4);
+        reason.push_str(&"\u{20ac}".repeat(8));
+        assert!(reason.len() > MAX_QUARANTINE_REASON_BYTES);
+        let truncated = truncate_quarantine_reason(&reason);
+        assert!(truncated.len() <= MAX_QUARANTINE_REASON_BYTES);
+        assert!(truncated.ends_with('\u{2026}'));
+        assert_eq!(
+            truncated
+                .chars()
+                .filter(|character| *character == '\u{20ac}')
+                .count(),
+            0,
+            "the character straddling the cut is dropped whole, not split"
+        );
     }
 
     #[test]
@@ -1045,7 +1224,8 @@ mod tests {
             serde_json::from_str(&status_reply(req_id, &OutboxSummary::default(), &[], &[]))
                 .expect("json");
         assert_eq!(status[2]["req_id"], req_id);
-        let requeue: Value = serde_json::from_str(&requeue_reply(req_id, true)).expect("json");
+        let requeue: Value =
+            serde_json::from_str(&requeue_reply(req_id, RequeueOutcome::Requeued)).expect("json");
         assert_eq!(requeue[2]["req_id"], req_id);
     }
 
