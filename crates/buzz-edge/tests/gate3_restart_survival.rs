@@ -18,6 +18,31 @@
 //! upstream, so the sidecar comes back the way it comes back on the operator's
 //! machine at 6am: offline, on its signed lease.
 //!
+//! # Two things this gate does NOT prove, stated up front
+//!
+//! **The recovery of the mid-flight rows is caused by compressed time, not by
+//! the restart.** The four rows alice and bob claimed before the restart are
+//! held under a [`DRAIN_LEASE_SECONDS`]-second drain lease. Nothing about
+//! restarting the sidecar or reconnecting a client releases that lease: the
+//! post-restart drain calls `claim_outbox_batch`, which expires leases against
+//! the *real* clock, and only a couple of seconds of real clock have passed. So
+//! this gate calls [`EdgeStore::expire_outbox_leases`] directly with
+//! `restarted_at + DRAIN_LEASE_SECONDS + 1` to stand in for the minute of
+//! wall-clock the operator would actually wait. Delete that call and
+//! `recovered == unfinished` fails — not because a row was lost, but because
+//! the lease has not run out yet.
+//!
+//! What the gate therefore proves is: **the rows survived the process
+//! boundary** — they are on disk, unclaimed-able but intact, and they come back
+//! complete and exactly once when their lease expires. It does **not** prove
+//! that a restart alone returns them, and it must not be read that way.
+//!
+//! **Startup is not the production startup.** The gate calls
+//! `apply_startup_policy` and the test harness's `serve` directly rather than
+//! running `main.rs`, so environment parsing, the keyring-backed edge identity,
+//! the selected-channel replacement, and the mirror spawn are all outside what
+//! is proven here.
+//!
 //! "No duplicate canonical events" is demonstrated four ways, because a count
 //! alone cannot tell the difference between correct dedup and a write that
 //! silently failed:
@@ -306,17 +331,24 @@ async fn gate3_restart_survival() {
 
     let (url, relay, server) = harness::serve(Arc::clone(&store), edge_keys.clone(), true).await;
 
+    // ── Compressed time, applied explicitly ────────────────────────────────
+    //
     // The author process vanished with the sidecar, so its drain leases are
-    // stranded. Sixty-one seconds of clock is applied directly, because the
-    // lease length is a sidecar constant and the wire drain reads the real
-    // clock. How many rows come back is itself the outbox-loss measurement.
+    // stranded — and nothing about the restart or the reconnect releases them.
+    // The drain path reads the real clock, and only seconds of real clock have
+    // passed, so without this call the rows stay leased and every recovery
+    // assertion below fails. This line *is* the minute the operator would
+    // wait; it is not the restart doing the work. See this file's header.
     let reclaimed = store
         .expire_outbox_leases(restarted_at + DRAIN_LEASE_SECONDS + 1)
         .expect("expire stranded leases");
     assert_eq!(
         reclaimed, 4,
-        "four rows were mid-flight when the sidecar went away and all four must return \
-         to the queue"
+        "four rows were mid-flight when the sidecar went away, and all four must return to \
+         the queue once their {DRAIN_LEASE_SECONDS}-second drain lease expires. The clock is \
+         compressed here by the test, not advanced by the restart: what is being measured is \
+         that the rows survived the process boundary intact, not that a restart releases a \
+         live lease"
     );
 
     // ── No outbox loss ─────────────────────────────────────────────────────
@@ -365,7 +397,10 @@ async fn gate3_restart_survival() {
     assert_eq!(
         recovered, unfinished,
         "the outbox after the restart does not hold exactly the rows that were unfinished \
-         before it"
+         before it. Note what this does and does not say: the rows are re-offered because \
+         their drain lease was expired above with a compressed clock, so a failure here is \
+         a failure of durability across the process boundary — not evidence that a restart \
+         on its own re-offers a leased row, which it does not"
     );
     assert!(
         !recovered.contains(&delivered.id.to_hex()),
@@ -475,7 +510,12 @@ async fn gate3_restart_survival() {
     println!("[gate3] messages submitted before the restart: 5");
     println!("[gate3] rows acknowledged delivered before the restart: 1");
     println!("[gate3] rows mid-flight at the restart: 4");
-    println!("[gate3] rows reclaimed by lease expiry after the restart: {reclaimed}");
+    println!(
+        "[gate3] rows reclaimed by lease expiry after the restart: {reclaimed} \
+         (clock compressed by the test to restarted_at + {} s; the restart itself does not \
+         release a live drain lease)",
+        DRAIN_LEASE_SECONDS + 1
+    );
     println!(
         "[gate3] events replayed to the reconnecting Desktop: {}",
         history.len()

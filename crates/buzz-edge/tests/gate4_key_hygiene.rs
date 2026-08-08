@@ -13,21 +13,37 @@
 //! author's key to sign something on their behalf, a drain is where it would
 //! happen.
 //!
-//! 1. **Nothing durable.** Every byte of every file in the sidecar's data
-//!    directory — the SQLite database, its write-ahead log, its shared-memory
-//!    index — is searched for each identity's secret in all four shapes a key
-//!    is realistically stored in: raw 32 bytes, lowercase hex, uppercase hex,
-//!    and bech32 `nsec`. *Positive controls:* a planted decoy secret is found
-//!    by the same search in all four shapes, and an author's **public** key is
-//!    found in the real database, so a clean result cannot come from an empty
-//!    file or a broken matcher.
+//! # What this gate searches
 //!
-//! 2. **Nothing on the wire.** The same search runs over every frame the
-//!    clients sent to the sidecar and every frame the sidecar sent back. A
-//!    private key the sidecar never receives is one it cannot cache, and a
-//!    private key it never emits is one it cannot leak; the recording is
-//!    unconditional inside the harness so a newly added `send` cannot slip past
-//!    it.
+//! 1. **Nothing durable, in the data directory tree.** Every byte of every file
+//!    under the sidecar's data directory — the SQLite database, its
+//!    write-ahead log, its shared-memory index, **and every subdirectory**, so
+//!    a key parked in `<data>/keys/edge.json` is not invisible — is searched
+//!    for each identity's secret in all of [`KEY_SHAPES`] shapes: raw 32 bytes,
+//!    lowercase hex, uppercase hex, bech32 `nsec`, standard base64, URL-safe
+//!    base64, the serde JSON array-of-integers that is the *default*
+//!    serialization of a `[u8; 32]`, colon- and space-separated hex, and
+//!    UTF-16 (both endiannesses) of the hex and `nsec` forms — UTF-16 because
+//!    that is the encoding this very feature writes its scheduled-task XML in.
+//!    An `0x`-prefixed hex string needs no separate needle: the plain hex
+//!    needles are a substring of it.
+//!
+//!    *Positive controls:* a decoy secret is written into a real file in a real
+//!    **subdirectory** of the data directory and then found by the **same
+//!    production scan path** the negative assertions use, in every shape; and
+//!    an author's **public** key is found in the real database, so a clean
+//!    result cannot come from an empty file or a broken matcher. The control
+//!    deliberately does not search a buffer it built itself — a control that
+//!    never touches [`data_directory_bytes`] cannot detect that function
+//!    reading the wrong directory, skipping subdirectories, or losing its
+//!    per-file loop, which is exactly how this gate was previously wrong.
+//!
+//! 2. **Nothing on the wire, across the client/sidecar boundary.** The same
+//!    search runs over every frame the clients sent to the sidecar and every
+//!    frame the sidecar sent back. A private key the sidecar never receives is
+//!    one it cannot cache, and a private key it never emits is one it cannot
+//!    leak; the recording is unconditional inside the harness so a newly added
+//!    `send` cannot slip past it.
 //!
 //! 3. **Nothing signed.** Every artifact the sidecar authored — one delivery
 //!    receipt per locally accepted event, the authorization snapshot, every
@@ -37,14 +53,37 @@
 //!    sidecar ever acquired an author's key and used it, the extra artifact
 //!    would show up here.
 //!
+//! # What this gate does NOT search, and why
+//!
+//! An honest narrow gate beats a broad-sounding one, so the holes are named
+//! here rather than left for a reader to infer from a green run.
+//!
+//! - **The Windows Credential Manager.** In production the edge identity is
+//!   persisted as a bech32 `nsec` **string** by `main.rs`
+//!   (`keyring::Entry::set_password`, service `buzz-edge`). That is the real
+//!   at-rest location of the one key the sidecar is *supposed* to hold, and it
+//!   is out of scope here for two reasons: this gate never executes `main.rs`
+//!   (it constructs its keys in-process), and a test must not write to, read
+//!   from, or enumerate the operator's credential store. Nothing in this file
+//!   says anything about what is or is not in the keyring. A gate that covers
+//!   it has to run the real binary against a scratch account name.
+//! - **The sidecar↔canonical-relay direction.** This gate runs no upstream
+//!   mirror, so "nothing on the wire" is a claim about the *client* boundary
+//!   only. The mirror's frames are unscanned here.
+//! - **Process memory.** Nothing in this gate inspects the sidecar's heap.
+//! - **Anything outside the data directory tree**, including the temporary
+//!   directory's parent, the system temp directory, and any log sink.
+//!
 //! What would break this gate: a future change that caches a drained author's
 //! key. Assertion 2 fails the moment the key has to be transmitted to be
-//! cached; assertion 1 fails the moment it is written down; assertion 3 fails
-//! the moment it is used.
+//! cached; assertion 1 fails the moment it is written into the data directory;
+//! assertion 3 fails the moment it is used.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE as BASE64_URL_SAFE};
+use base64::Engine;
 use nostr::{Event, EventBuilder, Filter, JsonUtil, Keys, Kind, PublicKey, Tag, ToBech32};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -62,14 +101,47 @@ struct Needle {
     bytes: Vec<u8>,
 }
 
+/// How many shapes [`secret_needles`] produces per identity.
+///
+/// Asserted against the produced list so the reported number cannot drift away
+/// from the searched number — a gate that claims more coverage than it has is
+/// the failure this whole file is guarding against.
+const KEY_SHAPES: usize = 13;
+
+/// Separator-joined hex, e.g. `ab:cd:ef…`.
+fn separated_hex(lowercase_hex: &str, separator: &str) -> String {
+    lowercase_hex
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| String::from_utf8_lossy(pair).into_owned())
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+fn utf16_le(value: &str) -> Vec<u8> {
+    value.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+fn utf16_be(value: &str) -> Vec<u8> {
+    value.encode_utf16().flat_map(u16::to_be_bytes).collect()
+}
+
 /// Every shape of one identity's secret key that this gate searches for.
+///
+/// The list is deliberately longer than "the obvious four". A leak does not get
+/// to choose a convenient encoding: the JSON array-of-integers form is what
+/// `serde` emits for a bare `[u8; 32]` with no annotation, base64 is what a
+/// config file or an HTTP header carries, and UTF-16 is what a Windows
+/// scheduled-task XML — a file this very feature writes — is encoded in.
 fn secret_needles(keys: &Keys) -> Vec<Needle> {
     let secret = keys.secret_key();
+    let raw = secret.to_secret_bytes();
     let lowercase = secret.to_secret_hex();
-    vec![
+    let nsec = secret.to_bech32().expect("bech32 encoding of a secret key");
+    let needles = vec![
         Needle {
             shape: "raw 32 bytes",
-            bytes: secret.to_secret_bytes().to_vec(),
+            bytes: raw.to_vec(),
         },
         Needle {
             shape: "lowercase hex",
@@ -81,12 +153,51 @@ fn secret_needles(keys: &Keys) -> Vec<Needle> {
         },
         Needle {
             shape: "bech32 nsec",
-            bytes: secret
-                .to_bech32()
-                .expect("bech32 encoding of a secret key")
-                .into_bytes(),
+            bytes: nsec.clone().into_bytes(),
         },
-    ]
+        Needle {
+            shape: "standard base64",
+            bytes: BASE64_STANDARD.encode(raw).into_bytes(),
+        },
+        Needle {
+            shape: "URL-safe base64",
+            bytes: BASE64_URL_SAFE.encode(raw).into_bytes(),
+        },
+        Needle {
+            shape: "serde JSON array of integers",
+            bytes: serde_json::to_vec(&raw.to_vec()).expect("serialize the raw key bytes"),
+        },
+        Needle {
+            shape: "colon-separated hex",
+            bytes: separated_hex(&lowercase, ":").into_bytes(),
+        },
+        Needle {
+            shape: "space-separated hex",
+            bytes: separated_hex(&lowercase, " ").into_bytes(),
+        },
+        Needle {
+            shape: "UTF-16LE hex",
+            bytes: utf16_le(&lowercase),
+        },
+        Needle {
+            shape: "UTF-16BE hex",
+            bytes: utf16_be(&lowercase),
+        },
+        Needle {
+            shape: "UTF-16LE nsec",
+            bytes: utf16_le(&nsec),
+        },
+        Needle {
+            shape: "UTF-16BE nsec",
+            bytes: utf16_be(&nsec),
+        },
+    ];
+    assert_eq!(
+        needles.len(),
+        KEY_SHAPES,
+        "the reported key-shape count must equal the searched key-shape count"
+    );
+    needles
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -98,27 +209,58 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-/// Read every file in the sidecar's data directory.
+/// Read every file in the sidecar's data directory, **recursively**.
+///
+/// A flat `read_dir` would make `<data>/keys/edge.json` invisible, which is a
+/// perfectly ordinary place for a key to end up and therefore exactly the place
+/// this gate must be able to see. Names are returned relative to the data
+/// directory so a failure message says *where* the key was found.
 fn data_directory_bytes(directory: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(directory).expect("read the edge data directory") {
-        let entry = entry.expect("directory entry");
-        if !entry.file_type().expect("file type").is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("<unnamed>")
-            .to_string();
-        files.push((
-            name,
-            std::fs::read(&path).expect("read the edge database file"),
-        ));
-    }
+    collect_files(directory, directory, &mut files);
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
+}
+
+fn collect_files(
+    root: &std::path::Path,
+    directory: &std::path::Path,
+    files: &mut Vec<(String, Vec<u8>)>,
+) {
+    for entry in std::fs::read_dir(directory).unwrap_or_else(|error| {
+        panic!(
+            "read the edge data directory {}: {error}",
+            directory.display()
+        )
+    }) {
+        let entry = entry.expect("directory entry");
+        let path = entry.path();
+        let file_type = entry.file_type().expect("file type");
+        if file_type.is_dir() {
+            collect_files(root, &path, files);
+            continue;
+        }
+        if !file_type.is_file() {
+            // A symlink or a device node is reported rather than skipped: a
+            // silently ignored entry is an unscanned byte range.
+            files.push((
+                format!("{} <not a regular file>", relative_name(root, &path)),
+                Vec::new(),
+            ));
+            continue;
+        }
+        files.push((
+            relative_name(root, &path),
+            std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+        ));
+    }
+}
+
+fn relative_name(root: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 async fn next_control_frame(socket: &mut ClientSocket) -> Value {
@@ -297,6 +439,27 @@ async fn gate4_key_hygiene() {
     );
 
     // ── 1. Nothing durable ─────────────────────────────────────────────────
+    //
+    // Positive control A, planted BEFORE the scan so the production scan path
+    // is the thing under test. The decoy goes into a real file in a real
+    // subdirectory of the data directory, so this control fails if
+    // `data_directory_bytes` reads the wrong directory, refuses to recurse,
+    // filters out the file that matters, or breaks its per-file loop. A control
+    // that searched a buffer it had just built itself would prove only that
+    // `slice::windows().any()` works.
+    let decoy = Keys::generate();
+    let planted_directory = directory.path().join("keys");
+    std::fs::create_dir_all(&planted_directory).expect("create the planted key subdirectory");
+    let planted_path = planted_directory.join("decoy-edge-identity.bin");
+    let mut planted = Vec::new();
+    for needle in secret_needles(&decoy) {
+        planted.extend_from_slice(needle.shape.as_bytes());
+        planted.extend_from_slice(b"=");
+        planted.extend_from_slice(&needle.bytes);
+        planted.extend_from_slice(b"\n");
+    }
+    std::fs::write(&planted_path, &planted).expect("plant the decoy secret");
+
     let files = data_directory_bytes(directory.path());
     let scanned_bytes: usize = files.iter().map(|(_, bytes)| bytes.len()).sum();
     assert!(
@@ -305,19 +468,21 @@ async fn gate4_key_hygiene() {
          directory would pass every search below for the wrong reason",
         files.len()
     );
-
-    // Positive control A: the matcher finds every shape it claims to find.
-    let decoy = Keys::generate();
-    let mut planted = Vec::new();
-    for needle in secret_needles(&decoy) {
-        planted.extend_from_slice(b"----");
-        planted.extend_from_slice(&needle.bytes);
-    }
+    let planted_name = relative_name(directory.path(), &planted_path);
+    assert!(
+        files.iter().any(|(name, _)| name == &planted_name),
+        "the production scan never visited {planted_name}, so it does not see files in \
+         subdirectories of the data directory; every 'not found' below would be about a \
+         directory listing rather than about the data the sidecar wrote. Scanned: {:?}",
+        files.iter().map(|(name, _)| name).collect::<Vec<_>>()
+    );
     for needle in secret_needles(&decoy) {
         assert!(
-            contains(&planted, &needle.bytes),
-            "the {} search cannot find a key that is definitely present, so its absence \
-             elsewhere proves nothing",
+            files
+                .iter()
+                .any(|(_, bytes)| contains(bytes, &needle.bytes)),
+            "the production data-directory scan cannot find a {} key that is definitely \
+             written to {planted_name}, so its absence elsewhere proves nothing",
             needle.shape
         );
     }
@@ -446,8 +611,23 @@ async fn gate4_key_hygiene() {
     }
 
     println!("[gate4] identities exercised: 2 authors + 1 provisioned edge identity");
-    println!("[gate4] key shapes searched per identity: 4 (raw, lower hex, upper hex, nsec)");
-    println!("[gate4] data-directory files scanned: {}", files.len());
+    println!(
+        "[gate4] key shapes searched per identity: {KEY_SHAPES} ({})",
+        secret_needles(&decoy)
+            .iter()
+            .map(|needle| needle.shape)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "[gate4] data-directory files scanned (recursive): {} [{}]",
+        files.len(),
+        files
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     println!("[gate4] data-directory bytes scanned: {scanned_bytes}");
     println!("[gate4] client-to-sidecar frames scanned: {}", sent.len());
     println!(
@@ -463,6 +643,11 @@ async fn gate4_key_hygiene() {
         stored.len()
     );
     println!("[gate4] private keys found: 0");
+    println!(
+        "[gate4] NOT searched (see this file's header): the Windows Credential Manager entry \
+         that holds the production edge nsec, the sidecar-to-canonical-relay wire, process \
+         memory, and anything outside the data directory tree"
+    );
 
     server.abort();
     drop(relay);

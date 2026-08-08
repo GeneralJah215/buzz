@@ -317,8 +317,20 @@ test-unit:
         # membership alone buys clippy/check, not a single executed test.
         cargo nextest run -p buzz-backend-kubernetes
         # Local continuity sidecar: protocol, SQLite durability, authorization
-        # lease, and loopback fan-out are all infra-free.
-        cargo nextest run -p buzz-edge
+        # lease, and loopback fan-out are all infra-free. This also runs release
+        # gates 3 and 4, which are not timing sensitive.
+        #
+        # Gate 2 is excluded here and run on its own immediately below, through
+        # the same `just edge-gate2` recipe an operator would type. It measures
+        # a 250 ms p95, and nextest runs every test in the workspace job
+        # concurrently by default — a gate whose verdict depends on how many
+        # other tests happened to be scheduled beside it is not a gate. The
+        # exclusion names the gate's test binary and is paired with the explicit
+        # run: rename the file and `just edge-gate2` hard-errors on the missing
+        # target; rename nothing and both lines keep working. Neither way can
+        # silently stop running the gate.
+        cargo nextest run -p buzz-edge -E 'not binary(gate2_slow_upstream_slo)'
+        {{just_executable()}} edge-gate2
     else
         ./scripts/run-tests.sh unit
     fi
@@ -333,18 +345,26 @@ test-integration:
 # and prints its collected measurements. `--nocapture` is deliberate: the gates
 # report counts and latencies, and a captured run reduces them to "ok".
 #
-# Gates 1 (full cut), 5 (private-channel end-to-end), and 6
-# (direct-to-upstream post-revocation) are NOT implemented — they need a real
-# canonical relay and real network manipulation, and a stub would make them
-# lie. What each one needs is written up in
-# crates/buzz-edge/tests/README.md.
+# Three of the spec's eleven gates are implemented: 2, 3, and 4. The other
+# eight (1, 5, 6, 7, 8, 9, 10, 11) are NOT — most need a real canonical relay,
+# real network manipulation, or a real Windows install cycle, and a stub would
+# make them lie. Every one of the eleven, including what unit coverage already
+# exists for it, is accounted for in crates/buzz-edge/tests/README.md.
 
 # All implemented Buzz Edge release gates
 edge-gates: edge-gate2 edge-gate3 edge-gate4
 
-# Gate 2 — slow-upstream transport SLO (p95 ≤ 250 ms, max ≤ 1 s, no send blocked
-# on upstream). Injects 30 s of upstream delay and runs for ~12 s; timing-sensitive,
-# so it is run on its own thread budget rather than beside the rest of the suite.
+# Gate 2 — slow-upstream transport SLO: submit-to-peer-delivery p95 ≤ 250 ms and
+# max ≤ 1 s, with no send blocked on upstream. The canonical relay answers its
+# NIP-42 handshake at once and then acknowledges no EVENT and sends no EOSE for
+# 300 s, while the real upstream mirror sits in its live read loop; the gate runs
+# for ~12 s inside that window.
+#
+# This recipe is the single definition of "run gate 2". `just test-unit` calls it
+# rather than running the gate inline, because the gate is timing sensitive and
+# must not have its verdict decided by whatever else nextest scheduled beside it.
+# `cargo test --test <one target>` runs that binary alone in its own process, and
+# `--test-threads=1` keeps it that way if a second test is ever added to the file.
 edge-gate2:
     cargo test -p buzz-edge --test gate2_slow_upstream_slo -- --nocapture --test-threads=1
 

@@ -113,10 +113,22 @@ run_unit_tests() {
   run_test_step "buzz-backend-kubernetes tests" \
     cargo test -p buzz-backend-kubernetes -- --nocapture
 
-  # Local continuity sidecar: protocol and SQLite tests are infra-free.
+  # Local continuity sidecar: protocol and SQLite tests are infra-free. This
+  # also runs release gates 3 and 4, which are not timing sensitive.
   # Keep this aligned with the cargo-nextest list in just test-unit.
-  run_test_step "buzz-edge tests" \
-    cargo test -p buzz-edge -- --nocapture
+  #
+  # Release gate 2 is skipped here and run on its own immediately below, through
+  # the same `just edge-gate2` recipe an operator would type — it asserts a
+  # 250 ms p95, and a gate whose verdict depends on what else was running beside
+  # it is not a gate. Both ways of running gate 2 must be the same way. The skip
+  # is by test name and is paired with the explicit run: if the test is ever
+  # renamed the filter stops matching and gate 2 runs twice, which is safe. It
+  # cannot silently stop running.
+  run_test_step "buzz-edge tests (release gate 2 excluded, run separately below)" \
+    cargo test -p buzz-edge -- --nocapture --skip gate2_slow_upstream_transport_slo
+
+  run_test_step "buzz-edge release gate 2 (slow-upstream transport SLO)" \
+    "${REPO_ROOT}/bin/just" edge-gate2
 }
 
 # ---- DB / integration tests (infra required) --------------------------------

@@ -2,27 +2,77 @@
 
 The phase-1 local-continuity spec
 (`docs/specs/SPEC-2026-08-05-buzz-edge-phase1-local-continuity.md`, "Test list")
-lists eleven release gates. This directory holds the ones that can be proven
-against a real sidecar without a real canonical relay.
+lists **eleven** release gates. **Three are built** (2, 3, 4). **Eight are not**
+(1, 5, 6, 7, 8, 9, 10, 11). Every one of the eleven is accounted for below,
+because the failure this directory is supposed to guard against — a gate that
+reads as coverage when it is not there — is committed just as easily by a
+document that lists six of eleven and lets the reader infer the rest.
 
-Run them with `just edge-gates`, or one at a time with `just edge-gate2`,
-`just edge-gate3`, `just edge-gate4`. Every recipe passes `--nocapture`: these
-gates report collection counts and measurements, and a captured run reduces all
-of that to the word `ok`.
+Run the built ones with `just edge-gates`, or one at a time with
+`just edge-gate2`, `just edge-gate3`, `just edge-gate4`. Every recipe passes
+`--nocapture`: these gates report collection counts and measurements, and a
+captured run reduces all of that to the word `ok`.
+
+## Status of all eleven
+
+| Gate | Status | Where |
+|---|---|---|
+| 1 — full cut (>15 min outage) | **not built** | needs a real relay + a real network cut; see below |
+| 2 — slow-upstream transport SLO | **built** | `gate2_slow_upstream_slo.rs` |
+| 3 — restart survival | **built** | `gate3_restart_survival.rs` |
+| 4 — key hygiene | **built** | `gate4_key_hygiene.rs` |
+| 5 — private-channel end-to-end | **not built** | needs a real relay enforcing private-channel membership |
+| 6 — direct-to-upstream post-revocation | **not built** | needs a real relay + relay-level membership removal |
+| 7 — authorization-lease gates (a)–(h) | **not built as a gate**; parts covered by unit tests | see below |
+| 8 — mixed-age thread | **not built as a gate**; demotion covered by unit tests | see below |
+| 9 — community-switch | **not built as a gate**; binding refusal covered by unit tests | see below |
+| 10 — digest durability (a)–(c) | **not built as a gate**; (b) and (c) covered by unit tests | see below |
+| 11 — packaging lifecycle | **not built**; lives in `desktop/`, not in this crate | see below |
+
+"Covered by unit tests" is **not** the same as "gated". A unit test proves a
+function behaves; a release gate proves the assembled system behaves under the
+spec's scenario. Where unit coverage exists it is named below so the next
+session knows what it can reuse — not so anyone can count it as the gate.
 
 ## Built
 
 | Gate | File | What it proves |
 |---|---|---|
-| 2 — slow-upstream transport SLO | `gate2_slow_upstream_slo.rs` | Local ingress-to-peer-delivery p95 ≤ 250 ms and max ≤ 1 s, with no send blocked on an upstream acknowledgment, while the real upstream mirror sits against a reachable relay that answers nothing for 60 s |
+| 2 — slow-upstream transport SLO | `gate2_slow_upstream_slo.rs` | Local **submit**-to-peer-delivery p95 ≤ 250 ms and max ≤ 1 s, with no send blocked on an upstream acknowledgment, while the real upstream mirror sits in its live read loop against a relay that acknowledges no `EVENT` and sends no `EOSE` for five minutes |
 | 3 — restart survival | `gate3_restart_survival.rs` | No outbox loss and no duplicate canonical events across a sidecar restart and a Desktop reconnect, with event-ID dedup demonstrated four ways |
-| 4 — key hygiene | `gate4_key_hygiene.rs` | The sidecar holds only the provisioned edge identity key: nothing durable, nothing on the wire, nothing signed under an author's identity |
+| 4 — key hygiene | `gate4_key_hygiene.rs` | The sidecar writes no author or edge private key into its data directory tree and puts none on the client wire, and signs its own artifacts only under the provisioned edge identity |
+
+Each built gate's own module header states its measurement boundary and its
+limits. Two of those are worth repeating here, because both are places where
+the gate deliberately claims **less** than its title suggests:
+
+- **Gate 2 does not use the spec's literal measurement boundary.** The spec says
+  "from the sidecar returning `OK` … to each subscribed peer", which assumes the
+  sidecar acknowledges before it fans out. `accept_event` does the reverse — it
+  awaits `fan_out` and only then produces the `OK` — so the literal interval is
+  scheduling jitter, negative by construction, and stays green when a 400 ms
+  sleep is added at the top of `fan_out`. The gate asserts the spec's budgets
+  against **submit → peer delivery** instead, and reports `OK → peer delivery`
+  as an unasserted diagnostic. Do not "fix" it back without first changing
+  `accept_event`.
+- **Gate 3's recovery is caused by compressed time, not by the restart.** It
+  calls `expire_outbox_leases` directly, because nothing about a restart or a
+  reconnect releases a live 60-second drain lease. What it proves is that the
+  rows survive the process boundary intact and come back complete and exactly
+  once when the lease expires.
+- **Gate 4 does not search the Windows Credential Manager**, which is where
+  `main.rs` actually persists the edge identity (as a bech32 `nsec` string), nor
+  the sidecar↔relay wire, nor process memory. Those exclusions are listed in the
+  file header.
 
 `gate_harness/mod.rs` is the shared fixture — the same real store, real signed
 kind-39002 roster, real authorization lease, and authenticated WebSocket session
-that `status_and_requeue.rs` stands up.
+that `status_and_requeue.rs` stands up. Note that it is a **harness** startup,
+not `main.rs`: no gate in this directory executes the real binary's entry point,
+so environment parsing, the keyring-backed identity load, and the mirror spawn
+are unproven by all of them.
 
-## Not built: gates 1, 5, and 6
+## Not built: gates 1, 5, and 6 — they need a real canonical relay
 
 These three make claims about **upstream** behaviour. Every one of them requires
 a real canonical relay with real membership enforcement, and two of them require
@@ -142,6 +192,116 @@ Would have to be true:
   stronger property, because §6 does not claim it. If the relay's behaviour ever
   becomes stricter, this gate is where that gets recorded.
 
+## Not built: gates 7, 8, 9, and 10 — partial unit coverage, no gate
+
+Each of these has real unit coverage of the *decision layer* it depends on. None
+of them is gated, because in every case the part the spec actually asks about is
+the part that needs a real upstream, a real Desktop, or both.
+
+### Gate 7 — authorization-lease gates (a)–(h)
+
+The spec asks for eight sub-scenarios: (a) offline restart on a valid lease,
+(b) offline restart on an expired lease, (c) revocation performed upstream while
+offline and enforced at reconnect before any queued submission, (d) reconnect
+always refreshes before drain, (e) author removed while offline, (f) author
+removed while online via the kind-40099 announcement, (g) author added while
+offline, (h) roster-staleness fault injection with both carriers suppressed.
+
+Already covered as unit tests, reusable but not the gate:
+
+- `src/eligibility.rs`: `valid_signed_lease_restores_offline_eligibility`,
+  `expired_lease_and_definitive_denial_fail_closed`,
+  `signed_roster_replacement_bounds_removed_and_added_authors`,
+  `observed_revocation_cannot_restore_the_old_offline_lease`,
+  `membership_snapshot_must_be_signed_by_the_advertised_relay_identity`.
+- `src/storage.rs`: `system_removal_survives_an_unchanged_roster_refresh`,
+  `suppressed_removal_carriers_leave_local_access_until_canonical_rejection`,
+  `pre_snapshot_system_removal_cannot_override_a_newer_roster`,
+  `changed_roster_projection_can_reauthorize_a_removed_author`,
+  `signed_authorization_lease_is_bounded_and_survives_restart`.
+- `src/lib.rs`: `authorization_refresh_closes_removed_author_and_channel_subscriptions`,
+  `lease_expiry_closes_existing_subscription`.
+- Gate 3 exercises (a) end-to-end incidentally: the restarted sidecar comes back
+  on `AuthorizationStartup::OfflineLease` and keeps serving.
+
+What is missing for the gate: (c), (d), (f), and (g) are all statements about
+what happens **at a reconnect refresh against a live relay** and about ordering
+relative to drain. They need the real relay of gate 1, a drain client, and a
+compressed refresh clock.
+
+### Gate 8 — mixed-age thread gate
+
+> Author A posts a thread root at T−16 minutes, author B replies at T−5 minutes,
+> reconnect at T. Prove the root and the reply both go to the digest path, in
+> order; no orphan submission reaches upstream; nothing lands in quarantine as
+> `reply parent not found`.
+
+Already covered as unit tests: `src/storage.rs`
+`a_stale_parent_drags_its_fresh_replies_to_the_digest_path`,
+`a_fresh_thread_is_left_on_the_exact_path`,
+`demotion_propagates_down_a_multi_level_thread`,
+`a_quarantined_ancestor_demotes_its_descendants`, `demotion_is_idempotent`.
+
+What is missing for the gate: the two upstream-facing halves — "no orphan
+submission reaches upstream" and "nothing lands in quarantine as
+`reply parent not found`" — both require a real reconnect and a real drain
+against a relay. The demotion window is also real-clock today (same blocker as
+gate 1).
+
+### Gate 9 — community-switch gate
+
+> Two communities containing equal channel UUIDs; switch Desktop's active
+> community both directions; prove handshake rejection, fail-closed canonical
+> fallback, and zero cross-community read, write, or cache reuse.
+
+Already covered as unit tests: `src/storage.rs`
+`database_header_rejects_equal_channel_ids_from_another_community` and
+`canonical_binding_requires_a_plain_origin`; `src/lib.rs`
+`mismatched_community_handshake_is_rejected_before_auth`.
+
+What is missing for the gate: the *switch* itself. The spec's scenario is
+Desktop changing its active community in both directions and falling back to
+canonical routing cleanly, which is a `desktop/` behaviour driving two sidecar
+data directories — not something a single in-process store test observes.
+
+### Gate 10 — digest durability gates (a)–(c)
+
+> (a) ambiguous upstream response followed by retry → identical bytes re-sent,
+> exactly one canonical digest; (b) sidecar restart between digest
+> materialization and acknowledgment → same; (c) backlog whose digest content
+> exceeds 256 KiB → deterministic `part i/total N` chunks each ≤ 200 KiB, source
+> rows resolved only after all chunks acknowledged.
+
+Already covered as unit tests, and these are close to complete for (b) and (c):
+`src/storage.rs` `digest_materialization_survives_restart_with_identical_signed_bytes`,
+`digest_chunks_stay_under_the_ingest_limit_and_preserve_order`,
+`digest_chunking_is_deterministic`, `an_oversized_single_message_still_gets_a_chunk`,
+`sources_resolve_only_after_every_part_lands`,
+`a_rejected_part_quarantines_the_batch_and_its_sources`,
+`digest_sources_are_unique_across_batches_and_inputs_are_validated`.
+
+What is missing for the gate: (a) is entirely upstream — an *ambiguous* response
+(no answer, then a retry) and the proof that canonical history ends up with
+exactly one digest. That is a relay-side count, and there is no way to take it
+without a relay. (b) and (c) are proven at the store layer but never through the
+real submit path.
+
+## Not built: gate 11 — packaging lifecycle
+
+> Login race (task and Desktop starting together → readiness gate holds agents
+> until edge answers or the 2-second fallback fires), sidecar crash →
+> scheduled-task restart-on-failure brings it back and clients re-attach, reboot
+> → sidecar up before Desktop interaction, upgrade → task re-registered pointing
+> at the new binary, uninstall → task unregistered and process stopped, nothing
+> left running.
+
+Nothing in this crate can prove any of it. It lives in `desktop/` — the
+supervisor (`desktop/src-tauri/src/edge_supervisor.rs`), the NSIS installer hook
+(`desktop/src-tauri/windows/edge-task.nsi`), and the Windows Scheduled Task they
+register — and it needs a real install/upgrade/uninstall cycle on a real Windows
+user account. It is listed here only so the count of eleven closes; the gate
+belongs with the packaging work, not in `crates/buzz-edge/tests/`.
+
 ## Notes for whoever builds them
 
 - Do not let a missing precondition become a skip. If the relay is not up, the
@@ -152,3 +312,7 @@ Would have to be true:
   purely because of wall-clock time. Making the demotion window injectable is
   the cheapest way to make that gate runnable in CI, and it is a change to the
   sidecar, not to the gate.
+- Before believing a gate, break the property it names and watch the named
+  assertion fail. Gate 2 was green for weeks against a boundary that could not
+  move, and gate 4's positive control searched a buffer the test had just built.
+  Both looked fine in review.
