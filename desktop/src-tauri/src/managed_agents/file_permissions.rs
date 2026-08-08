@@ -164,3 +164,140 @@ pub(super) fn restrict_file_to_current_user(path: &Path) -> Result<(), String> {
         last_error.expect("loop ran at least once")
     ))
 }
+
+#[cfg(test)]
+mod restricted_write_tests {
+    use super::super::atomic_write_json_restricted;
+
+    /// The write itself must land on every platform â€” the permission tightening
+    /// is never allowed to cost the user their agent list.
+    #[test]
+    fn restricted_write_commits_the_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("managed-agents.json");
+
+        atomic_write_json_restricted(&path, br#"{"agents":[]}"#).expect("restricted write");
+
+        assert_eq!(
+            std::fs::read(&path).expect("read back").as_slice(),
+            br#"{"agents":[]}"#.as_slice()
+        );
+    }
+
+    /// The committed file must carry an explicit, inheritance-blocked DACL.
+    ///
+    /// This is the regression test for the defect where the Windows branch was
+    /// simply missing: the file inherited the parent directory's ACL, and on a
+    /// real install a non-owner group held Modify on 17 plaintext private keys.
+    /// Asserting `SE_DACL_PROTECTED` plus a single non-inherited ACE is exactly
+    /// the shape that cannot happen by inheritance.
+    #[cfg(windows)]
+    #[test]
+    fn restricted_write_blocks_inherited_aces_on_windows() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::{
+            GetAce, GetFileSecurityW, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+            ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, INHERITED_ACE, SE_DACL_PROTECTED,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("managed-agents.json");
+        atomic_write_json_restricted(&path, br#"{"agents":[]}"#).expect("restricted write");
+
+        let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+        let wide: Vec<u16> = resolved
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // Read the committed DACL back out of the filesystem.
+        let mut needed: u32 = 0;
+        // SAFETY: null buffer with length 0 is the documented sizing form.
+        unsafe {
+            GetFileSecurityW(
+                wide.as_ptr(),
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        assert!(
+            needed > 0,
+            "GetFileSecurityW sizing: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+        let descriptor = buf.as_mut_ptr().cast();
+        // SAFETY: buffer is at least `needed` bytes and 8-byte aligned.
+        assert_ne!(
+            unsafe {
+                GetFileSecurityW(
+                    wide.as_ptr(),
+                    DACL_SECURITY_INFORMATION,
+                    descriptor,
+                    needed,
+                    &mut needed,
+                )
+            },
+            0,
+            "GetFileSecurityW: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        // SAFETY: `descriptor` is a valid self-relative descriptor.
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+            0,
+            "GetSecurityDescriptorControl: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(
+            control & SE_DACL_PROTECTED,
+            0,
+            "DACL is not protected: the parent directory's ACEs still apply"
+        );
+
+        let mut present: i32 = 0;
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut defaulted: i32 = 0;
+        // SAFETY: all three out-params are valid slots.
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+            },
+            0,
+            "GetSecurityDescriptorDacl: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(present, 0, "no DACL on the written file");
+        // A NULL DACL is not "no access" â€” it grants everyone full control.
+        assert!(!dacl.is_null(), "NULL DACL grants everyone full control");
+
+        // SAFETY: `dacl` points into `buf`, which is still alive.
+        let ace_count = unsafe { (*dacl).AceCount };
+        assert_eq!(
+            ace_count, 1,
+            "expected exactly one owner ACE, found {ace_count}"
+        );
+
+        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: index 0 exists, per the AceCount assertion above.
+        assert_ne!(
+            unsafe { GetAce(dacl, 0, &mut ace) },
+            0,
+            "GetAce: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: the sole ACE was added by us as an ACCESS_ALLOWED_ACE.
+        let flags = unsafe { (*ace.cast::<ACCESS_ALLOWED_ACE>()).Header.AceFlags } as u32;
+        assert_eq!(
+            flags & INHERITED_ACE,
+            0,
+            "the sole ACE is inherited from the parent directory"
+        );
+    }
+}
