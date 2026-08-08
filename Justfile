@@ -327,6 +327,35 @@ test-unit:
 test-integration:
     ./scripts/run-tests.sh integration
 
+# ─── Buzz Edge release gates (M5) ─────────────────────────────────────────────
+#
+# Each recipe runs one gate from the phase-1 local-continuity spec's test list
+# and prints its collected measurements. `--nocapture` is deliberate: the gates
+# report counts and latencies, and a captured run reduces them to "ok".
+#
+# Gates 1 (full cut), 5 (private-channel end-to-end), and 6
+# (direct-to-upstream post-revocation) are NOT implemented — they need a real
+# canonical relay and real network manipulation, and a stub would make them
+# lie. What each one needs is written up in
+# crates/buzz-edge/tests/README.md.
+
+# All implemented Buzz Edge release gates
+edge-gates: edge-gate2 edge-gate3 edge-gate4
+
+# Gate 2 — slow-upstream transport SLO (p95 ≤ 250 ms, max ≤ 1 s, no send blocked
+# on upstream). Injects 30 s of upstream delay and runs for ~12 s; timing-sensitive,
+# so it is run on its own thread budget rather than beside the rest of the suite.
+edge-gate2:
+    cargo test -p buzz-edge --test gate2_slow_upstream_slo -- --nocapture --test-threads=1
+
+# Gate 3 — restart survival: no outbox loss, no duplicate canonical events
+edge-gate3:
+    cargo test -p buzz-edge --test gate3_restart_survival -- --nocapture
+
+# Gate 4 — key hygiene: the sidecar holds only the provisioned edge identity key
+edge-gate4:
+    cargo test -p buzz-edge --test gate4_key_hygiene -- --nocapture
+
 # Buzz shared compute e2e: current desktop discovery/admission logic and
 # Playwright UI coverage.
 mesh-e2e:
