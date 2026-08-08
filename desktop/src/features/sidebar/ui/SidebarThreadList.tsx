@@ -18,6 +18,13 @@ import {
   resolveThreadDirectoryTitle,
   threadDirectoryUnreadState,
 } from "@/features/sidebar/lib/threadDirectory";
+import {
+  loadLocalThreadNames,
+  localThreadNameIsValid,
+  MAX_LOCAL_THREAD_NAME_LENGTH,
+  resolveLocalThreadName,
+  setLocalThreadName,
+} from "@/features/sidebar/lib/localThreadNames";
 import { useThreadDirectory } from "@/features/sidebar/useThreadDirectory";
 import { formatRelativeTime } from "@/features/forum/lib/time";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -108,10 +115,16 @@ export function legacySidebarThreadItems(
 
 export function LegacySidebarThreadList({
   items,
+  localNames,
   onNavigate,
+  onRename,
 }: {
   items: LegacyThreadItem[];
+  /** rootId → machine-local name, when one has been set. */
+  localNames?: Record<string, string>;
   onNavigate: (rootId: string) => void;
+  /** Absent in read-only contexts (tests, previews): no rename is offered. */
+  onRename?: (rootId: string, currentName: string) => void;
 }) {
   if (items.length === 0) {
     return (
@@ -125,23 +138,46 @@ export function LegacySidebarThreadList({
       className="flex min-w-0 flex-col gap-0.5"
       data-testid="legacy-thread-list"
     >
-      {items.map((item) => (
-        <li key={item.rootId}>
-          <button
-            className="flex h-8 w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs text-sidebar-foreground/80 outline-hidden transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring"
-            onClick={() => onNavigate(item.rootId)}
-            type="button"
-          >
-            <span className="min-w-0 flex-1 truncate">{item.title}</span>
-            <span
-              className="shrink-0 text-3xs text-sidebar-foreground/45"
-              title={new Date(item.lastReplyAt * 1_000).toLocaleString()}
+      {items.map((item) => {
+        // A local name replaces the derived first-line title. There is no
+        // shared title on this path — the relay cannot store one — so the
+        // local name is the only override in play.
+        const local = localNames?.[item.rootId];
+        const label = resolveLocalThreadName(null, local, item.title);
+        return (
+          <li key={item.rootId} className="group/thread relative">
+            <button
+              className="flex h-8 w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs text-sidebar-foreground/80 outline-hidden transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+              onClick={() => onNavigate(item.rootId)}
+              type="button"
             >
-              {formatRelativeTime(item.lastReplyAt)}
-            </span>
-          </button>
-        </li>
-      ))}
+              <span className="min-w-0 flex-1 truncate" title={label}>
+                {label}
+              </span>
+              <span
+                className="shrink-0 text-3xs text-sidebar-foreground/45 group-hover/thread:hidden"
+                title={new Date(item.lastReplyAt * 1_000).toLocaleString()}
+              >
+                {formatRelativeTime(item.lastReplyAt)}
+              </span>
+            </button>
+            {onRename ? (
+              <button
+                aria-label={`Rename ${label}`}
+                className="absolute right-1 top-1 hidden h-6 w-6 items-center justify-center rounded-sm text-sidebar-foreground/60 outline-hidden transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring group-hover/thread:flex"
+                onClick={(event) => {
+                  stopSidebarThreadInteraction(event);
+                  onRename(item.rootId, local ?? "");
+                }}
+                title="Rename (this machine only)"
+                type="button"
+              >
+                <Pencil aria-hidden className="size-3" />
+              </button>
+            ) : null}
+          </li>
+        );
+      })}
     </ul>
   );
 }
@@ -507,6 +543,49 @@ export function SidebarThreadList({
     [channelId, threadActivityItems],
   );
 
+  // Machine-local thread names, used only on the fallback path. A relay with
+  // thread-directory support stores shared names instead, and those win.
+  const localNamesScope = {
+    pubkey: identityQuery.data?.pubkey ?? null,
+    relayUrl: activeCommunity?.relayUrl ?? null,
+  };
+  const [localNames, setLocalNames] = React.useState<Record<string, string>>(
+    () =>
+      loadLocalThreadNames(localNamesScope.pubkey, localNamesScope.relayUrl),
+  );
+  const [localRenameDraft, setLocalRenameDraft] = React.useState<{
+    rootId: string;
+    name: string;
+  } | null>(null);
+  // Reload when the identity or relay changes: names are scoped to that pair,
+  // and carrying one community's labels into another would be wrong.
+  React.useEffect(() => {
+    setLocalNames(
+      loadLocalThreadNames(localNamesScope.pubkey, localNamesScope.relayUrl),
+    );
+  }, [localNamesScope.pubkey, localNamesScope.relayUrl]);
+
+  const localRenameIsValid = localThreadNameIsValid(
+    localRenameDraft?.name ?? "",
+  );
+  const saveLocalRename = React.useCallback(() => {
+    if (!localRenameDraft || !localRenameIsValid) return;
+    setLocalNames(
+      setLocalThreadName(
+        localNamesScope.pubkey,
+        localNamesScope.relayUrl,
+        localRenameDraft.rootId,
+        localRenameDraft.name,
+      ),
+    );
+    setLocalRenameDraft(null);
+  }, [
+    localNamesScope.pubkey,
+    localNamesScope.relayUrl,
+    localRenameDraft,
+    localRenameIsValid,
+  ]);
+
   if (directory.isUnsupported) {
     return (
       <div
@@ -520,10 +599,69 @@ export function SidebarThreadList({
         </p>
         <LegacySidebarThreadList
           items={legacyItems}
+          localNames={localNames}
           onNavigate={(rootId) => {
             void goChannel(channelId, threadDirectoryNavigationSearch(rootId));
           }}
+          onRename={(rootId, currentName) =>
+            setLocalRenameDraft({ rootId, name: currentName })
+          }
         />
+        <Dialog
+          open={localRenameDraft !== null}
+          onOpenChange={(open) => {
+            if (!open) setLocalRenameDraft(null);
+          }}
+        >
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>Rename thread</DialogTitle>
+              <DialogDescription>
+                Saved on this computer only. This relay cannot store shared
+                thread names, so nobody else will see it.
+              </DialogDescription>
+            </DialogHeader>
+            <Input
+              autoFocus
+              maxLength={MAX_LOCAL_THREAD_NAME_LENGTH}
+              onChange={(event) =>
+                setLocalRenameDraft((draft) =>
+                  draft ? { ...draft, name: event.target.value } : draft,
+                )
+              }
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && localRenameIsValid) {
+                  event.preventDefault();
+                  saveLocalRename();
+                }
+              }}
+              placeholder="Leave empty to restore the original name"
+              value={localRenameDraft?.name ?? ""}
+            />
+            {!localRenameIsValid ? (
+              <p className="text-xs text-destructive">
+                Thread names must be a single line of at most{" "}
+                {MAX_LOCAL_THREAD_NAME_LENGTH} characters.
+              </p>
+            ) : null}
+            <DialogFooter>
+              <Button
+                onClick={() => setLocalRenameDraft(null)}
+                type="button"
+                variant="ghost"
+              >
+                Cancel
+              </Button>
+              <Button
+                disabled={!localRenameIsValid}
+                onClick={saveLocalRename}
+                type="button"
+              >
+                Save
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
     );
   }
