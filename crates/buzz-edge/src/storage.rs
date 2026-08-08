@@ -211,6 +211,69 @@ pub enum InsertOutcome {
     Duplicate,
 }
 
+/// Largest digest chunk content, in bytes.
+///
+/// Relay ingest rejects content over 256 KiB. Packing to 200 KiB leaves room
+/// for JSON escaping and event metadata without needing to model either.
+pub const MAX_DIGEST_CHUNK_BYTES: usize = 200 * 1024;
+
+/// How far a batch has got through its parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DigestBatchProgress {
+    /// Parts in this batch.
+    pub total_parts: u64,
+    /// Parts accepted upstream so far.
+    pub delivered_parts: u64,
+    /// Every part landed; the source rows are now in canonical history.
+    pub complete: bool,
+    /// A part was permanently refused; the batch and its sources are quarantined.
+    pub failed: bool,
+}
+
+/// Render events into deterministically chunked digest bodies.
+///
+/// The digest is what carries messages that can no longer be replayed under
+/// their own IDs (§12). It quotes each one with its author and local timestamp,
+/// in order, and the originals' IDs and thread structure do not become
+/// canonical — the digest does.
+///
+/// Chunking is greedy and order-preserving so the same input always produces
+/// the same chunks. That matters because the parts are signed once and every
+/// retry must re-submit identical bytes for upstream dedup to work.
+///
+/// Mentions are neutralised: a digest is authored by the edge identity, not by
+/// the people quoted in it, so live `@` mentions would notify readers on behalf
+/// of an author who never sent that message from this identity.
+pub fn build_digest_chunks(events: &[(PublicKey, i64, String)]) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for (author, created_at, content) in events {
+        let line = format!(
+            "[{}] {}: {}\n",
+            DateTime::<Utc>::from_timestamp(*created_at, 0)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| created_at.to_string()),
+            &author.to_hex()[..16],
+            neutralize_mentions(content)
+        );
+        // A single line larger than the budget still has to go somewhere; it
+        // gets its own chunk rather than being dropped or silently truncated.
+        if !current.is_empty() && current.len() + line.len() > MAX_DIGEST_CHUNK_BYTES {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push_str(&line);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Defuse `@`-style mentions so a quoted message cannot notify anyone.
+fn neutralize_mentions(content: &str) -> String {
+    content.replace('@', "(at)")
+}
+
 /// One outbox row leased to an author for upstream submission.
 #[derive(Debug, Clone)]
 pub struct ClaimedOutboxRow {
@@ -1644,6 +1707,86 @@ impl EdgeStore {
         Ok(demoted as u64)
     }
 
+    /// Record the result of submitting one digest part upstream.
+    ///
+    /// Source rows become `delivered` only when **every** part of the batch is
+    /// acknowledged. A digest split across three chunks is not in canonical
+    /// history until all three land — resolving sources after the first would
+    /// claim delivery for messages nobody can read yet.
+    ///
+    /// As with the exact path, duplicate is success: retries re-submit the same
+    /// pre-signed bytes, so upstream dedup is what makes this exactly-once.
+    pub fn acknowledge_digest_part(
+        &self,
+        batch_id: &str,
+        part_index: usize,
+        accepted: bool,
+        error: Option<&str>,
+    ) -> Result<DigestBatchProgress, StorageError> {
+        let now = unix_seconds();
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+
+        transaction.execute(
+            "UPDATE digest_parts
+                SET state = ?3, attempts = attempts + 1, last_error = ?4, updated_at = ?5
+              WHERE batch_id = ?1 AND part_index = ?2",
+            params![
+                batch_id,
+                part_index as i64,
+                if accepted { "delivered" } else { "quarantined" },
+                error,
+                now
+            ],
+        )?;
+
+        let (total, delivered, quarantined): (i64, i64, i64) = transaction.query_row(
+            "SELECT
+                 COUNT(*),
+                 SUM(CASE WHEN state = 'delivered' THEN 1 ELSE 0 END),
+                 SUM(CASE WHEN state = 'quarantined' THEN 1 ELSE 0 END)
+               FROM digest_parts WHERE batch_id = ?1",
+            [batch_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
+        let complete = total > 0 && delivered == total;
+        let failed = quarantined > 0;
+
+        if complete {
+            transaction.execute(
+                "UPDATE digest_batches SET state = 'delivered', updated_at = ?2 WHERE batch_id = ?1",
+                params![batch_id, now],
+            )?;
+            // Only now are the originals represented in canonical history.
+            transaction.execute(
+                "UPDATE outbox
+                    SET state = 'delivered', updated_at = ?2
+                  WHERE event_id IN (SELECT event_id FROM digest_sources WHERE batch_id = ?1)",
+                params![batch_id, now],
+            )?;
+        } else if failed {
+            transaction.execute(
+                "UPDATE digest_batches SET state = 'quarantined', updated_at = ?2 WHERE batch_id = ?1",
+                params![batch_id, now],
+            )?;
+            transaction.execute(
+                "UPDATE outbox
+                    SET state = 'quarantined', last_error = ?3, updated_at = ?2
+                  WHERE event_id IN (SELECT event_id FROM digest_sources WHERE batch_id = ?1)",
+                params![batch_id, now, error.unwrap_or("digest part rejected")],
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(DigestBatchProgress {
+            total_parts: total as u64,
+            delivered_parts: delivered as u64,
+            complete,
+            failed,
+        })
+    }
+
     /// Rows on the digest path awaiting collapse into a catch-up digest,
     /// oldest first so the digest preserves local order.
     pub fn digest_candidates(&self, limit: usize) -> Result<Vec<Event>, StorageError> {
@@ -2839,6 +2982,139 @@ mod tests {
             0,
             "re-running must not churn rows"
         );
+    }
+
+    // ── Digest fallback (§12) ──────────────────────────────────────────────
+
+    /// An edge-signed digest chunk carrying the `part`/`total` tags the
+    /// materializer validates.
+    fn digest_part(
+        edge: &Keys,
+        channel: Uuid,
+        part_index: usize,
+        total_parts: usize,
+        body: &str,
+    ) -> Event {
+        EventBuilder::new(Kind::Custom(9), body)
+            .tags([
+                Tag::parse(["h", channel.to_string().as_str()]).expect("h tag"),
+                Tag::parse(["part", part_index.to_string().as_str()]).expect("part tag"),
+                Tag::parse(["total", total_parts.to_string().as_str()]).expect("total tag"),
+            ])
+            .sign_with_keys(edge)
+            .expect("sign digest part")
+    }
+
+    #[test]
+    fn digest_chunks_stay_under_the_ingest_limit_and_preserve_order() {
+        // Relay ingest rejects content over 256 KiB, so a long backlog has to
+        // be split. Order must survive the split or the digest misrepresents
+        // the conversation.
+        let author = Keys::generate().public_key();
+        let events: Vec<(PublicKey, i64, String)> = (0..400)
+            .map(|i| (author, 1_000 + i as i64, format!("message {i} ").repeat(80)))
+            .collect();
+
+        let chunks = build_digest_chunks(&events);
+        assert!(chunks.len() > 1, "this backlog must need several chunks");
+        for chunk in &chunks {
+            assert!(
+                chunk.len() <= MAX_DIGEST_CHUNK_BYTES,
+                "chunk of {} bytes exceeds the budget",
+                chunk.len()
+            );
+        }
+        let joined = chunks.concat();
+        let first = joined.find("message 0 ").expect("first message present");
+        let last = joined.find("message 399 ").expect("last message present");
+        assert!(first < last, "order must be preserved across chunks");
+    }
+
+    #[test]
+    fn digest_chunking_is_deterministic() {
+        // Parts are signed once and every retry re-submits identical bytes.
+        // Non-deterministic chunking would change the event ID and break the
+        // upstream dedup this relies on.
+        let author = Keys::generate().public_key();
+        let events: Vec<(PublicKey, i64, String)> = (0..200)
+            .map(|i| (author, 1_000 + i as i64, format!("line {i} ").repeat(60)))
+            .collect();
+        assert_eq!(build_digest_chunks(&events), build_digest_chunks(&events));
+    }
+
+    #[test]
+    fn digest_neutralizes_mentions() {
+        // The digest is authored by the edge identity. A live @mention would
+        // notify someone on behalf of an author who never sent it from here.
+        let author = Keys::generate().public_key();
+        let chunks = build_digest_chunks(&[(author, 1_000, "hey @james look".into())]);
+        assert!(chunks[0].contains("(at)james"));
+        assert!(!chunks[0].contains("@james"));
+    }
+
+    #[test]
+    fn an_oversized_single_message_still_gets_a_chunk() {
+        // Dropping or truncating it would lose the message silently.
+        let author = Keys::generate().public_key();
+        let huge = "x".repeat(MAX_DIGEST_CHUNK_BYTES * 2);
+        let chunks = build_digest_chunks(&[(author, 1_000, huge)]);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].len() > MAX_DIGEST_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn sources_resolve_only_after_every_part_lands() {
+        // A digest split across parts is not in canonical history until all of
+        // them are. Resolving after the first would claim delivery for
+        // messages nobody can read yet.
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let source = message(&author, channel, "old");
+        store_with_event(&store, &source, channel, &edge);
+
+        let parts: Vec<Event> = (1..=2)
+            .map(|i| digest_part(&edge, channel, i, 2, &format!("part {i}")))
+            .collect();
+        store
+            .materialize_digest_batch("b1", channel, &[source.id], &parts, &edge.public_key())
+            .expect("materialize");
+
+        let after_first = store
+            .acknowledge_digest_part("b1", 1, true, None)
+            .expect("ack 1");
+        assert!(!after_first.complete, "one of two parts is not delivery");
+        assert_eq!(store.outbox_summary().expect("s").delivered_via_digest, 0);
+
+        let after_second = store
+            .acknowledge_digest_part("b1", 2, true, None)
+            .expect("ack 2");
+        assert!(after_second.complete);
+        assert_eq!(
+            store.outbox_summary().expect("s").delivered_via_digest,
+            1,
+            "source now counts as synced via digest, not as an exact delivery"
+        );
+    }
+
+    #[test]
+    fn a_rejected_part_quarantines_the_batch_and_its_sources() {
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let source = message(&author, channel, "old");
+        store_with_event(&store, &source, channel, &edge);
+        let parts = vec![digest_part(&edge, channel, 1, 1, "only part")];
+        store
+            .materialize_digest_batch("b2", channel, &[source.id], &parts, &edge.public_key())
+            .expect("materialize");
+
+        let progress = store
+            .acknowledge_digest_part("b2", 1, false, Some("content too large"))
+            .expect("ack");
+        assert!(progress.failed);
+        assert!(!progress.complete);
+        assert_eq!(store.outbox_summary().expect("s").quarantined, 1);
     }
 
     #[test]
