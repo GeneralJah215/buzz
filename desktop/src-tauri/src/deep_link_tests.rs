@@ -1,15 +1,177 @@
 //! Tests for `deep_link.rs`, split out to keep that file under the repo's
 //! file-size ratchet.
 
+use std::time::{Duration, Instant};
+
 use url::Url;
 
 use super::{
     parse_add_community_deep_link, parse_join_deep_link, parse_message_deep_link,
     parse_nostr_bind_deep_link, parse_restart_agent_deep_link, PendingCommunityDeepLink,
-    PendingCommunityDeepLinks,
+    PendingCommunityDeepLinks, RecentDeepLinks, DEEP_LINK_DEDUP_CAPACITY,
+    DEEP_LINK_DEDUP_WINDOW,
 };
 
 const AGENT_PUBKEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+// ---------------------------------------------------------------------------
+// BUG-030: one deep-link activation must produce exactly one action.
+// ---------------------------------------------------------------------------
+
+/// A `buzz://restart-agent` link exactly as `agent-watchdog.ps1` fires it:
+/// one pubkey, one single-use control token.
+fn restart_url(token: &str) -> String {
+    format!("buzz://restart-agent?pubkey={AGENT_PUBKEY}&token={token}")
+}
+
+/// Drive `n` deliveries of the same URL through the dedup gate at the given
+/// offsets from `t0` and count how many would reach the dispatch arms of
+/// `handle_deep_link_url`. This is the shape of the real bug: each delivery is
+/// an independent handler calling in with an identical URL.
+fn actions_dispatched(url: &str, offsets: &[Duration]) -> usize {
+    let recent = RecentDeepLinks::default();
+    let t0 = Instant::now();
+    offsets
+        .iter()
+        .filter(|offset| recent.admit(url, t0 + **offset))
+        .count()
+}
+
+#[test]
+fn one_deep_link_delivered_twice_dispatches_one_action() {
+    // Reproduces buzz-desktop.log 2026-08-08T20:54:24: the single-instance
+    // plugin's `deep-link` feature emitted the forwarded argv (dispatch 1) and
+    // 0.7 ms later the app's own argv scan dispatched the identical URL again
+    // (dispatch 2). Two `restart_agent_task_entered`, two live PIDs, one agent
+    // identity. Both deliveries carry the same single-use token, so they are
+    // provably one request.
+    assert_eq!(
+        actions_dispatched(
+            &restart_url("one-shot-token"),
+            &[Duration::ZERO, Duration::from_micros(700)],
+        ),
+        1,
+        "two deliveries of one URL must produce one action"
+    );
+}
+
+#[test]
+fn duplicate_deliveries_are_suppressed_across_every_observed_gap() {
+    // The gaps actually seen between the paired `deep_link_received` lines in
+    // buzz-desktop.log, widest last. The window must cover all of them with
+    // room to spare, and must not depend on the two handlers being close.
+    for gap in [
+        Duration::from_micros(340),
+        Duration::from_micros(700),
+        Duration::from_millis(13),
+        Duration::from_millis(51),
+        Duration::from_secs(1),
+    ] {
+        assert_eq!(
+            actions_dispatched(&restart_url("one-shot-token"), &[Duration::ZERO, gap]),
+            1,
+            "duplicate {gap:?} apart must be suppressed"
+        );
+    }
+}
+
+#[test]
+fn a_third_and_fourth_delivery_are_also_suppressed() {
+    // Nothing about the fix should assume exactly two handlers.
+    assert_eq!(
+        actions_dispatched(
+            &restart_url("one-shot-token"),
+            &[
+                Duration::ZERO,
+                Duration::from_micros(700),
+                Duration::from_millis(2),
+                Duration::from_millis(60),
+            ],
+        ),
+        1
+    );
+}
+
+#[test]
+fn distinct_restart_requests_are_never_suppressed() {
+    // The dedup key is the whole URL, so a genuinely new watchdog action —
+    // which always mints a fresh single-use token — still gets through even
+    // back to back. Deduping on the action alone would have swallowed this.
+    let recent = RecentDeepLinks::default();
+    let t0 = Instant::now();
+    assert!(recent.admit(&restart_url("token-a"), t0));
+    assert!(recent.admit(&restart_url("token-b"), t0 + Duration::from_millis(1)));
+}
+
+#[test]
+fn different_agents_are_never_suppressed() {
+    let recent = RecentDeepLinks::default();
+    let t0 = Instant::now();
+    let other = AGENT_PUBKEY.replace("0123", "abcd");
+    assert!(recent.admit(&restart_url("shared"), t0));
+    assert!(recent.admit(
+        &format!("buzz://restart-agent?pubkey={other}&token=shared"),
+        t0 + Duration::from_millis(1)
+    ));
+}
+
+#[test]
+fn the_same_url_is_admitted_again_once_the_window_has_passed() {
+    // Suppression is a duplicate-delivery guard, not a rate limiter: a retry
+    // of the identical URL long afterwards must still work.
+    let url = restart_url("one-shot-token");
+    let recent = RecentDeepLinks::default();
+    let t0 = Instant::now();
+    assert!(recent.admit(&url, t0));
+    assert!(!recent.admit(&url, t0 + DEEP_LINK_DEDUP_WINDOW - Duration::from_millis(1)));
+    assert!(recent.admit(&url, t0 + DEEP_LINK_DEDUP_WINDOW));
+}
+
+#[test]
+fn remembered_urls_stay_bounded_for_a_long_lived_app() {
+    // The app runs for weeks. Neither expiry nor the capacity cap may let the
+    // queue grow without limit.
+    let recent = RecentDeepLinks::default();
+    let t0 = Instant::now();
+    for index in 0..(DEEP_LINK_DEDUP_CAPACITY * 10) {
+        // All inside one window, so expiry never fires and only the capacity
+        // cap can hold the queue down.
+        recent.admit(&restart_url(&format!("token-{index}")), t0);
+    }
+    assert!(
+        recent.0.lock().unwrap().len() <= DEEP_LINK_DEDUP_CAPACITY,
+        "dedup queue grew past its cap"
+    );
+
+    // And expiry alone also drains it, without needing the cap.
+    let recent = RecentDeepLinks::default();
+    for index in 0..1_000u32 {
+        recent.admit(
+            &restart_url(&format!("token-{index}")),
+            t0 + DEEP_LINK_DEDUP_WINDOW * index,
+        );
+    }
+    assert!(recent.0.lock().unwrap().len() <= 1);
+}
+
+#[test]
+fn lib_rs_registers_exactly_one_deep_link_dispatch_site() {
+    // The dedup gate above is the backstop; this is the actual fix. Two
+    // registrations both calling `handle_deep_link_url` for one OS activation
+    // is what BUG-030 was, and it survived the BUG-009 and BUG-015
+    // investigations unnoticed because nothing asserted the count.
+    //
+    // If this fails because a second delivery path was added on purpose: the
+    // dedup gate will keep it correct, but read the BUG-030 notes in `lib.rs`
+    // first — on Windows the single-instance plugin already feeds argv to the
+    // deep-link plugin for you.
+    let lib_rs = include_str!("lib.rs");
+    assert_eq!(
+        lib_rs.matches("handle_deep_link_url(").count(),
+        1,
+        "expected exactly one handle_deep_link_url call site in lib.rs"
+    );
+}
 
 fn pending(id: &str, relay_url: &str, code: Option<&str>) -> PendingCommunityDeepLink {
     PendingCommunityDeepLink {

@@ -48,7 +48,7 @@ use builderlab::*;
 use commands::*;
 use deep_link::{
     acknowledge_pending_community_deep_link, handle_deep_link_url,
-    take_pending_community_deep_link, PendingCommunityDeepLinks,
+    take_pending_community_deep_link, PendingCommunityDeepLinks, RecentDeepLinks,
 };
 use huddle::audio_output::{
     get_audio_output_device, list_audio_output_devices, set_audio_output_device,
@@ -121,12 +121,11 @@ pub fn run() {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_focus();
             }
-            // Forward any deep link URLs from the duplicate launch.
-            for arg in &argv {
-                if arg.starts_with("buzz://") {
-                    handle_deep_link_url(app, arg);
-                }
-            }
+            // BUG-030: deliberately does NOT forward `buzz://` argv itself.
+            // `features = ["deep-link"]` makes this plugin feed the argv to the
+            // deep-link plugin *before* calling us, so `on_open_url` in `setup`
+            // already dispatches it once. Scanning argv here dispatched the
+            // same URL twice. Full reasoning: `deep_link::RecentDeepLinks`.
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
@@ -308,6 +307,7 @@ pub fn run() {
         .manage(build_app_state())
         .manage(ClipboardState::new())
         .manage(PendingCommunityDeepLinks::default())
+        .manage(RecentDeepLinks::default())
         .manage(BuilderlabSession::default())
         .manage(BuilderlabLogin::default())
         .manage(commands::pairing::PairingHandle::new())
@@ -523,9 +523,9 @@ pub fn run() {
                 eprintln!("buzz-desktop: failed to prepare agent control token: {error}");
             }
 
-            // Handle deep link URLs received while the app is running (macOS)
-            // and on cold start. The single-instance plugin handles forwarding
-            // from duplicate launches on Windows/Linux.
+            // The single, authoritative deep-link delivery path (BUG-030).
+            // Covers warm opens on every desktop platform; does NOT cover cold
+            // start on Windows/Linux, and never did. Proofs: `RecentDeepLinks`.
             #[cfg(desktop)]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;

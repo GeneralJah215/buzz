@@ -1,10 +1,115 @@
-use std::{collections::VecDeque, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 use url::Url;
 
 use crate::nostr_bind;
+
+/// How long a delivered deep-link URL stays "already handled" (BUG-030).
+///
+/// Sized against the real gaps between the two deliveries of a single
+/// `buzz://restart-agent` link observed in `buzz-desktop.log`: 0.3 ms to 51 ms.
+/// Five seconds is three orders of magnitude of headroom while staying far
+/// below any plausible interval at which a human or a supervisor script
+/// deliberately re-fires the *same* URL. `restart-agent` links carry a
+/// single-use `token`, so a legitimate repeat never has an identical URL.
+const DEEP_LINK_DEDUP_WINDOW: Duration = Duration::from_secs(5);
+
+/// Hard cap on remembered URLs, so a long-lived app cannot grow this
+/// unboundedly. Deliveries are seconds apart at worst; 64 is far more than
+/// one window can hold.
+const DEEP_LINK_DEDUP_CAPACITY: usize = 64;
+
+/// Recently-handled deep-link URLs, keyed by the **full URL string**.
+///
+/// # Why (BUG-030)
+///
+/// One OS-level `buzz://` activation used to reach [`handle_deep_link_url`]
+/// twice, 0.3-51 ms apart. For `restart-agent` that meant two restart tasks and
+/// two live processes for one agent identity, both holding the same nsec and
+/// connecting to the same relay as the same pubkey: the winner writes a
+/// healthy-looking log while the loser answers nothing. 25 such pairs in a
+/// single `buzz-desktop.log`.
+///
+/// The mechanism, from the plugin sources:
+/// - Windows/Linux have no OS "open URL" event for a running app. A warm open
+///   spawns a second process; `tauri-plugin-single-instance` forwards its argv
+///   over `WM_COPYDATA` and exits.
+/// - Built with `features = ["deep-link"]` (see `Cargo.toml`), that plugin
+///   *wraps* the app's callback and calls `DeepLink::handle_cli_arguments(argv)`
+///   **before** invoking it — tauri-plugin-single-instance-2.4.2 `src/lib.rs`
+///   :72-76. That emits `deep-link://new-url`, so `on_open_url` fires. Delivery
+///   #1.
+/// - `lib.rs` then also scanned the same argv in its own callback body and
+///   called in directly. Delivery #2. That scan is now removed; `on_open_url`
+///   in `lib.rs`'s `setup` is the one authoritative path.
+///
+/// Known gap this does not change: cold start on Windows/Linux drops the URL.
+/// The plugin scans `std::env::args()` inside its own plugin `setup`
+/// (tauri-plugin-deep-link-2.4.9 `src/lib.rs`:73-84), which Tauri runs during
+/// `Builder::build()`, whereas the app's `setup` runs later at `Ready`; and
+/// `on_open_url` is a plain `listen` with no replay (ibid. :515-527), so the
+/// cold-start emit has no listener. Recovering it needs `get_current()`. The
+/// removed argv scan never covered this either — it only ran for a *second*
+/// instance.
+///
+/// # Why the key is the whole URL
+///
+/// The identity of a deep-link request is its entire URL, query string
+/// included: `buzz://restart-agent` carries a single-use `token`, so two
+/// deliveries bearing the same token are provably the same request, while two
+/// genuinely distinct requests differ in at least that parameter. Deduping on
+/// the action alone would swallow real back-to-back requests; widening a lock
+/// or sleeping would recast a deterministic double-dispatch as a timing race
+/// and let it come back.
+#[derive(Default)]
+pub(crate) struct RecentDeepLinks(Mutex<VecDeque<(String, Instant)>>);
+
+impl RecentDeepLinks {
+    /// Return `true` the first time `url` is seen, `false` for a repeat that
+    /// lands inside [`DEEP_LINK_DEDUP_WINDOW`].
+    ///
+    /// `now` is injected rather than read internally so the guardrail tests can
+    /// reproduce the exact sub-millisecond gap from the production log without
+    /// sleeping.
+    pub(crate) fn admit(&self, url: &str, now: Instant) -> bool {
+        self.admit_within(url, now, DEEP_LINK_DEDUP_WINDOW)
+    }
+
+    fn admit_within(&self, url: &str, now: Instant, window: Duration) -> bool {
+        let mut seen = self.0.lock().expect("recent deep-link queue poisoned");
+        // Entries are pushed in non-decreasing `now` order, so expiry is a
+        // prefix — pop from the front until the oldest survivor is in-window.
+        while seen
+            .front()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= window)
+        {
+            seen.pop_front();
+        }
+        if seen.iter().any(|(seen_url, _)| seen_url == url) {
+            return false;
+        }
+        while seen.len() >= DEEP_LINK_DEDUP_CAPACITY {
+            seen.pop_front();
+        }
+        seen.push_back((url.to_owned(), now));
+        true
+    }
+}
+
+/// The action (`restart-agent`, `join`, …) of a deep link, for logging only.
+/// Never the query string: that carries the control token.
+fn deep_link_action(url_str: &str) -> String {
+    Url::parse(url_str)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "<unparsable>".to_owned())
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -447,12 +552,35 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
     // The action only; the query string carries the control token.
     tracing::info!(
         event = "deep_link_received",
-        action = Url::parse(url_str)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_owned))
-            .unwrap_or_else(|| "<unparsable>".to_owned()),
+        action = deep_link_action(url_str),
         "deep link received"
     );
+
+    // BUG-030: one OS-level deep-link activation could reach this function
+    // twice. On Windows a warm `buzz://` open is delivered through
+    // `tauri-plugin-single-instance`, whose `deep-link` feature re-emits the
+    // forwarded argv into the deep-link plugin *before* running our callback —
+    // so any second registration reading the same argv dispatches the same
+    // request again, microseconds later. For `restart-agent` that produced two
+    // live processes for one agent identity, both holding the same nsec.
+    //
+    // The redundant registration is gone (see `lib.rs`), but this gate is the
+    // invariant that does not depend on getting the wiring right: identity of
+    // the request, not timing luck. A suppression is logged at WARN, never
+    // silently dropped, so a re-introduced duplicate path is visible in the log
+    // instead of costing another investigation.
+    if !app
+        .state::<RecentDeepLinks>()
+        .admit(url_str, Instant::now())
+    {
+        tracing::warn!(
+            event = "deep_link_duplicate_suppressed",
+            action = deep_link_action(url_str),
+            "suppressing duplicate delivery of a deep link already handled"
+        );
+        return;
+    }
+
     let url = match Url::parse(url_str) {
         Ok(u) => u,
         Err(e) => {
