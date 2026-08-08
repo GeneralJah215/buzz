@@ -1568,6 +1568,104 @@ impl EdgeStore {
         Ok(claimed)
     }
 
+    /// Demote thread components that can no longer be replayed upstream with
+    /// their original event IDs, and everything that depends on them (§11
+    /// mixed-age thread policy).
+    ///
+    /// Canonical ingest rejects a reply whose parent it does not hold, so a
+    /// fresh reply to a stale parent can never be submitted on its own — it
+    /// would be an orphan. The whole component therefore moves to the digest
+    /// path together, in order, **even the descendants still inside the drift
+    /// window**.
+    ///
+    /// A row is un-replayable when it is older than the relay's drift window,
+    /// already quarantined, or blocked by revoked authorization. Demotion
+    /// propagates transitively: demoting a parent demotes its children, then
+    /// theirs, until nothing changes.
+    ///
+    /// Returns the number of rows demoted.
+    pub fn demote_unreplayable_threads(
+        &self,
+        drift_window_seconds: i64,
+        now: i64,
+    ) -> Result<u64, StorageError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        let cutoff = now.saturating_sub(drift_window_seconds);
+
+        // Seed: rows whose own event is too old to keep its ID upstream.
+        let mut demoted = transaction.execute(
+            "UPDATE outbox
+                SET delivery_path = 'digest',
+                    demotion_reason = 'older than the relay drift window',
+                    updated_at = ?2
+              WHERE delivery_path = 'exact'
+                AND state IN ('pending', 'quarantined')
+                AND event_id IN (SELECT event_id FROM events WHERE created_at < ?1)",
+            params![cutoff, now],
+        )?;
+
+        // Seed: a quarantined row is never going upstream under its own ID, so
+        // anything depending on it is equally stuck.
+        demoted += transaction.execute(
+            "UPDATE outbox
+                SET delivery_path = 'digest',
+                    demotion_reason = 'permanently rejected upstream',
+                    updated_at = ?1
+              WHERE delivery_path = 'exact' AND state = 'quarantined'",
+            params![now],
+        )?;
+
+        // Propagate to descendants until the set is closed. Bounded by the
+        // number of rows: each pass demotes at least one or stops.
+        loop {
+            let changed = transaction.execute(
+                "UPDATE outbox
+                    SET delivery_path = 'digest',
+                        demotion_reason = 'ancestor cannot be replayed upstream',
+                        updated_at = ?1
+                  WHERE delivery_path = 'exact'
+                    AND state IN ('pending', 'claimed')
+                    AND event_id IN (
+                        SELECT d.child_event_id
+                          FROM event_dependencies d
+                          JOIN outbox a ON a.event_id = d.ancestor_event_id
+                         WHERE a.delivery_path = 'digest'
+                    )",
+                params![now],
+            )?;
+            if changed == 0 {
+                break;
+            }
+            demoted += changed;
+        }
+
+        transaction.commit()?;
+        Ok(demoted as u64)
+    }
+
+    /// Rows on the digest path awaiting collapse into a catch-up digest,
+    /// oldest first so the digest preserves local order.
+    pub fn digest_candidates(&self, limit: usize) -> Result<Vec<Event>, StorageError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT e.event_json
+               FROM outbox o
+               JOIN events e ON e.event_id = o.event_id
+              WHERE o.delivery_path = 'digest' AND o.state IN ('pending', 'quarantined')
+              ORDER BY e.created_at, e.received_at, o.event_id
+              LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(
+                Event::from_json(row?).map_err(|error| StorageError::Corrupt(error.to_string()))?,
+            );
+        }
+        Ok(events)
+    }
+
     /// Extend a live lease so a slow but healthy drain is not preempted.
     ///
     /// Only the holder of `claim_token` can renew, so a stale author that lost
@@ -2573,6 +2671,174 @@ mod tests {
             1
         );
         assert_eq!(store.outbox_summary().expect("summary").claimed, 1);
+    }
+
+    /// Build a message with an explicit `created_at`, for drift-window tests.
+    fn aged_message(keys: &Keys, channel: Uuid, content: &str, created_at: i64) -> Event {
+        EventBuilder::new(Kind::Custom(9), content)
+            .tags([Tag::parse(["h", channel.to_string().as_str()]).expect("h tag")])
+            .custom_created_at(Timestamp::from(created_at as u64))
+            .sign_with_keys(keys)
+            .expect("sign")
+    }
+
+    fn aged_reply(
+        keys: &Keys,
+        channel: Uuid,
+        parent: &Event,
+        content: &str,
+        created_at: i64,
+    ) -> Event {
+        EventBuilder::new(Kind::Custom(9), content)
+            .tags([
+                Tag::parse(["h", channel.to_string().as_str()]).expect("h tag"),
+                Tag::parse(["e", parent.id.to_hex().as_str(), "", "root"]).expect("root tag"),
+                Tag::parse(["e", parent.id.to_hex().as_str(), "", "reply"]).expect("reply tag"),
+            ])
+            .custom_created_at(Timestamp::from(created_at as u64))
+            .sign_with_keys(keys)
+            .expect("sign")
+    }
+
+    #[test]
+    fn a_stale_parent_drags_its_fresh_replies_to_the_digest_path() {
+        // The case the mixed-age policy exists for: canonical ingest rejects a
+        // reply whose parent it does not hold, so a fresh reply to a parent
+        // that can no longer be replayed would be an orphan. The whole
+        // component moves together, even the in-window descendants.
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let now = 100_000;
+        let drift = 900; // the relay's ±15 minutes
+
+        let old_root = aged_message(&author, channel, "old root", now - 5_000);
+        store_with_event(&store, &old_root, channel, &edge);
+        let fresh_child = aged_reply(&author, channel, &old_root, "fresh reply", now - 10);
+        store_with_event(&store, &fresh_child, channel, &edge);
+
+        let demoted = store
+            .demote_unreplayable_threads(drift, now)
+            .expect("demote");
+        assert_eq!(demoted, 2, "parent and its in-window descendant");
+
+        // Neither is claimable for exact replay any more.
+        assert!(store
+            .claim_outbox_batch(&author.public_key(), "t", 10, now, 60)
+            .expect("claim")
+            .is_empty());
+
+        // Both are queued for the digest, oldest first.
+        let candidates = store.digest_candidates(10).expect("candidates");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].id, old_root.id,
+            "digest preserves local order"
+        );
+        assert_eq!(candidates[1].id, fresh_child.id);
+    }
+
+    #[test]
+    fn a_fresh_thread_is_left_on_the_exact_path() {
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let now = 100_000;
+
+        let root = aged_message(&author, channel, "root", now - 60);
+        store_with_event(&store, &root, channel, &edge);
+        let child = aged_reply(&author, channel, &root, "reply", now - 30);
+        store_with_event(&store, &child, channel, &edge);
+
+        assert_eq!(
+            store.demote_unreplayable_threads(900, now).expect("demote"),
+            0
+        );
+        assert!(store.digest_candidates(10).expect("candidates").is_empty());
+        assert_eq!(
+            store
+                .claim_outbox_batch(&author.public_key(), "t", 10, now, 60)
+                .expect("claim")
+                .len(),
+            1,
+            "root still drains normally"
+        );
+    }
+
+    #[test]
+    fn demotion_propagates_down_a_multi_level_thread() {
+        // Grandchild is fresh and its parent is fresh, but the grandparent is
+        // stale. All three must move, or the grandchild is submitted as an
+        // orphan the relay will refuse.
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let now = 100_000;
+
+        let grandparent = aged_message(&author, channel, "gp", now - 5_000);
+        store_with_event(&store, &grandparent, channel, &edge);
+        let parent = aged_reply(&author, channel, &grandparent, "p", now - 20);
+        store_with_event(&store, &parent, channel, &edge);
+        let child = aged_reply(&author, channel, &parent, "c", now - 10);
+        store_with_event(&store, &child, channel, &edge);
+
+        assert_eq!(
+            store.demote_unreplayable_threads(900, now).expect("demote"),
+            3
+        );
+        assert_eq!(store.digest_candidates(10).expect("candidates").len(), 3);
+    }
+
+    #[test]
+    fn a_quarantined_ancestor_demotes_its_descendants() {
+        // Permanently rejected upstream is just as un-replayable as too old.
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let now = 100_000;
+
+        let root = aged_message(&author, channel, "root", now - 60);
+        store_with_event(&store, &root, channel, &edge);
+        let child = aged_reply(&author, channel, &root, "reply", now - 30);
+        store_with_event(&store, &child, channel, &edge);
+
+        store
+            .claim_outbox_batch(&author.public_key(), "t", 10, now, 60)
+            .expect("claim");
+        store
+            .acknowledge_outbox_row("t", &root.id, DrainOutcome::Rejected("revoked".into()))
+            .expect("ack");
+
+        let demoted = store.demote_unreplayable_threads(900, now).expect("demote");
+        assert_eq!(demoted, 2, "the rejected root and its descendant");
+        assert!(store
+            .claim_outbox_batch(&author.public_key(), "t2", 10, now, 60)
+            .expect("claim")
+            .is_empty());
+    }
+
+    #[test]
+    fn demotion_is_idempotent() {
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let now = 100_000;
+        store_with_event(
+            &store,
+            &aged_message(&author, channel, "old", now - 5_000),
+            channel,
+            &edge,
+        );
+
+        assert_eq!(
+            store.demote_unreplayable_threads(900, now).expect("first"),
+            1
+        );
+        assert_eq!(
+            store.demote_unreplayable_threads(900, now).expect("second"),
+            0,
+            "re-running must not churn rows"
+        );
     }
 
     #[test]
