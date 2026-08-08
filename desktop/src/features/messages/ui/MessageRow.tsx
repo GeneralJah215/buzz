@@ -37,6 +37,7 @@ import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
 import { useMessageEmoji } from "@/features/messages/lib/useMessageEmoji";
 import { parseWaveMessageContent } from "@/features/messages/lib/waveMessage";
 import { resolveSnapshotSharedBy } from "@/features/messages/lib/snapshotSharedBy";
+import { MessageDeliveryStatus } from "@/features/edge-status/ui/MessageDeliveryStatus";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import { Markdown } from "@/shared/ui/markdown";
 import type { VideoReviewContext } from "@/shared/ui/VideoPlayer";
@@ -520,6 +521,25 @@ export const MessageRow = React.memo(
       </div>
     );
 
+    // `message.accent` is the app's existing "this row is mine" signal
+    // (`currentPubkey === authorPubkey`, set once per event in
+    // `formatTimelineMessages`), already driving the avatar accent. Reusing it
+    // keeps one definition of ownership rather than introducing a second.
+    //
+    // Rendered unconditionally: the component decides for itself whether there
+    // is anything to draw, and on every machine without the edge sidecar the
+    // answer is no. Note this sits BESIDE "Sending…", never merged with it —
+    // that string is local acceptance, this badge is canonical history, and
+    // SPEC-2026-08-05 criterion (3) requires the two to stay separately
+    // labelled wherever they surface.
+    const deliveryStateNode = (
+      <MessageDeliveryStatus
+        eventId={message.id}
+        isOwnMessage={message.accent === true}
+        isPending={message.pending === true}
+      />
+    );
+
     const statusMetadataNode =
       message.pending || message.edited ? (
         <>
@@ -546,15 +566,29 @@ export const MessageRow = React.memo(
       <div className="flex shrink-0 items-baseline gap-2 text-xs">
         <MessageTimestamp createdAt={message.createdAt} time={message.time} />
         {statusMetadataNode}
+        {deliveryStateNode}
       </div>
     );
 
+    // A grouped row has no header to hang the badge off, so it gets its own
+    // line — but only when there is something on it. The self-wrapping variant
+    // exists so a row with nothing to report emits no element at all: an empty
+    // `mt-0.5` div under every continuation message would be a 2px shift on
+    // every machine, including the overwhelming majority with no sidecar.
     const continuationMetadataNode =
-      isDisplayedAsContinuation && statusMetadataNode ? (
+      !isDisplayedAsContinuation ? null : statusMetadataNode ? (
         <div className="mt-0.5 flex items-baseline gap-2 text-xs">
           {statusMetadataNode}
+          {deliveryStateNode}
         </div>
-      ) : null;
+      ) : (
+        <MessageDeliveryStatus
+          containerClassName="mt-0.5 flex items-baseline gap-2 text-xs"
+          eventId={message.id}
+          isOwnMessage={message.accent === true}
+          isPending={message.pending === true}
+        />
+      );
 
     const headerNode = isDisplayedAsContinuation ? null : (
       <MessageHeaderRow>

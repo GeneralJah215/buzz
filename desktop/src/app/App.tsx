@@ -20,6 +20,7 @@ import { deriveShellRoute } from "@/app/AppShell.helpers";
 import { ThemeGrainientBackground } from "@/app/ThemeGrainientBackground";
 import { useReloadShortcut } from "@/app/useReloadShortcut";
 import { KnownAgentPubkeysProvider } from "@/features/agents/useKnownAgentPubkeys";
+import { EdgeDeliveryStateProvider } from "@/features/edge-status/EdgeDeliveryStateProvider";
 import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
 import { useAppOnboardingState } from "@/features/onboarding/hooks";
 import { useMachineOnboardingState } from "@/features/onboarding/machineOnboarding";
@@ -281,7 +282,18 @@ function AppReady({
       }
     >
       <KnownAgentPubkeysProvider>
-        <RouterProvider router={router} />
+        {/*
+          One batched `edge_event_delivery_states` call for every message row on
+          screen, in either the channel timeline or the thread panel. Mounted
+          here for the same reason `KnownAgentPubkeysProvider` is: the consumers
+          are individual `MessageRow`s, and a query per consumer would refetch
+          on every batch of row mounts. Costs nothing on a machine without the
+          sidecar — no rows registered means no IPC, and the first rejection
+          backs the cadence off to minutes.
+        */}
+        <EdgeDeliveryStateProvider>
+          <RouterProvider router={router} />
+        </EdgeDeliveryStateProvider>
       </KnownAgentPubkeysProvider>
     </EncryptedBackupProvider>
   );

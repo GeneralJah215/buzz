@@ -45,7 +45,21 @@ export {
   useEdgeStatus,
   type EdgeStatus,
 } from "./hooks";
+export {
+  EDGE_DELIVERY_REGISTRATION_DEBOUNCE_MS,
+  EdgeDeliveryStateProvider,
+  MAX_DELIVERY_STATE_IDS,
+  useEdgeDeliveryState,
+} from "./EdgeDeliveryStateProvider";
 export { DeliveryStateBadge } from "./ui/DeliveryStateBadge";
+export {
+  EdgeSyncSettingsCard,
+  isEdgeSyncSectionVisible,
+} from "./ui/EdgeSyncSettingsCard";
+export {
+  MessageDeliveryStatus,
+  type MessageDeliveryStatusProps,
+} from "./ui/MessageDeliveryStatus";
 export { QuarantineList, type QuarantineListProps } from "./ui/QuarantineList";
 export {
   WaitingForAuthorNotice,

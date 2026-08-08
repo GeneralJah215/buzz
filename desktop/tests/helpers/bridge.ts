@@ -1,6 +1,9 @@
 import type { Page } from "@playwright/test";
 import type { ChannelTemplate, RelayEvent } from "../../src/shared/api/types";
-import type { MockManagedAgentSeed } from "../../src/testing/e2eBridge";
+import type {
+  MockEdgeStatusSeed,
+  MockManagedAgentSeed,
+} from "../../src/testing/e2eBridge";
 import { FEATURE_OVERRIDES_STORAGE_KEY, PREVIEW_FEATURE_IDS } from "./features";
 
 export const TEST_IDENTITIES = {
@@ -388,6 +391,14 @@ type MockBridgeOptions = {
     scope_value: string;
     kinds: string; // JSON-encoded integer array, e.g. "[9,40002]"
   }>;
+  /**
+   * Seed for the optional `buzz-edge` sidecar.
+   *
+   * OMIT IT to get the production default: every `edge_*` command rejects with
+   * the exact `edge sidecar not running` sentinel, and the whole edge feature
+   * must then leave no trace anywhere in the UI.
+   */
+  edgeStatus?: MockEdgeStatusSeed;
   /**
    * Event IDs that `get_event` should report as definitively not found.
    * Causes `useDraftRootStatus` to map the draft to `deleted` state so specs

@@ -75,6 +75,59 @@ type MockCommandAvailability = {
   resolvedPath?: string | null;
 };
 
+/**
+ * A running edge sidecar, in the exact camelCase wire shapes
+ * `desktop/src/features/edge-status/api/edgeStatus.ts` validates. Written out
+ * rather than derived so a rename on either side fails a spec loudly.
+ */
+export type MockEdgeStatusSeed = {
+  summary: {
+    pending: number;
+    pendingViaDigest: number;
+    claimed: number;
+    syncedExact: number;
+    syncedViaDigest: number;
+    quarantined: number;
+  };
+  quarantined?: Array<{
+    eventId: string;
+    channelId: string;
+    author: string;
+    createdAt: number;
+    attempts: number;
+    reason: string;
+    carriedByDigest: boolean;
+    demotionReason: string | null;
+    updatedAt: number;
+  }>;
+  waitingAuthors?: Array<{
+    author: string;
+    pending: number;
+    ancestorBlocked: number;
+    pendingViaDigest: number;
+    oldestPendingAt: number;
+  }>;
+  /** `eventId` -> wire state name, for the per-message badges. */
+  deliveryStates?: Record<string, string>;
+  /**
+   * Wire state applied to every requested id that `deliveryStates` does not
+   * name. Specs cannot know the event ids of messages the mock relay generated
+   * at runtime, and without this the timeline badge would be unreachable from
+   * an e2e test -- which is precisely the gap that let frontend defects ship.
+   */
+  deliveryStateForAll?: string;
+  /** `eventId` -> demotion reason, for the badge tooltips. */
+  demotionReasons?: Record<string, string>;
+};
+
+/**
+ * The one rejection that means "the optional sidecar isn't running here".
+ * Must stay byte-identical to `EDGE_UNAVAILABLE_MESSAGE` in
+ * `src/features/edge-status/api/edgeStatus.ts` (which matches it exactly, never
+ * by substring) and to `EDGE_UNAVAILABLE` in `src-tauri/src/relay/edge.rs`.
+ */
+const MOCK_EDGE_UNAVAILABLE_MESSAGE = "edge sidecar not running";
+
 export type MockManagedAgentSeed = {
   pubkey: string;
   name: string;
@@ -405,6 +458,19 @@ type E2eConfig = {
     // snake_case wire shape the Rust backend returns so tests can drive the
     // LocalArchiveSettingsCard without a real SQLite database.
     agentMetricArchiveDefaultEnabled?: boolean;
+    /**
+     * Seed for the optional `buzz-edge` sidecar.
+     *
+     * ABSENT IS THE PRODUCTION DEFAULT and the important case: every
+     * `edge_*` command then rejects with the exact `EDGE_UNAVAILABLE_MESSAGE`
+     * sentinel the Rust side returns when `BUZZ_EDGE_RELAY_URL` is unset, so
+     * specs prove the whole feature leaves no trace on a normal machine.
+     * Falling through to `Unsupported mocked Tauri command` instead would be a
+     * *different* rejection, which the app correctly treats as a real fault --
+     * every spec that opened Settings would then see an error banner the real
+     * app never shows.
+     */
+    edgeStatus?: MockEdgeStatusSeed;
     saveSubscriptions?: Array<{
       scope_type: string;
       scope_value: string;
@@ -11596,6 +11662,51 @@ export function maybeInstallE2eTauriMocks() {
         return getRelayWsUrl(activeConfig);
       case "get_edge_relay_binding":
         return null;
+      case "edge_delivery_summary":
+      case "edge_quarantined_events":
+      case "edge_waiting_authors":
+      case "edge_event_delivery_states":
+      case "edge_requeue_quarantined": {
+        const edge = activeConfig?.mock?.edgeStatus;
+        if (!edge) {
+          throw new Error(MOCK_EDGE_UNAVAILABLE_MESSAGE);
+        }
+        if (command === "edge_delivery_summary") {
+          return { ...edge.summary };
+        }
+        if (command === "edge_quarantined_events") {
+          const { limit } = (payload ?? {}) as { limit?: number };
+          const rows = edge.quarantined ?? [];
+          return rows.slice(0, limit ?? rows.length).map((row) => ({ ...row }));
+        }
+        if (command === "edge_waiting_authors") {
+          return (edge.waitingAuthors ?? []).map((row) => ({ ...row }));
+        }
+        if (command === "edge_event_delivery_states") {
+          const { eventIds } = (payload ?? {}) as { eventIds?: string[] };
+          const states = edge.deliveryStates ?? {};
+          // Unknown ids are absent from the reply, exactly as the sidecar
+          // leaves them out -- an event that never entered the local outbox is
+          // an ordinary thing for a timeline to ask about, not an error.
+          return (eventIds ?? [])
+            .map((eventId) => ({
+              eventId,
+              state: states[eventId] ?? edge.deliveryStateForAll,
+              demotionReason: edge.demotionReasons?.[eventId] ?? null,
+            }))
+            .filter((row) => row.state !== undefined);
+        }
+        const { eventId } = (payload ?? {}) as { eventId?: string };
+        const row = (edge.quarantined ?? []).find(
+          (entry) => entry.eventId === eventId,
+        );
+        if (row?.carriedByDigest) {
+          return { requeued: false, outcome: "carriedByDigest" };
+        }
+        return row
+          ? { requeued: true, outcome: "requeued" }
+          : { requeued: false, outcome: "notFound" };
+      }
       case "get_default_relay_url":
         return getRelayWsUrl(activeConfig);
       case "auto_connect_default_relay_enabled":

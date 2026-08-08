@@ -3,6 +3,8 @@ import { getVersion } from "@tauri-apps/api/app";
 import { AlertCircle, ArrowLeft, LoaderCircle, RefreshCw } from "lucide-react";
 
 import { useMyRelayMembershipLookupQuery } from "@/features/community-members/hooks";
+import { useEdgeStatus } from "@/features/edge-status/hooks";
+import { isEdgeSyncSectionVisible } from "@/features/edge-status/ui/EdgeSyncSettingsCard";
 import {
   canManageCommunityMembers,
   shouldWarnMissingMembershipSnapshot,
@@ -71,7 +73,14 @@ const settingsNavGroups: Array<{
   },
   {
     label: "App",
-    sections: ["agents", "compute", "experimental", "mobile", "updates"],
+    sections: [
+      "agents",
+      "compute",
+      "experimental",
+      "edge-sync",
+      "mobile",
+      "updates",
+    ],
   },
 ];
 
@@ -130,6 +139,11 @@ export function SettingsView({
   const { isMobile, open: sidebarOpen, setOpen: setSidebarOpen } = useSidebar();
   const myMembershipQuery = useMyRelayMembershipLookupQuery();
   const featureState = useFeatureSnapshot();
+  // One poller for both the nav gate below and the panel itself. It only runs
+  // while Settings is open, and it backs off to minutes the moment the sidecar
+  // says it is not there -- which on a default install is the first reply.
+  const edgeStatus = useEdgeStatus();
+  const edgeSyncVisible = isEdgeSyncSectionVisible(edgeStatus);
   const visibleSections = React.useMemo(() => {
     return settingsSections.filter((s) => {
       // Feature gate check. Manifest is preview-only — if the gate id is in
@@ -146,9 +160,16 @@ export function SettingsView({
       if (s.value === "community-members") {
         return canManageCommunityMembers(myMembershipQuery.data);
       }
+      // The edge sidecar is optional and off by default. Absent one, this
+      // section leaves no trace at all -- no nav entry, no placeholder, and
+      // (because the gate is evidence of a sidecar rather than the absence of
+      // a rejection) no flash of one before the first reply lands.
+      if (s.value === "edge-sync") {
+        return edgeSyncVisible;
+      }
       return true;
     });
-  }, [myMembershipQuery.data, featureState]);
+  }, [myMembershipQuery.data, featureState, edgeSyncVisible]);
 
   const [isLoaded, setIsLoaded] = React.useState(false);
   const [appVersion, setAppVersion] = React.useState<string | null>(null);
@@ -335,6 +356,7 @@ export function SettingsView({
               data-testid={`settings-panel-${section}`}
             >
               {renderSettingsSection(section, {
+                edgeStatus,
                 currentPubkey,
                 fallbackDisplayName,
                 isUpdatingDesktopNotifications,

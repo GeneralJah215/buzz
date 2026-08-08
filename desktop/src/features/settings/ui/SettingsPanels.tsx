@@ -21,6 +21,7 @@ import {
   SunMoon,
   Ticket,
   UserRound,
+  Waypoints,
   Volume2,
   type LucideIcon,
 } from "lucide-react";
@@ -31,6 +32,8 @@ import type {
 import type { SoundName, SoundSlot } from "@/features/notifications/lib/sound";
 import { CommunityMembersSettingsCard } from "@/features/community-members/ui/CommunityMembersSettingsCard";
 import { CustomEmojiSettingsCard } from "@/features/custom-emoji/ui/CustomEmojiSettingsCard";
+import { EdgeSyncSettingsCard } from "@/features/edge-status/ui/EdgeSyncSettingsCard";
+import type { EdgeStatus } from "@/features/edge-status/hooks";
 import { LocalArchiveSettingsCard } from "@/features/local-archive/ui/LocalArchiveSettingsCard";
 import {
   setThreadViewMode,
@@ -101,6 +104,7 @@ export type SettingsSection =
   | "moderation"
   | "custom-emoji"
   | "local-archive"
+  | "edge-sync"
   | "mobile"
   | "updates";
 
@@ -121,6 +125,7 @@ const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
   "moderation",
   "custom-emoji",
   "local-archive",
+  "edge-sync",
   "mobile",
   "updates",
 ];
@@ -228,6 +233,15 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     value: "local-archive",
     label: "Local archive",
     icon: Archive,
+  },
+  {
+    // Hidden unless a local edge sidecar actually answers. See
+    // `isEdgeSyncSectionVisible` and the runtime filter in `SettingsView`:
+    // the feature is off by default, and a user who has never heard of it
+    // must not find a nav entry advertising it.
+    value: "edge-sync",
+    label: "Local sync",
+    icon: Waypoints,
   },
   {
     value: "mobile",
@@ -787,9 +801,21 @@ function AccentPickerContent({
   );
 }
 
+/**
+ * What `renderSettingsSection` needs, which is more than what `SettingsView`'s
+ * own callers supply.
+ *
+ * `edgeStatus` is deliberately NOT on `SettingsPanelProps`: that type is the
+ * contract `AppShell` fills in, and the edge poller is owned by `SettingsView`
+ * so the nav gate and the panel share one cadence instead of two.
+ */
+export type SettingsPanelRenderProps = SettingsPanelProps & {
+  edgeStatus: EdgeStatus;
+};
+
 export function renderSettingsSection(
   section: SettingsSection,
-  props: SettingsPanelProps,
+  props: SettingsPanelRenderProps,
 ): React.ReactNode {
   switch (section) {
     case "profile":
@@ -848,6 +874,8 @@ export function renderSettingsSection(
       return <CustomEmojiSettingsCard />;
     case "local-archive":
       return <LocalArchiveSettingsCard />;
+    case "edge-sync":
+      return <EdgeSyncSettingsCard status={props.edgeStatus} />;
     case "mobile":
       return <MobilePairingCard currentPubkey={props.currentPubkey} />;
     case "updates":
