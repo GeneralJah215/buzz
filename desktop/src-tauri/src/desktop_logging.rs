@@ -349,6 +349,27 @@ pub(crate) fn log_second_instance(argv: &[String]) {
     );
 }
 
+/// Record the launch-time agent-restore decision.
+///
+/// "No agents started" has three indistinguishable causes from outside: repos
+/// unresolved, recovery mode, or the frontend never applying a workspace. This
+/// says which.
+pub(crate) fn log_agent_restore_gate(
+    restore_agents: bool,
+    recovery_mode: bool,
+    identity_lost: bool,
+    keyring_locked: bool,
+) {
+    tracing::info!(
+        event = "agent_restore_gate",
+        restore_agents,
+        recovery_mode,
+        identity_lost,
+        keyring_locked,
+        "evaluated launch-time agent restore"
+    );
+}
+
 pub(crate) fn log_window_created(window_label: &str) {
     tracing::info!(
         event = "window_created",
