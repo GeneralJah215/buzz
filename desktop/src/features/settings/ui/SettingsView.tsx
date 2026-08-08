@@ -164,6 +164,12 @@ export function SettingsView({
       // section leaves no trace at all -- no nav entry, no placeholder, and
       // (because the gate is evidence of a sidecar rather than the absence of
       // a rejection) no flash of one before the first reply lands.
+      //
+      // The gate is LATCHED for the life of this view, which matters because of
+      // the fallback effect below: an unlatched gate drops `edge-sync` from
+      // `visibleSections` the moment one poll comes back "not running", and the
+      // fallback then navigates the operator to Profile -- during exactly the
+      // sidecar restart they opened this section to watch.
       if (s.value === "edge-sync") {
         return edgeSyncVisible;
       }

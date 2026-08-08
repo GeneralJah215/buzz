@@ -132,26 +132,28 @@ async function flushDebounce() {
   });
 }
 
+function rowTree(rows) {
+  return React.createElement(
+    EdgeDeliveryStateProvider,
+    null,
+    rows.map((row) =>
+      React.createElement(MessageDeliveryStatus, {
+        eventId: row.eventId,
+        isOwnMessage: row.isOwnMessage ?? true,
+        isPending: row.isPending ?? false,
+        key: row.eventId,
+      }),
+    ),
+  );
+}
+
 /** Mount rows, let the debounce fire, and let the resulting fetch settle. */
 async function renderRows(rows) {
   container = dom.window.document.createElement("div");
   dom.window.document.body.appendChild(container);
   root = createRoot(container);
   await act(async () => {
-    root.render(
-      React.createElement(
-        EdgeDeliveryStateProvider,
-        null,
-        rows.map((row) =>
-          React.createElement(MessageDeliveryStatus, {
-            eventId: row.eventId,
-            isOwnMessage: row.isOwnMessage ?? true,
-            isPending: row.isPending ?? false,
-            key: row.eventId,
-          }),
-        ),
-      ),
-    );
+    root.render(rowTree(rows));
   });
   await flushDebounce();
   // The fetch is kicked off from an effect that runs after the debounce commit.
@@ -159,6 +161,31 @@ async function renderRows(rows) {
     await Promise.resolve();
     await Promise.resolve();
   });
+}
+
+/** Swap the rendered window, as a virtualized scroll step does. */
+async function rerenderRows(rows) {
+  await act(async () => {
+    root.render(rowTree(rows));
+  });
+  await flushDebounce();
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+/** Runs `body` with `console.warn` captured, and hands back what it logged. */
+async function captureWarnings(body) {
+  const warnings = [];
+  const original = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  try {
+    await body();
+  } finally {
+    console.warn = original;
+  }
+  return warnings;
 }
 
 beforeEach(() => {
@@ -339,6 +366,122 @@ test("other people's messages and un-acked sends are never asked about", async (
     ...container.querySelectorAll('[data-testid="message-delivery-state"]'),
   ];
   assert.equal(badges.length, 1);
+});
+
+test("one failed chunk does not discard the chunks that answered", async () => {
+  // 501 ids is two chunks. Under `Promise.all` a 503 on the second one threw
+  // away 500 good entries from the first, so a single flaky chunk blanked every
+  // badge on a long timeline -- and a stuck message showing nothing reads
+  // exactly like a message that arrived.
+  const total = MAX_DELIVERY_STATE_IDS + 1;
+  const ids = Array.from({ length: total }, (_, index) => eventId(index + 1));
+  const lastId = ids[total - 1];
+  invokeHandler = (command, args) => {
+    if (command !== "edge_event_delivery_states") {
+      throw new Error(`unexpected command ${command}`);
+    }
+    if (args.eventIds.includes(lastId)) {
+      throw new Error("relay returned 503 Service Unavailable");
+    }
+    return args.eventIds.map((id) => ({
+      eventId: id,
+      state: "quarantined",
+      demotionReason: null,
+    }));
+  };
+
+  const warnings = await captureWarnings(() =>
+    renderRows(ids.map((id) => ({ eventId: id }))),
+  );
+
+  const badges = [
+    ...container.querySelectorAll('[data-testid="message-delivery-state"]'),
+  ];
+  assert.equal(
+    badges.length,
+    MAX_DELIVERY_STATE_IDS,
+    `every id the sidecar DID answer for must still be badged, got ${badges.length}`,
+  );
+  // A genuine fault keeps the fast cadence so recovery is picked up promptly.
+  const cadences = [...activeIntervals.values()].map((entry) => entry.ms);
+  assert.ok(
+    cadences.every((ms) => ms < 120_000),
+    `a genuine fault must not be treated as 'no sidecar', got ${cadences.join(", ")}`,
+  );
+  // The badge has no error UI by design, so the log is the ONLY trace this
+  // fault leaves anywhere. Silence here is how a repeated fault stays invisible.
+  const guardrail = warnings.find(
+    (args) =>
+      typeof args[0] === "string" &&
+      args[0].startsWith("[GUARDRAIL]") &&
+      args[0].includes("edge_event_delivery_states"),
+  );
+  assert.ok(guardrail, "a genuine delivery-state fault must be logged");
+  assert.match(String(guardrail[1]), /503 Service Unavailable/);
+});
+
+test("a whole batch of sentinel rejections is still the benign case", async () => {
+  // Two chunks, both "not running". That is not a fault and must render
+  // nothing at all, exactly as the single-chunk case does.
+  const total = MAX_DELIVERY_STATE_IDS + 1;
+  const ids = Array.from({ length: total }, (_, index) => eventId(index + 1));
+  invokeHandler = () => {
+    throw new Error(UNAVAILABLE);
+  };
+
+  const warnings = await captureWarnings(() =>
+    renderRows(ids.map((id) => ({ eventId: id }))),
+  );
+
+  assert.equal(container.innerHTML, "");
+  assert.equal(warnings.length, 0, "an absent sidecar is not a fault to log");
+  const cadences = [...activeIntervals.values()].map((entry) => entry.ms);
+  assert.ok(cadences.every((ms) => ms >= 120_000));
+});
+
+test("an absent sidecar's backoff survives id-set churn", async () => {
+  // The cadence guard used to cover only the `unavailable` flip. Every id-set
+  // change still forced an immediate poll, so scrolling a virtualized timeline
+  // on a sidecar-free machine paid a rejected IPC call per debounce window
+  // while the retry timer sat armed at two minutes.
+  invokeHandler = () => {
+    throw new Error(UNAVAILABLE);
+  };
+
+  await renderRows([{ eventId: eventId(1) }]);
+  assert.equal(invokeCalls.length, 1);
+
+  for (let step = 2; step <= 11; step += 1) {
+    await rerenderRows([{ eventId: eventId(step) }, { eventId: eventId(1) }]);
+  }
+
+  assert.equal(
+    invokeCalls.length,
+    1,
+    `ten scroll steps must not punch through the backoff, got ${invokeCalls.length} calls`,
+  );
+});
+
+test("unmounting schedules no flush the provider will never run", async () => {
+  invokeHandler = () => {
+    throw new Error(UNAVAILABLE);
+  };
+  await renderRows([{ eventId: eventId(1) }, { eventId: eventId(2) }]);
+  assert.equal(pendingTimeouts.size, 0, "the debounce should have flushed");
+
+  const current = root;
+  root = null;
+  await act(async () => {
+    current.unmount();
+  });
+
+  // Row cleanups run after the provider's own, so `unregister -> scheduleFlush`
+  // used to arm one timer per teardown whose callback could only be a no-op.
+  assert.equal(
+    pendingTimeouts.size,
+    0,
+    "a torn-down provider must not leave a timer behind",
+  );
 });
 
 test("a state this build predates renders no badge rather than a broken one", async () => {

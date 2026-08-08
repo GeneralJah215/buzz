@@ -53,6 +53,17 @@ export const MAX_DELIVERY_STATE_IDS = 500;
  */
 export const EDGE_DELIVERY_REGISTRATION_DEBOUNCE_MS = 250;
 
+/**
+ * Minimum gap between two `[GUARDRAIL]` fault logs from this provider.
+ *
+ * The badge deliberately has no error UI — it is an aside on someone else's
+ * screen and must never replace a message with a banner. That makes a log the
+ * ONLY trace a repeated `edge_event_delivery_states` fault leaves anywhere, so
+ * it has to exist; and because the poll runs on a timer, it has to be throttled
+ * or it becomes a console the operator learns to ignore.
+ */
+const EDGE_DELIVERY_FAULT_LOG_INTERVAL_MS = 60_000;
+
 /** Shared frozen empty lookup so "no data" never re-renders a consumer. */
 const EMPTY_LOOKUP: EdgeDeliveryStateLookup = Object.freeze({});
 const EMPTY_IDS: readonly string[] = Object.freeze([]);
@@ -126,6 +137,12 @@ export function EdgeDeliveryStateProvider({
   // rejected IPC calls per timeline instead of one.
   const previousIdsRef = React.useRef<readonly string[] | null>(null);
   const previousUnavailableRef = React.useRef(false);
+  // When the last "sidecar not running" rejection came back. The backoff has to
+  // hold across id-set changes, not only across the flag flip: a virtualized
+  // scroll re-keys the batch every debounce window, and each re-key used to
+  // punch straight through the 120s cadence with another rejected IPC call.
+  const lastUnavailableAtRef = React.useRef<number | null>(null);
+  const lastFaultLogAtRef = React.useRef(0);
 
   React.useEffect(() => {
     mountedRef.current = true;
@@ -139,6 +156,13 @@ export function EdgeDeliveryStateProvider({
   }, []);
 
   const scheduleFlush = React.useCallback(() => {
+    // Row cleanups run AFTER the provider's own cleanup, so an unmounting tree
+    // hands `unregister` -> `scheduleFlush` a provider that is already gone.
+    // Without this the last teardown leaves one live `setTimeout` behind whose
+    // callback can only ever be a no-op.
+    if (!mountedRef.current) {
+      return;
+    }
     if (flushHandleRef.current !== null) {
       return;
     }
@@ -189,37 +213,65 @@ export function EdgeDeliveryStateProvider({
       if (cancelled || !mountedRef.current) {
         return;
       }
-      try {
-        const chunks = await Promise.all(
-          chunkIds(eventIds).map((chunk) =>
-            fetchEdgeEventDeliveryStates(chunk),
-          ),
-        );
-        if (cancelled || !mountedRef.current) {
-          return;
-        }
-        setLookup(Object.assign({}, ...chunks) as EdgeDeliveryStateLookup);
-        setUnavailable(false);
-      } catch (caught) {
-        if (cancelled || !mountedRef.current) {
-          return;
-        }
-        if (isEdgeUnavailableError(caught)) {
-          // The ordinary case on every machine that never installed the
-          // sidecar. Drop any stale badges and slow the timer right down.
-          setLookup((current) =>
-            current === EMPTY_LOOKUP ? current : EMPTY_LOOKUP,
-          );
-          setUnavailable(true);
-          return;
-        }
-        // A genuine fault (503, binding mismatch, SQLite, a shape break). The
-        // badge is an aside on someone else's screen, so it must not take the
-        // timeline down or replace a message with an error; the operator-facing
-        // report of the same fault is the Local sync settings section. Keep the
-        // fast cadence so recovery is picked up promptly.
-        setUnavailable(false);
+      // `allSettled`, never `all`. A 600-id timeline is two chunks, and under
+      // `all` one 503 on the second chunk threw away 500 perfectly good entries
+      // from the first -- so a single flaky chunk blanked every badge on screen.
+      // That is the dangerous direction: a genuinely stuck message showing
+      // nothing reads exactly like a message that arrived.
+      const results = await Promise.allSettled(
+        chunkIds(eventIds).map((chunk) => fetchEdgeEventDeliveryStates(chunk)),
+      );
+      if (cancelled || !mountedRef.current) {
+        return;
       }
+
+      const merged: Record<string, EdgeDeliveryStateEntry> = {};
+      const rejections: unknown[] = [];
+      for (const result of results) {
+        if (result.status === "fulfilled") {
+          Object.assign(merged, result.value);
+        } else {
+          rejections.push(result.reason);
+        }
+      }
+
+      if (rejections.length === 0) {
+        setLookup(merged as EdgeDeliveryStateLookup);
+        setUnavailable(false);
+        return;
+      }
+
+      if (rejections.every((reason) => isEdgeUnavailableError(reason))) {
+        // The ordinary case on every machine that never installed the sidecar.
+        // Drop any stale badges and slow the timer right down. Partial results
+        // are dropped too: if the sidecar went away mid-batch, half a lookup is
+        // a half-badged timeline, and "renders nothing at all" is the contract.
+        lastUnavailableAtRef.current = Date.now();
+        setLookup((current) =>
+          current === EMPTY_LOOKUP ? current : EMPTY_LOOKUP,
+        );
+        setUnavailable(true);
+        return;
+      }
+
+      // A genuine fault on at least one chunk (503, binding mismatch, SQLite, a
+      // shape break). The badge is an aside on someone else's screen, so it must
+      // not take the timeline down or replace a message with an error -- but the
+      // chunks that DID answer are still published, so one bad chunk costs only
+      // its own badges. Keep the fast cadence so recovery is picked up promptly.
+      const now = Date.now();
+      if (
+        now - lastFaultLogAtRef.current >=
+        EDGE_DELIVERY_FAULT_LOG_INTERVAL_MS
+      ) {
+        lastFaultLogAtRef.current = now;
+        console.warn(
+          `[GUARDRAIL] edge_event_delivery_states failed for ${rejections.length} of ${results.length} chunk(s); badges for those ids are missing`,
+          rejections[0],
+        );
+      }
+      setLookup(merged as EdgeDeliveryStateLookup);
+      setUnavailable(false);
     }
 
     const idsChanged = previousIdsRef.current !== eventIds;
@@ -228,7 +280,21 @@ export function EdgeDeliveryStateProvider({
       !idsChanged && previousUnavailableRef.current !== unavailable;
     previousUnavailableRef.current = unavailable;
 
-    if (!cadenceOnly) {
+    // The backoff has to survive id-set churn, not just the flag flip. Scrolling
+    // a virtualized timeline re-keys the batch every debounce window, and each
+    // re-key firing an immediate poll meant a sidecar-free machine paid roughly
+    // four rejected IPC calls per second of scrolling while the cadence timer
+    // sat armed at two minutes. Once a rejection has aged past the retry
+    // interval a new id set may poll again immediately, so a sidecar that starts
+    // later is still picked up promptly and continuous scrolling cannot starve
+    // recovery by re-arming the interval.
+    const sinceUnavailable =
+      lastUnavailableAtRef.current === null
+        ? Number.POSITIVE_INFINITY
+        : Date.now() - lastUnavailableAtRef.current;
+    const backoffHolds = unavailable && sinceUnavailable < unavailableRetryMs;
+
+    if (!cadenceOnly && !backoffHolds) {
       void poll();
     }
 

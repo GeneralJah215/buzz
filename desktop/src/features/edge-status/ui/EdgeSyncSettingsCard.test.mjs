@@ -143,10 +143,13 @@ function healthyHandler(command) {
 
 let root = null;
 let container = null;
+/** The most recent `EdgeStatus` the harness rendered with. */
+let latestStatus = null;
 
 /** Mounts the card with the real poller feeding it. */
 function Harness() {
   const status = useEdgeStatus();
+  latestStatus = status;
   return React.createElement(EdgeSyncSettingsCard, { status });
 }
 
@@ -166,9 +169,25 @@ async function mount() {
   });
 }
 
+/** Fires every armed interval once and lets the poll it starts settle. */
+async function tickPollers() {
+  const callbacks = [...activeIntervals.values()].map((entry) => entry.fn);
+  await act(async () => {
+    for (const callback of callbacks) {
+      callback();
+    }
+  });
+  await act(async () => {
+    for (let index = 0; index < 6; index += 1) {
+      await Promise.resolve();
+    }
+  });
+}
+
 beforeEach(() => {
   invokeCalls.length = 0;
   activeIntervals.clear();
+  latestStatus = null;
 });
 
 afterEach(async () => {
@@ -201,43 +220,45 @@ test("no sidecar: the settings surface contributes nothing to the DOM", async ()
   );
 });
 
+function status(overrides) {
+  return {
+    summary: null,
+    waitingAuthors: [],
+    unavailable: false,
+    error: null,
+    hasAnswered: false,
+    isLoading: false,
+    refresh: () => {},
+    ...overrides,
+  };
+}
+
 test("no sidecar: the settings section itself is hidden, before and after the first reply", async () => {
   // Pre-reply. `unavailable` is still false here, which is exactly why the
   // gate keys on evidence of a sidecar instead: gating on `!unavailable` would
   // show the nav entry to every user for one IPC round-trip and then remove it.
-  assert.equal(
-    isEdgeSyncSectionVisible({
-      summary: null,
-      waitingAuthors: [],
-      unavailable: false,
-      error: null,
-      isLoading: true,
-      refresh: () => {},
-    }),
-    false,
-  );
+  assert.equal(isEdgeSyncSectionVisible(status({ isLoading: true })), false);
   // Post-reply.
+  assert.equal(isEdgeSyncSectionVisible(status({ unavailable: true })), false);
+  // A fault DOES open it. `edge_post` answers with the sentinel both when no
+  // binding is configured and on any transport failure, so a machine that never
+  // opted in cannot produce a non-sentinel error at all -- reaching one means a
+  // binding resolved, which means the user set BUZZ_EDGE_RELAY_URL. Hiding here
+  // would leave an operator whose sidecar 503s from app start with no surface
+  // whatsoever, which is the exact situation this panel is for.
   assert.equal(
-    isEdgeSyncSectionVisible({
-      summary: null,
-      waitingAuthors: [],
-      unavailable: true,
-      error: null,
-      isLoading: false,
-      refresh: () => {},
-    }),
-    false,
+    isEdgeSyncSectionVisible(
+      status({ error: new Error("relay returned 503 Service Unavailable") }),
+    ),
+    true,
   );
-  // A real fault on a machine that DOES have a sidecar must reach the operator.
+  // Positive evidence does open it, and stays latched afterwards.
   assert.equal(
-    isEdgeSyncSectionVisible({
-      summary: null,
-      waitingAuthors: [],
-      unavailable: false,
-      error: new Error("relay returned 503 Service Unavailable"),
-      isLoading: false,
-      refresh: () => {},
-    }),
+    isEdgeSyncSectionVisible(status({ summary: SUMMARY, hasAnswered: true })),
+    true,
+  );
+  assert.equal(
+    isEdgeSyncSectionVisible(status({ unavailable: true, hasAnswered: true })),
     true,
   );
 });
@@ -340,10 +361,15 @@ test("the summary keeps the two delivery axes on separate labels", async () => {
 });
 
 test("a genuine fault is reported instead of being hidden as 'no sidecar'", async () => {
-  invokeHandler = () => {
-    // A real failure that merely contains the word "unavailable". Substring
-    // sniffing used to swallow these, leaving the status surface silent -- the
-    // worst possible answer to "is anything stuck?".
+  invokeHandler = (command) => {
+    if (command === "edge_delivery_summary") {
+      // A sidecar that answered with a payload this build cannot read. That is
+      // positive evidence of a sidecar (only a running one produces a body),
+      // and an `EdgeStatusShapeError` exists precisely so it is never mistaken
+      // for the benign "not running" case.
+      return {};
+    }
+    if (command === "edge_waiting_authors") return [];
     throw new Error("relay returned 503 Service Unavailable");
   };
 
@@ -351,5 +377,131 @@ test("a genuine fault is reported instead of being hidden as 'no sidecar'", asyn
 
   const alert = container.querySelector('[role="alert"]');
   assert.ok(alert, "a genuine fault must be visible, not silence");
-  assert.match(alert.textContent, /503 Service Unavailable/);
+  assert.match(alert.textContent, /edge_delivery_summary/);
+  assert.match(alert.textContent, /'pending'/);
+});
+
+test("a sidecar that only ever faults still gets a surface", async () => {
+  invokeHandler = () => {
+    // A sidecar that is plainly there and 503s from app start, never once
+    // succeeding. `hasAnswered` never latches, because no payload comes back.
+    // Hiding on that leaves the operator nothing at all -- no list, no banner,
+    // one console line -- for the exact situation this panel exists for.
+    throw new Error("relay returned 503 Service Unavailable");
+  };
+
+  await mount();
+
+  assert.equal(latestStatus.hasAnswered, false, "no payload ever came back");
+  assert.notEqual(latestStatus.error, null, "but something answered unhappily");
+  assert.equal(
+    isEdgeSyncSectionVisible(latestStatus),
+    true,
+    "a machine that has a sidecar and cannot talk to it must still get the panel",
+  );
+});
+
+test("a user with no sidecar still sees nothing at all", async () => {
+  invokeHandler = () => {
+    // The sentinel, exactly. `edge_post` answers with this both when no binding
+    // is configured and on any transport failure, so this is what every machine
+    // that never opted in produces -- and the only thing it can produce.
+    throw new Error("edge sidecar not running");
+  };
+
+  await mount();
+
+  assert.equal(latestStatus.hasAnswered, false);
+  assert.equal(latestStatus.error, null, "the sentinel is not a fault");
+  assert.equal(isEdgeSyncSectionVisible(latestStatus), false);
+  assert.equal(container.innerHTML, "");
+});
+
+test("the quarantine list reports its own faults instead of swallowing them", async () => {
+  // The exact shape of the bug: the summary says two events gave up, and the
+  // call that fetches those two rows fails with something that is NOT the
+  // sentinel. Swallowing it rendered "Sync failed: 2" beside an empty list --
+  // no heading, no alert, no log -- on the one surface whose entire job is
+  // answering "is anything stuck?".
+  invokeHandler = (command) => {
+    if (command === "edge_quarantined_events") {
+      throw new Error("sqlite: disk I/O error, store unavailable");
+    }
+    return healthyHandler(command);
+  };
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+
+  try {
+    await mount();
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const alert = container.querySelector('[role="alert"]');
+  assert.ok(alert, "a failed quarantine fetch must be reported, not silent");
+  assert.match(alert.textContent, /disk I\/O error/);
+  // The rest of the card still works -- one failed sub-fetch is not a reason
+  // to blank the summary the operator came for.
+  assert.ok(container.querySelector('[data-testid="edge-delivery-summary"]'));
+  // And it left a log with context, not just a UI string.
+  const guardrail = warnings.find(
+    (args) =>
+      typeof args[0] === "string" &&
+      args[0].startsWith("[GUARDRAIL]") &&
+      args[0].includes("edge_quarantined_events"),
+  );
+  assert.ok(guardrail, `expected a [GUARDRAIL] log, got ${warnings.length}`);
+  assert.match(String(guardrail[1]), /disk I\/O error/);
+});
+
+test("an EdgeStatusShapeError from the quarantine page is reported too", async () => {
+  // The shape error's stated purpose is to never be mistaken for the benign
+  // case. It used to be swallowed by exactly the same branch.
+  invokeHandler = (command) => {
+    if (command === "edge_quarantined_events") {
+      return [{ eventId: 42 }];
+    }
+    return healthyHandler(command);
+  };
+  const originalWarn = console.warn;
+  console.warn = () => {};
+
+  try {
+    await mount();
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const alert = container.querySelector('[role="alert"]');
+  assert.ok(alert, "a malformed quarantine payload must be reported");
+  assert.match(alert.textContent, /edge_quarantined_events/);
+});
+
+test("a sidecar blip does not take the section away mid-triage", async () => {
+  // One sentinel reply after a healthy poll used to drop `edge-sync` out of
+  // `visibleSections`, and SettingsView's fallback effect then navigated the
+  // operator to Profile -- during exactly the sidecar restart they had opened
+  // this section to watch.
+  invokeHandler = healthyHandler;
+  await mount();
+  assert.equal(isEdgeSyncSectionVisible(latestStatus), true);
+
+  invokeHandler = () => {
+    throw new Error(UNAVAILABLE);
+  };
+  await tickPollers();
+
+  assert.equal(latestStatus.summary, null, "the blip must have landed");
+  assert.equal(latestStatus.unavailable, true);
+  assert.equal(
+    isEdgeSyncSectionVisible(latestStatus),
+    true,
+    "the section must survive a sidecar restart",
+  );
+  assert.ok(
+    container.querySelector('[data-testid="settings-edge-sync"]'),
+    "the panel must stay mounted while the sidecar restarts",
+  );
 });

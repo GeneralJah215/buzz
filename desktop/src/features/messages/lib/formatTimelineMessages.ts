@@ -197,7 +197,12 @@ export function formatTimelineMessages(
   /** Profiles for verified agent owners, fetched in one batch by the surface. */
   ownerProfiles?: UserProfileLookup,
 ): TimelineMessage[] {
-  const currentPubkeyLower = currentPubkey?.toLowerCase();
+  // `normalizePubkey`, not `toLowerCase`, because every pubkey this is compared
+  // against has been through `normalizePubkey` (which trims as well). One
+  // stray space on the identity side would otherwise silently make every
+  // "is this mine?" answer on the timeline `false`.
+  const currentPubkeyLower =
+    currentPubkey === undefined ? undefined : normalizePubkey(currentPubkey);
   const roleByPubkey = new Map<string, string>();
   if (members) {
     for (const member of members) {
@@ -429,12 +434,13 @@ export function formatTimelineMessages(
     const authorProfile = profiles?.[authorPubkey.toLowerCase()];
     const isAgent = role === "bot" || authorProfile?.isAgent === true;
     const ownerPubkey = isAgent ? (authorProfile?.ownerPubkey ?? null) : null;
+    const signerPubkey = normalizePubkey(event.pubkey);
     return {
       id: event.id,
       renderKey: event.localKey ?? event.id,
       createdAt: event.created_at,
       pubkey: authorPubkey,
-      signerPubkey: normalizePubkey(event.pubkey),
+      signerPubkey,
       author,
       isAgent,
       ownerPubkey,
@@ -461,7 +467,20 @@ export function formatTimelineMessages(
       parentId: thread.parentId,
       rootId: thread.rootId,
       depth: getDepth(event),
-      accent: currentPubkey === authorPubkey,
+      // DISPLAY ownership: "this row is shown as me", which is what the avatar
+      // accent is about. `authorPubkey` may be a delegated author lifted off an
+      // `actor`/`p` tag of a relay-signed event, so this is deliberately not the
+      // same question as `isMine` below. Both sides are normalized: comparing a
+      // raw `currentPubkey` against a normalized author let a single upper-case
+      // or whitespace skew blank the accent on every row at once.
+      accent: currentPubkeyLower === authorPubkey,
+      // SIGNING ownership: "I hold the key that signed this event". Anything the
+      // viewer can act on hangs off this one, not off `accent` -- the delivery
+      // badge above all, because only the signing identity can drain that
+      // event's outbox row, so a delegated row badged as the viewer's would ask
+      // them to fix something they cannot reach.
+      isMine:
+        currentPubkeyLower !== undefined && signerPubkey === currentPubkeyLower,
       pending: event.pending,
       edited: edit !== undefined,
       kind: event.kind,

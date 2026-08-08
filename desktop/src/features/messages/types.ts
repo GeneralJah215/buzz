@@ -42,7 +42,20 @@ export type TimelineMessage = {
   parentId?: string | null;
   rootId?: string | null;
   depth: number;
+  /**
+   * The row is DISPLAYED as the current user. Drives the avatar accent only.
+   * May be true for an event the viewer did not sign: `pubkey` can be a
+   * delegated author taken off a relay-signed event's `actor`/`p` tag.
+   */
   accent?: boolean;
+  /**
+   * The current user SIGNED this event (`signerPubkey === currentPubkey`).
+   * This is the one to use for anything the viewer can act on — only the
+   * signing identity can republish or drain its own queued events, so a
+   * capability keyed on `accent` would promise an action a delegated row
+   * cannot perform.
+   */
+  isMine?: boolean;
   pending?: boolean;
   edited?: boolean;
   highlighted?: boolean;

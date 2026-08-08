@@ -23,6 +23,7 @@
 import * as React from "react";
 
 import {
+  EdgeStatusShapeError,
   fetchEdgeDeliverySummary,
   fetchEdgeWaitingAuthors,
   isEdgeUnavailableError,
@@ -44,6 +45,9 @@ export const EDGE_STATUS_POLL_INTERVAL_MS = 15_000;
  */
 export const EDGE_UNAVAILABLE_RETRY_INTERVAL_MS = 120_000;
 
+/** Minimum gap between two `[GUARDRAIL]` poll-fault logs from this hook. */
+const FAULT_LOG_INTERVAL_MS = 60_000;
+
 export type EdgeStatus = {
   /** `null` until the first successful poll, and whenever unavailable. */
   summary: EdgeDeliverySummary | null;
@@ -52,6 +56,21 @@ export type EdgeStatus = {
   unavailable: boolean;
   /** A genuine fault — malformed response or an unexpected rejection. */
   error: Error | null;
+  /**
+   * Sticky, positive evidence that a sidecar exists on this machine: it has
+   * answered at least once this session, either with a payload this build
+   * understood (`summary` landed) or with one it did not (`EdgeStatusShapeError`
+   * — the parse got a body back, which only a running sidecar can produce).
+   *
+   * This, and NOT `error !== null`, is what the Local sync surface is gated on.
+   * A bare rejection is not evidence of anything: the "no sidecar here" reply is
+   * matched by one byte-exact string, so any drift in that string on a machine
+   * that never installed the feature would otherwise unhide the whole section
+   * for a user who has never heard of it. A latch also survives a sidecar
+   * restart — `summary` goes null on the first rejection, and without this the
+   * section would vanish underneath an operator mid-triage.
+   */
+  hasAnswered: boolean;
   isLoading: boolean;
   /** Fetch immediately and return to the fast cadence. */
   refresh: () => void;
@@ -85,6 +104,9 @@ export function useEdgeStatus(options?: {
   // that hammers a process which is not there.
   const [unavailable, setUnavailable] = React.useState(false);
   const [error, setError] = React.useState<Error | null>(null);
+  // Latched once, never cleared for the life of the hook. See `hasAnswered` on
+  // `EdgeStatus` for why the surface is gated on this rather than on `error`.
+  const [hasAnswered, setHasAnswered] = React.useState(false);
   const [isLoading, setIsLoading] = React.useState(false);
   const [refreshToken, setRefreshToken] = React.useState(0);
 
@@ -96,6 +118,7 @@ export function useEdgeStatus(options?: {
   const queuedRef = React.useRef(false);
   const refreshRequestedRef = React.useRef(false);
   const previousUnavailableRef = React.useRef<boolean | null>(null);
+  const lastFaultLogAtRef = React.useRef(0);
 
   React.useEffect(() => {
     mountedRef.current = true;
@@ -128,6 +151,7 @@ export function useEdgeStatus(options?: {
         setWaitingAuthors(nextWaitingAuthors);
         setUnavailable(false);
         setError(null);
+        setHasAnswered(true);
       } catch (caught) {
         if (!mountedRef.current) {
           return;
@@ -140,6 +164,25 @@ export function useEdgeStatus(options?: {
           setError(null);
           setUnavailable(true);
           return;
+        }
+        if (caught instanceof EdgeStatusShapeError) {
+          // The sidecar answered with a body; this build could not read it.
+          // That is positive evidence a sidecar exists, so the surface that
+          // reports the fault is allowed to open.
+          setHasAnswered(true);
+        } else {
+          // A bare rejection that is not the "no sidecar" sentinel. It does NOT
+          // unhide the section (see `hasAnswered`), so a log is the only trace
+          // it leaves on a machine that has never had a successful reply.
+          // Throttled: the poll cadence would otherwise fill the console.
+          const now = Date.now();
+          if (now - lastFaultLogAtRef.current >= FAULT_LOG_INTERVAL_MS) {
+            lastFaultLogAtRef.current = now;
+            console.warn(
+              "[GUARDRAIL] edge status poll failed and is not the 'sidecar not running' sentinel",
+              caught,
+            );
+          }
         }
         setError(caught instanceof Error ? caught : new Error(String(caught)));
       }
@@ -234,6 +277,7 @@ export function useEdgeStatus(options?: {
     waitingAuthors,
     unavailable,
     error,
+    hasAnswered,
     isLoading,
     refresh,
   };

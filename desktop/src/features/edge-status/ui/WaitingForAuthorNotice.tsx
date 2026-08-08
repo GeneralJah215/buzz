@@ -111,8 +111,18 @@ export function WaitingForAuthorNotice({
                   {eventCount(author.ancestorBlocked, "event")} blocked
                 </span>
                 <span aria-hidden="true">·</span>
+                {/*
+                 * NOT "oldest waiting". The sidecar sends one timestamp per
+                 * author across all three buckets (BUG-023), so this row's
+                 * figure may come from a genuinely pending event rather than a
+                 * blocked one -- and this is the section whose entire point is
+                 * that these events are not waiting for anybody. The data
+                 * cannot be narrowed here, so the label claims only what the
+                 * number actually is.
+                 */}
                 <span>
-                  oldest waiting {formatQueuedAge(author.oldestPendingAt, now)}
+                  oldest queued event from this author{" "}
+                  {formatQueuedAge(author.oldestPendingAt, now)}
                 </span>
               </li>
             ))}

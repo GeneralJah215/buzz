@@ -521,10 +521,14 @@ export const MessageRow = React.memo(
       </div>
     );
 
-    // `message.accent` is the app's existing "this row is mine" signal
-    // (`currentPubkey === authorPubkey`, set once per event in
-    // `formatTimelineMessages`), already driving the avatar accent. Reusing it
-    // keeps one definition of ownership rather than introducing a second.
+    // `message.isMine`, NOT `message.accent`. The two answer different
+    // questions and only one of them is the badge's: `accent` is "displayed as
+    // me", which is true for a relay-signed event whose `actor`/`p` tag
+    // attributes it to the viewer, while `isMine` is "signed by my key". The
+    // badge's premise is "did MY message get out, and can I act on it?" — and
+    // only the signing identity can drain that event's outbox row, so a
+    // delegated row badged here would ask the viewer to fix something no key
+    // they hold can reach. `accent` keeps driving the avatar, which is display.
     //
     // Rendered unconditionally: the component decides for itself whether there
     // is anything to draw, and on every machine without the edge sidecar the
@@ -535,7 +539,7 @@ export const MessageRow = React.memo(
     const deliveryStateNode = (
       <MessageDeliveryStatus
         eventId={message.id}
-        isOwnMessage={message.accent === true}
+        isOwnMessage={message.isMine === true}
         isPending={message.pending === true}
       />
     );
@@ -585,7 +589,7 @@ export const MessageRow = React.memo(
         <MessageDeliveryStatus
           containerClassName="mt-0.5 flex items-baseline gap-2 text-xs"
           eventId={message.id}
-          isOwnMessage={message.accent === true}
+          isOwnMessage={message.isMine === true}
           isPending={message.pending === true}
         />
       );
@@ -882,6 +886,7 @@ export const MessageRow = React.memo(
     prev.message.ownerLabel === next.message.ownerLabel &&
     prev.message.avatarUrl === next.message.avatarUrl &&
     prev.message.accent === next.message.accent &&
+    prev.message.isMine === next.message.isMine &&
     prev.message.time === next.message.time &&
     prev.message.depth === next.message.depth &&
     prev.message.kind === next.message.kind &&

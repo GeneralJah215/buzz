@@ -674,3 +674,86 @@ test("CHANNEL_TIMELINE_CONTENT_KINDS matches isTimelineContentEvent", () => {
     );
   }
 });
+
+test("isMine follows the signing key, not the displayed author", () => {
+  // A relay-signed event whose `actor` tag attributes it to the viewer. It is
+  // DISPLAYED as theirs -- `accent` is correct at true, and the avatar should
+  // stay accented -- but they did not sign it, and only the signing identity
+  // can drain that event's outbox row. Anything the viewer can act on (the
+  // delivery badge above all) must key on `isMine`, or it promises a fix no key
+  // they hold can reach.
+  const event = finalizeEvent(
+    {
+      kind: 9,
+      created_at: 1_700_000_000,
+      content: "hello world",
+      tags: [
+        ["h", CHANNEL_ID],
+        ["actor", PUBKEY_B],
+      ],
+    },
+    RELAY_SECRET,
+  );
+
+  const [message] = formatTimelineMessages(
+    [event],
+    null,
+    PUBKEY_B,
+    null,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    RELAY_PUBKEY,
+  );
+
+  assert.equal(message.pubkey, PUBKEY_B);
+  assert.equal(message.signerPubkey, RELAY_PUBKEY);
+  assert.equal(message.accent, true, "display authorship is unchanged");
+  assert.equal(
+    message.isMine,
+    false,
+    "a delegated row is not signed by the viewer",
+  );
+});
+
+test("isMine is true for an event the viewer actually signed", () => {
+  const [message] = formatTimelineMessages(
+    [streamMessage()],
+    null,
+    PUBKEY_A,
+    null,
+  );
+
+  assert.equal(message.isMine, true);
+  assert.equal(message.accent, true);
+});
+
+test("isMine and accent tolerate a case- or whitespace-skewed identity", () => {
+  // `currentPubkey` reaches this function straight from the identity layer
+  // while every pubkey it is compared against has been through
+  // `normalizePubkey`. Comparing the raw value meant one upper-case character
+  // silently made every row on the timeline "not mine" -- which blanks every
+  // delivery badge at once, with nothing on screen to say why.
+  const [message] = formatTimelineMessages(
+    [streamMessage()],
+    null,
+    ` ${PUBKEY_A.toUpperCase()} `,
+    null,
+  );
+
+  assert.equal(message.isMine, true);
+  assert.equal(message.accent, true);
+});
+
+test("no identity yet means no row is claimed as the viewer's", () => {
+  const [message] = formatTimelineMessages(
+    [streamMessage()],
+    null,
+    undefined,
+    null,
+  );
+
+  assert.equal(message.isMine, false);
+  assert.equal(message.accent, false);
+});

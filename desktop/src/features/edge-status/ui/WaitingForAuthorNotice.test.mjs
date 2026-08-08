@@ -218,3 +218,19 @@ test("each identity is listed under the sections that apply to it", async () => 
   assert.match(waiting.textContent, /44b8e82b/);
   assert.match(blocked.textContent, /9c3f0011/);
 });
+
+test("the ancestor-blocked age is not labelled as waiting", async () => {
+  // The sidecar sends ONE timestamp per author across all three buckets
+  // (BUG-023), so this figure may come from a genuinely pending row. Calling it
+  // "oldest waiting" inside the section whose whole point is that these events
+  // are NOT waiting for anybody claims more than the data knows.
+  await render([author({ ancestorBlocked: 2 })]);
+
+  const blocked = section(BLOCKED_LABEL);
+  assert.ok(blocked);
+  assert.ok(
+    !/oldest waiting/i.test(blocked.textContent),
+    `the blocked section must not call its age "waiting": ${blocked.textContent}`,
+  );
+  assert.match(blocked.textContent, /oldest queued event from this author/);
+});

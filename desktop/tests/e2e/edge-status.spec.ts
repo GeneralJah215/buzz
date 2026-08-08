@@ -67,6 +67,40 @@ async function openGeneralChannel(page: import("@playwright/test").Page) {
   });
 }
 
+/**
+ * Records whether the edge-sync nav entry or panel was EVER attached to the
+ * document, rather than whether it is attached now.
+ *
+ * A poll-and-assert-absence check cannot see a flash: a regression to gating on
+ * `!unavailable` (which starts `false`) puts the nav entry on screen for exactly
+ * one IPC round-trip — well under 100 ms — and then removes it, and every
+ * "expect count 0" afterwards passes. `MutationObserver` queues a record for a
+ * node that is added and removed inside a single task, so the flash is caught
+ * even though no poll interval could ever have sampled it.
+ */
+async function watchForEdgeSyncFlash(page: import("@playwright/test").Page) {
+  await page.addInitScript(() => {
+    const selector =
+      '[data-testid="settings-nav-edge-sync"],[data-testid="settings-edge-sync"]';
+    const scope = window as unknown as { __edgeSyncEverInDom?: boolean };
+    scope.__edgeSyncEverInDom = false;
+    const matches = (node: Node) =>
+      node instanceof Element &&
+      (node.matches(selector) || node.querySelector(selector) !== null);
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        const touched = [...record.addedNodes, ...record.removedNodes];
+        if (touched.some(matches)) {
+          scope.__edgeSyncEverInDom = true;
+          observer.disconnect();
+          return;
+        }
+      }
+    });
+    observer.observe(document, { childList: true, subtree: true });
+  });
+}
+
 async function openSettings(page: import("@playwright/test").Page) {
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await page.getByTestId("open-settings").click();
@@ -81,6 +115,7 @@ test.describe("edge status surfaces", () => {
     const pageErrors: string[] = [];
     page.on("pageerror", (error) => pageErrors.push(error.message));
 
+    await watchForEdgeSyncFlash(page);
     await installMockBridge(page);
     await openSettings(page);
 
@@ -89,6 +124,15 @@ test.describe("edge status surfaces", () => {
     await page.waitForTimeout(1_000);
     await expect(page.getByTestId("settings-nav-edge-sync")).toHaveCount(0);
     await expect(page.getByTestId("settings-edge-sync")).toHaveCount(0);
+
+    // And it was never there for a frame either. Absence sampled once a second
+    // is not the property this test is named for; this is.
+    const everAttached = await page.evaluate(
+      () =>
+        (window as unknown as { __edgeSyncEverInDom?: boolean })
+          .__edgeSyncEverInDom === true,
+    );
+    expect(everAttached).toBe(false);
 
     // Nothing anywhere on the settings surface mentions the feature.
     const body = await page.locator("body").innerText();
@@ -148,10 +192,18 @@ test.describe("edge status surfaces", () => {
 
     // Only the current user's rows carry it. Every other identity's queue is
     // reported in Local sync settings, where there is room to say what to do.
-    const rowCount = await page.getByTestId("message-row").count();
-    const badgeCount = await badges.count();
-    expect(badgeCount).toBeGreaterThan(0);
-    expect(badgeCount).toBeLessThan(rowCount);
+    //
+    // Asserted per row, not as `badgeCount < rowCount`: the sidecar is seeded
+    // to report EVERY id as stuck, so a count comparison passes just as happily
+    // with the ownership gate inverted — badges on everyone else's rows and
+    // none on the viewer's is also "fewer badges than rows".
+    const rows = page.getByTestId("message-row");
+    // The first seed message in #general is from the active identity and the
+    // second is from alice (the same fixture `identity-archive.spec.ts` uses).
+    const mine = rows.first();
+    const alices = rows.nth(1);
+    await expect(mine.getByTestId("message-delivery-state")).toHaveCount(1);
+    await expect(alices.getByTestId("message-delivery-state")).toHaveCount(0);
   });
 
   test("a message that reached canonical history is not badged", async ({
