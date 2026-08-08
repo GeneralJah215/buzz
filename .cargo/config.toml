@@ -4,6 +4,16 @@
 # CARGO_PROFILE_DEV_DEBUG=2
 debug = "line-tables-only"
 
+# audiopus_sys builds vendored opus through CMake. In dev/test builds on
+# Windows, CMake's Debug config appends /MDd after the /MD cmake-rs passes,
+# so the opus objects want the debug CRT while the rest of the link uses the
+# release CRT -> LNK2019 __imp__CrtDbgReportW. Release settings here make
+# cmake-rs select the Release config, so the CRTs agree. We never debug into
+# opus internals, so nothing is lost.
+[profile.dev.package.audiopus_sys]
+opt-level = 3
+debug = false
+
 [env]
 # CMake 4 (pinned by hermit) removed compat with projects declaring
 # cmake_minimum_required < 3.5; audiopus_sys's vendored opus declares 3.1.
