@@ -5,6 +5,7 @@ mod archive;
 mod builderlab;
 mod commands;
 mod deep_link;
+mod edge_supervisor;
 mod egress_guard;
 mod event_sync;
 mod events;
@@ -429,6 +430,8 @@ pub fn run() {
                 });
             }
 
+            // Off-thread; inert unless BUZZ_EDGE_RELAY_URL is set. See the module.
+            crate::edge_supervisor::host::start_for_app(&app_handle);
             // Start the localhost media streaming proxy. Uses the shared HTTP
             // client so VPN tunnelling applies. The port is stored in AppState
             // and exposed to the frontend via the `get_media_proxy_port` command.
