@@ -599,6 +599,11 @@ fn name_matches_interpreter_rejects_node_prefix() {
 #[test]
 fn claude_spawn_uses_the_probed_cli_executable() {
     let _guard = crate::managed_agents::lock_path_mutex();
+    // resolve_command caches positive lookups for the process lifetime. A
+    // test that resolved the host's real `claude` earlier in the run leaves
+    // that path cached, and this test then asserts against it instead of the
+    // fake CLI below. Start cold.
+    crate::managed_agents::clear_resolve_cache();
     let temp = tempfile::tempdir().expect("temp dir");
     let cli = temp
         .path()
@@ -615,6 +620,11 @@ fn claude_spawn_uses_the_probed_cli_executable() {
 
     let mut command = std::process::Command::new("buzz-acp");
     super::configure_runtime_cli(&mut command, super::known_acp_runtime("claude-agent-acp"));
+
+    // The call above cached the fake CLI path, and the tempdir holding it is
+    // about to be deleted. Leave the cache cold so later tests never resolve
+    // `claude` to a path that no longer exists.
+    crate::managed_agents::clear_resolve_cache();
 
     if let Some(path) = original_path {
         std::env::set_var("PATH", path);
