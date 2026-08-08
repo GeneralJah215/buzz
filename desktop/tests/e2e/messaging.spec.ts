@@ -1,8 +1,28 @@
-import { expect, test, type Locator } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 import { expectCornerRadiusPx, expectSmoothCorners } from "../helpers/css";
 import { openSettings } from "../helpers/settings";
+
+/**
+ * Read the system clipboard with line endings normalized to LF.
+ *
+ * BUG-025. The Windows clipboard stores plain text as CRLF (CF_UNICODETEXT),
+ * and Chromium hands that back verbatim from `readText()`. So a copy button
+ * that writes LF reads back as CRLF on Windows and as LF on Linux/macOS --
+ * a property of the OS clipboard, not of the copied content. Asserting on the
+ * raw string made this spec pass in CI and fail for every Windows developer,
+ * which is how the whole e2e gate ended up permanently red locally.
+ *
+ * Normalizing here keeps the assertion pointed at the thing that can actually
+ * regress -- which characters, in which order, on which lines -- while
+ * dropping the one detail the platform, not the app, decides. Line *count*
+ * and content are still compared exactly.
+ */
+async function readClipboardText(page: Page): Promise<string> {
+  const text = await page.evaluate(() => navigator.clipboard.readText());
+  return text.replace(/\r\n/g, "\n");
+}
 
 async function expectThreadReplyUnobscured(row: Locator) {
   await expect
@@ -330,15 +350,26 @@ test("copy a rendered code block and paste it back as code", async ({
   await codeBlock.hover();
   await expect(copyButton).toHaveCSS("opacity", "1");
   await copyButton.click();
-  await expect
-    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
-    .toBe(code);
+  await expect.poll(() => readClipboardText(page)).toBe(code);
 
   await input.click();
   await page.keyboard.press("ControlOrMeta+V");
   await input.press("Enter");
 
   await expect(codeBlock).toHaveCount(2);
+  // Not just "a code block came back" -- the same code came back. The rendered
+  // block puts each line in its own `[data-line]` span with no newline text
+  // node, so rejoin them to recover the code. This is what would catch a stray
+  // CR (or a lost line) surviving the copy → clipboard → paste round trip.
+  await expect
+    .poll(() =>
+      codeBlock.last().evaluate((element) =>
+        Array.from(element.querySelectorAll("[data-line]"))
+          .map((line) => line.textContent ?? "")
+          .join("\n"),
+      ),
+    )
+    .toBe(code);
 });
 
 test("pasting a long copied code block scrolls composer to cursor", async ({

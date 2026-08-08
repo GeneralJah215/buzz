@@ -1,30 +1,6 @@
 import { useMemo, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import {
-  Archive,
-  BellRing,
-  Bot,
-  Check,
-  ChevronDown,
-  Cpu,
-  Download,
-  FlaskConical,
-  Keyboard,
-  LayoutTemplate,
-  MessagesSquare,
-  MonitorCog,
-  Moon,
-  ShieldAlert,
-  Smartphone,
-  Smile,
-  Sun,
-  SunMoon,
-  Ticket,
-  UserRound,
-  Waypoints,
-  Volume2,
-  type LucideIcon,
-} from "lucide-react";
+import { Check, ChevronDown, Moon, Sun, SunMoon } from "lucide-react";
 import type {
   DesktopNotificationPermissionState,
   NotificationSettings,
@@ -88,62 +64,19 @@ import { ProfileSettingsCard } from "./ProfileSettingsCard";
 import { UpdateChecker } from "../UpdateChecker";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 import { VoiceSettingsCard } from "./VoiceSettingsCard";
+import type { SettingsSection } from "./settingsNav";
 
-export type SettingsSection =
-  | "profile"
-  | "notifications"
-  | "voice"
-  | "experimental"
-  | "agents"
-  | "channel-templates"
-  | "compute"
-  | "appearance"
-  | "shortcuts"
-  | "hosted-communities"
-  | "community-members"
-  | "moderation"
-  | "custom-emoji"
-  | "local-archive"
-  | "edge-sync"
-  | "mobile"
-  | "updates";
-
-export const DEFAULT_SETTINGS_SECTION: SettingsSection = "profile";
-
-const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
-  "profile",
-  "notifications",
-  "voice",
-  "experimental",
-  "agents",
-  "channel-templates",
-  "compute",
-  "appearance",
-  "shortcuts",
-  "hosted-communities",
-  "community-members",
-  "moderation",
-  "custom-emoji",
-  "local-archive",
-  "edge-sync",
-  "mobile",
-  "updates",
-];
-
-export function isSettingsSection(value: unknown): value is SettingsSection {
-  return (
-    typeof value === "string" &&
-    (SETTINGS_SECTION_VALUES as readonly string[]).includes(value)
-  );
-}
-
-export type SettingsSectionDescriptor = {
-  value: SettingsSection;
-  label: string;
-  icon: LucideIcon;
-  /** If set, this section is only visible when the feature is enabled */
-  featureGate?: string;
-};
+// The section registry and the nav groups that expose it live together in
+// `settingsNav.ts`, JSX-free, so a unit test can assert every registered
+// section is reachable from some group (BUG-024). Re-exported here because
+// this module has always been their public entrypoint.
+export {
+  DEFAULT_SETTINGS_SECTION,
+  isSettingsSection,
+  settingsSections,
+  type SettingsSection,
+  type SettingsSectionDescriptor,
+} from "./settingsNav";
 
 export type SettingsPanelProps = {
   currentPubkey?: string;
@@ -159,101 +92,6 @@ export type SettingsPanelProps = {
   onSetAllSlotAlertsEnabled: (enabled: boolean) => void;
   onSetSoundForSlot: (slot: SoundSlot, name: SoundName) => void;
 };
-
-export const settingsSections: SettingsSectionDescriptor[] = [
-  {
-    value: "appearance",
-    label: "Appearance",
-    icon: MonitorCog,
-  },
-  {
-    value: "profile",
-    label: "Profile",
-    icon: UserRound,
-  },
-  {
-    value: "notifications",
-    label: "Notifications",
-    icon: BellRing,
-  },
-  {
-    value: "voice",
-    label: "Voice",
-    icon: Volume2,
-  },
-  {
-    value: "experimental",
-    label: "Experiments",
-    icon: FlaskConical,
-  },
-  {
-    value: "agents",
-    label: "Agents",
-    icon: Bot,
-    featureGate: "managed-agents",
-  },
-  {
-    value: "channel-templates",
-    label: "Channel templates",
-    icon: LayoutTemplate,
-    featureGate: "channel-templates",
-  },
-  {
-    value: "compute",
-    label: "Compute",
-    icon: Cpu,
-  },
-  {
-    value: "shortcuts",
-    label: "Shortcuts",
-    icon: Keyboard,
-  },
-  {
-    value: "hosted-communities",
-    label: "Hosted communities",
-    icon: MessagesSquare,
-  },
-  {
-    value: "community-members",
-    label: "Invites",
-    icon: Ticket,
-  },
-  {
-    value: "moderation",
-    label: "Moderation",
-    icon: ShieldAlert,
-  },
-  {
-    value: "custom-emoji",
-    label: "Custom emoji",
-    icon: Smile,
-    featureGate: "custom-emoji",
-  },
-  {
-    value: "local-archive",
-    label: "Local archive",
-    icon: Archive,
-  },
-  {
-    // Hidden unless a local edge sidecar actually answers. See
-    // `isEdgeSyncSectionVisible` and the runtime filter in `SettingsView`:
-    // the feature is off by default, and a user who has never heard of it
-    // must not find a nav entry advertising it.
-    value: "edge-sync",
-    label: "Local sync",
-    icon: Waypoints,
-  },
-  {
-    value: "mobile",
-    label: "Mobile",
-    icon: Smartphone,
-  },
-  {
-    value: "updates",
-    label: "Updates",
-    icon: Download,
-  },
-];
 
 function formatThemeLabel(name: string): string {
   return name

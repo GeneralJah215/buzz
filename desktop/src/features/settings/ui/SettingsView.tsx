@@ -33,11 +33,14 @@ import {
 import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
 import {
   renderSettingsSection,
-  settingsSections,
   type SettingsPanelProps,
+} from "./SettingsPanels";
+import {
+  settingsNavGroups,
+  settingsSections,
   type SettingsSection,
   type SettingsSectionDescriptor,
-} from "./SettingsPanels";
+} from "./settingsNav";
 
 export {
   DEFAULT_SETTINGS_SECTION,
@@ -49,40 +52,6 @@ type SettingsViewProps = SettingsPanelProps & {
   onSectionChange: (section: SettingsSection) => void;
   section: SettingsSection;
 };
-
-const settingsNavGroups: Array<{
-  label: string;
-  sections: SettingsSection[];
-}> = [
-  {
-    label: "Personal",
-    sections: [
-      "profile",
-      "appearance",
-      "notifications",
-      "voice",
-      "shortcuts",
-      "custom-emoji",
-      "local-archive",
-      "channel-templates",
-    ],
-  },
-  {
-    label: "Communities",
-    sections: ["hosted-communities", "community-members"],
-  },
-  {
-    label: "App",
-    sections: [
-      "agents",
-      "compute",
-      "experimental",
-      "edge-sync",
-      "mobile",
-      "updates",
-    ],
-  },
-];
 
 function SettingsSectionButton({
   active,
@@ -157,7 +126,13 @@ export function SettingsView({
       }
       // Invites and member management require a discovered owner/admin role.
       // Open relays have no membership snapshot or invite controls.
-      if (s.value === "community-members") {
+      //
+      // The moderation queue carries the same requirement for the same reason:
+      // the relay 403s `/moderation/*` for anyone below admin, and
+      // `ModerationQueueCard` already refuses to fetch in that case. Gating the
+      // nav entry too keeps a plain member from finding a row that can only
+      // ever tell them no.
+      if (s.value === "community-members" || s.value === "moderation") {
         return canManageCommunityMembers(myMembershipQuery.data);
       }
       // The edge sidecar is optional and off by default. Absent one, this
