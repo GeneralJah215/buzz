@@ -436,6 +436,64 @@ async fn run_restart_agent_deep_link(app: tauri::AppHandle, request: RestartAgen
     }
 }
 
+/// A validated `buzz://delete-agent?…` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeleteAgentRequest {
+    /// Lower-cased 64-hex agent pubkey.
+    pubkey: String,
+    /// Presented control token. Never logged.
+    token: String,
+}
+
+/// Parse `buzz://delete-agent?pubkey=<64 hex>&token=<token>`.
+///
+/// Same strict pubkey shape as `parse_restart_agent_deep_link`, and narrower
+/// on purpose: deletion is irreversible (the agent's secret is discarded on
+/// delete), so there is no bulk form and no optional parameters — one link
+/// deletes exactly one pubkey.
+///
+/// Pure so it can be unit-tested without a live `tauri::AppHandle`.
+fn parse_delete_agent_deep_link(url: &Url) -> Result<DeleteAgentRequest, String> {
+    let pubkey = non_empty_param(url, "pubkey")?.to_ascii_lowercase();
+    if pubkey.len() != 64 || !pubkey.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("pubkey must be 64 hexadecimal characters".into());
+    }
+    let token = non_empty_param(url, "token")?;
+    Ok(DeleteAgentRequest { pubkey, token })
+}
+
+/// Carry out an authenticated `delete-agent` request.
+///
+/// Delegates to the same `delete_managed_agent` command the UI's delete
+/// button invokes, so every side effect stays on one path: stop the live
+/// process, remove the record, discard the keyring secret, publish the
+/// NIP-09 tombstone, and file the NIP-IA archive request.
+///
+/// `force_remote_delete` is deliberately `None`: a deployed remote agent is
+/// refused by the backend guard rather than orphaned. Only the UI's
+/// interactive confirm may override that — a fire-and-forget link may not.
+async fn run_delete_agent_deep_link(app: tauri::AppHandle, request: DeleteAgentRequest) {
+    let prefix: String = request.pubkey.chars().take(8).collect();
+    tracing::info!(
+        event = "delete_agent_task_entered",
+        agent = %prefix,
+        "delete task started"
+    );
+    match crate::commands::delete_managed_agent(request.pubkey.clone(), None, app).await {
+        Ok(()) => tracing::info!(
+            event = "delete_agent_deleted",
+            agent = %prefix,
+            "agent deleted from delete deep link"
+        ),
+        Err(error) => tracing::error!(
+            event = "delete_agent_failed",
+            agent = %prefix,
+            error = %error,
+            "agent delete failed"
+        ),
+    }
+}
+
 /// Handle an incoming `buzz://` deep link URL.
 ///
 /// Currently supports:
@@ -571,6 +629,44 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
             let restart_app = app.clone();
             tauri::async_runtime::spawn(run_restart_agent_deep_link(restart_app, request));
         }
+        Some("delete-agent") => {
+            // `buzz://delete-agent?pubkey=<64 hex>&token=<control token>`
+            //
+            // Machine-to-machine like `restart-agent` above, with the same
+            // no-window, no-focus contract and the same authentication: the
+            // local control-token file, checked before any work is scheduled.
+            // A bad token gets a log line and nothing else, and the presented
+            // token is never logged.
+            //
+            // Unlike a restart this is irreversible — the agent's secret is
+            // discarded and the pubkey can never sign again — so the arm stays
+            // deliberately narrow: exactly one pubkey per link, no relay
+            // scoping, no force flags.
+            let request = match parse_delete_agent_deep_link(&url) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!(
+                        event = "delete_agent_rejected",
+                        error = %error,
+                        "rejecting malformed delete-agent deep link"
+                    );
+                    return;
+                }
+            };
+            if !crate::managed_agents::control_token::verify_control_token(app, &request.token) {
+                let prefix: String = request.pubkey.chars().take(8).collect();
+                tracing::warn!(
+                    event = "delete_agent_unauthenticated",
+                    agent = %prefix,
+                    "rejecting delete-agent deep link with invalid control token"
+                );
+                return;
+            }
+            // Deletion blocks on process teardown, disk writes, and the
+            // keyring; hand it off the main thread and return.
+            let delete_app = app.clone();
+            tauri::async_runtime::spawn(run_delete_agent_deep_link(delete_app, request));
+        }
         Some(action) => {
             eprintln!("buzz-desktop: unknown deep link action: {action}");
         }
@@ -585,9 +681,9 @@ mod tests {
     use url::Url;
 
     use super::{
-        parse_add_community_deep_link, parse_join_deep_link, parse_message_deep_link,
-        parse_nostr_bind_deep_link, parse_restart_agent_deep_link, PendingCommunityDeepLink,
-        PendingCommunityDeepLinks,
+        parse_add_community_deep_link, parse_delete_agent_deep_link, parse_join_deep_link,
+        parse_message_deep_link, parse_nostr_bind_deep_link, parse_restart_agent_deep_link,
+        PendingCommunityDeepLink, PendingCommunityDeepLinks,
     };
 
     const AGENT_PUBKEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1004,6 +1100,72 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(parse_restart_agent_deep_link(&url).unwrap().relay_url, None);
+    }
+
+    #[test]
+    fn parse_delete_agent_deep_link_extracts_pubkey_and_token() {
+        let url = Url::parse(&format!(
+            "buzz://delete-agent?pubkey={AGENT_PUBKEY}&token=s3cret"
+        ))
+        .unwrap();
+        let request = parse_delete_agent_deep_link(&url).unwrap();
+        assert_eq!(request.pubkey, AGENT_PUBKEY);
+        assert_eq!(request.token, "s3cret");
+    }
+
+    #[test]
+    fn parse_delete_agent_deep_link_normalizes_an_uppercase_pubkey() {
+        let url = Url::parse(&format!(
+            "buzz://delete-agent?pubkey={}&token=s3cret",
+            AGENT_PUBKEY.to_ascii_uppercase()
+        ))
+        .unwrap();
+        let request = parse_delete_agent_deep_link(&url).unwrap();
+        assert_eq!(request.pubkey, AGENT_PUBKEY);
+    }
+
+    #[test]
+    fn parse_delete_agent_deep_link_rejects_a_missing_or_empty_pubkey() {
+        for raw in [
+            "buzz://delete-agent?token=s3cret".to_owned(),
+            "buzz://delete-agent?pubkey=&token=s3cret".to_owned(),
+        ] {
+            assert_eq!(
+                parse_delete_agent_deep_link(&Url::parse(&raw).unwrap()).unwrap_err(),
+                "missing pubkey"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_delete_agent_deep_link_rejects_a_malformed_pubkey() {
+        for pubkey in [
+            "notahexstring",
+            &AGENT_PUBKEY[..63],
+            &format!("{AGENT_PUBKEY}0"),
+            &format!("{}zz", &AGENT_PUBKEY[..62]),
+        ] {
+            let url =
+                Url::parse(&format!("buzz://delete-agent?pubkey={pubkey}&token=s3cret")).unwrap();
+            assert_eq!(
+                parse_delete_agent_deep_link(&url).unwrap_err(),
+                "pubkey must be 64 hexadecimal characters",
+                "{pubkey}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_delete_agent_deep_link_rejects_a_missing_or_empty_token() {
+        for raw in [
+            format!("buzz://delete-agent?pubkey={AGENT_PUBKEY}"),
+            format!("buzz://delete-agent?pubkey={AGENT_PUBKEY}&token="),
+        ] {
+            assert_eq!(
+                parse_delete_agent_deep_link(&Url::parse(&raw).unwrap()).unwrap_err(),
+                "missing token"
+            );
+        }
     }
 
     #[test]
