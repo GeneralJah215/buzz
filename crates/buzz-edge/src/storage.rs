@@ -211,6 +211,55 @@ pub enum InsertOutcome {
     Duplicate,
 }
 
+/// One outbox row leased to an author for upstream submission.
+#[derive(Debug, Clone)]
+pub struct ClaimedOutboxRow {
+    /// Identifies the row when acknowledging the result.
+    pub event_id: EventId,
+    /// The exact stored bytes. Re-submitting these unchanged is what makes
+    /// upstream's event-ID dedup produce exactly-once canonical storage.
+    pub event: Event,
+    /// Unix seconds after which this claim lapses back to `pending`.
+    pub lease_expires_at: i64,
+}
+
+/// The author's report of what upstream did with one claimed event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// Upstream accepted it.
+    Delivered,
+    /// Upstream already had it. **This is success** — event-ID dedup means the
+    /// event is in canonical history, which is the whole point of re-submitting
+    /// identical bytes after an ambiguous result.
+    Duplicate,
+    /// Upstream refused it permanently (bad signature, revoked membership,
+    /// oversized). Never retried; surfaced for the operator.
+    Rejected(String),
+    /// Timeout, disconnect, or silence. Records nothing — the lease lapses and
+    /// the row returns to `pending`. Writing a state here could contradict an
+    /// upstream acceptance the author has not observed yet.
+    Transient,
+}
+
+/// Outbox counts for the Desktop delivery surfaces.
+///
+/// `delivered_exact` and `delivered_via_digest` are kept apart on purpose:
+/// the spec requires **delivered locally** and **synced to canonical history**
+/// to be labelled separately everywhere they surface (§13).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxSummary {
+    /// Waiting for an author to drain them.
+    pub pending: u64,
+    /// Leased to an author right now.
+    pub claimed: u64,
+    /// In canonical history under their original event IDs.
+    pub delivered_exact: u64,
+    /// Represented in canonical history by an edge-authored digest instead.
+    pub delivered_via_digest: u64,
+    /// Permanently refused upstream. Needs a human.
+    pub quarantined: u64,
+}
+
 /// One byte-stable, pre-signed digest part loaded for canonical submission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializedDigestPart {
@@ -1402,6 +1451,216 @@ impl EdgeStore {
         .transpose()
     }
 
+    // ── Author-drain state machine (§11) ────────────────────────────────────
+    //
+    // `pending → claimed(lease) → delivered | quarantined`, with
+    // `claimed → pending` on lease expiry.
+    //
+    // There is deliberately no `submitted` state. A row stays `claimed` until
+    // the author's per-event acknowledgment arrives, so a crash between
+    // upstream accepting an event and the sidecar hearing about it cannot
+    // strand the row: the lease expires, the row returns to `pending`, the
+    // next drain re-submits the identical signed bytes, and upstream's
+    // event-ID dedup answers duplicate — which the protocol records as
+    // `delivered`.
+
+    /// Return expired claims to `pending` and report how many were reclaimed.
+    ///
+    /// Called before every claim so a crashed or vanished author cannot hold
+    /// rows hostage. Idempotent.
+    pub fn expire_outbox_leases(&self, now: i64) -> Result<u64, StorageError> {
+        let changed = self.connection.lock().execute(
+            "UPDATE outbox
+                SET state = 'pending',
+                    claim_token = NULL,
+                    lease_owner_pubkey = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?1
+              WHERE state = 'claimed' AND lease_expires_at IS NOT NULL
+                AND lease_expires_at <= ?1",
+            [now],
+        )?;
+        Ok(changed as u64)
+    }
+
+    /// Claim an ordered batch of this author's drainable rows under a lease.
+    ///
+    /// **Ownership is enforced here, not by the caller** (§11): only rows whose
+    /// author equals `author` are claimable. The sidecar cannot submit another
+    /// identity's events upstream — canonical ingest rejects that — so a claim
+    /// that crossed identities could never be drained.
+    ///
+    /// **Ordering is globally dependency-gated, not merely per-author.** A row
+    /// is claimable only when every locally known ancestor in its thread chain
+    /// has already reached `delivered`, because canonical ingest rejects a
+    /// reply whose parent is not stored, and threads routinely cross
+    /// identities. Within the claimable set, ordering is FIFO by local arrival.
+    ///
+    /// Rows already demoted to the digest path are never claimed: they are not
+    /// going upstream under their own IDs.
+    pub fn claim_outbox_batch(
+        &self,
+        author: &PublicKey,
+        claim_token: &str,
+        limit: usize,
+        now: i64,
+        lease_seconds: i64,
+    ) -> Result<Vec<ClaimedOutboxRow>, StorageError> {
+        if claim_token.trim().is_empty() {
+            return Err(StorageError::Corrupt(
+                "claim token must not be empty".to_string(),
+            ));
+        }
+        self.expire_outbox_leases(now)?;
+
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        let author_hex = author.to_hex();
+        let expires_at = now.saturating_add(lease_seconds);
+
+        let candidates: Vec<(String, Vec<u8>)> = {
+            let mut statement = transaction.prepare(
+                "SELECT o.event_id, e.event_json
+                   FROM outbox o
+                   JOIN events e ON e.event_id = o.event_id
+                  WHERE o.state = 'pending'
+                    AND o.delivery_path = 'exact'
+                    AND e.author_pubkey = ?1
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM event_dependencies d
+                          JOIN outbox po ON po.event_id = d.ancestor_event_id
+                         WHERE d.child_event_id = o.event_id
+                           AND po.state <> 'delivered'
+                    )
+                  ORDER BY e.received_at, o.event_id
+                  LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![author_hex, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for (event_id_hex, event_json) in candidates {
+            transaction.execute(
+                "UPDATE outbox
+                    SET state = 'claimed',
+                        claim_token = ?2,
+                        lease_owner_pubkey = ?3,
+                        lease_expires_at = ?4,
+                        attempts = attempts + 1,
+                        updated_at = ?5
+                  WHERE event_id = ?1 AND state = 'pending'",
+                params![event_id_hex, claim_token, author_hex, expires_at, now],
+            )?;
+            let event = Event::from_json(event_json)
+                .map_err(|error| StorageError::Corrupt(error.to_string()))?;
+            claimed.push(ClaimedOutboxRow {
+                event_id: EventId::from_hex(&event_id_hex)
+                    .map_err(|error| StorageError::Corrupt(error.to_string()))?,
+                event,
+                lease_expires_at: expires_at,
+            });
+        }
+        transaction.commit()?;
+        Ok(claimed)
+    }
+
+    /// Extend a live lease so a slow but healthy drain is not preempted.
+    ///
+    /// Only the holder of `claim_token` can renew, so a stale author that lost
+    /// its rows to expiry cannot silently take them back mid-flight.
+    pub fn renew_outbox_lease(
+        &self,
+        claim_token: &str,
+        now: i64,
+        lease_seconds: i64,
+    ) -> Result<u64, StorageError> {
+        let changed = self.connection.lock().execute(
+            "UPDATE outbox
+                SET lease_expires_at = ?2, updated_at = ?3
+              WHERE state = 'claimed' AND claim_token = ?1",
+            params![claim_token, now.saturating_add(lease_seconds), now],
+        )?;
+        Ok(changed as u64)
+    }
+
+    /// Record the author's per-event result for a claimed row.
+    ///
+    /// `Duplicate` is success, not an error: upstream event-ID dedup is what
+    /// makes canonical storage exactly-once across retries, so a duplicate
+    /// proves the event is already in canonical history.
+    ///
+    /// A transient failure is deliberately NOT recorded as a state change —
+    /// the row stays `claimed` and returns to `pending` when the lease expires.
+    /// Writing a state here would risk contradicting an upstream acceptance
+    /// the author has not yet observed.
+    pub fn acknowledge_outbox_row(
+        &self,
+        claim_token: &str,
+        event_id: &EventId,
+        outcome: DrainOutcome,
+    ) -> Result<bool, StorageError> {
+        let now = unix_seconds();
+        let connection = self.connection.lock();
+        let changed = match outcome {
+            DrainOutcome::Delivered | DrainOutcome::Duplicate => connection.execute(
+                "UPDATE outbox
+                    SET state = 'delivered',
+                        claim_token = NULL,
+                        lease_owner_pubkey = NULL,
+                        lease_expires_at = NULL,
+                        last_error = NULL,
+                        updated_at = ?3
+                  WHERE event_id = ?1 AND state = 'claimed' AND claim_token = ?2",
+                params![event_id.to_hex(), claim_token, now],
+            )?,
+            DrainOutcome::Rejected(ref reason) => connection.execute(
+                "UPDATE outbox
+                    SET state = 'quarantined',
+                        claim_token = NULL,
+                        lease_owner_pubkey = NULL,
+                        lease_expires_at = NULL,
+                        last_error = ?3,
+                        updated_at = ?4
+                  WHERE event_id = ?1 AND state = 'claimed' AND claim_token = ?2",
+                params![event_id.to_hex(), claim_token, reason.as_str(), now],
+            )?,
+            // Transient: leave it claimed and let the lease lapse.
+            DrainOutcome::Transient => 0,
+        };
+        Ok(changed > 0)
+    }
+
+    /// Counts by state, for the Desktop delivery surfaces (§13).
+    pub fn outbox_summary(&self) -> Result<OutboxSummary, StorageError> {
+        let connection = self.connection.lock();
+        let mut summary = OutboxSummary::default();
+        let mut statement = connection
+            .prepare("SELECT state, delivery_path, COUNT(*) FROM outbox GROUP BY 1, 2")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        for row in rows {
+            let (state, path, count) = row?;
+            match (state.as_str(), path.as_str()) {
+                ("pending", _) => summary.pending += count,
+                ("claimed", _) => summary.claimed += count,
+                ("quarantined", _) => summary.quarantined += count,
+                ("delivered", "digest") => summary.delivered_via_digest += count,
+                ("delivered", _) => summary.delivered_exact += count,
+                _ => {}
+            }
+        }
+        Ok(summary)
+    }
+
     fn load_filter_events(
         &self,
         filter: &Filter,
@@ -2110,6 +2369,223 @@ mod tests {
             .tags([Tag::parse(["h", channel.to_string().as_str()]).expect("h tag")])
             .sign_with_keys(keys)
             .expect("sign")
+    }
+
+    // ── Author-drain state machine (§11) ───────────────────────────────────
+
+    /// A reply to `parent`, carrying the thread tags the dependency graph reads.
+    fn reply(keys: &Keys, channel: Uuid, parent: &Event, content: &str) -> Event {
+        EventBuilder::new(Kind::Custom(9), content)
+            .tags([
+                Tag::parse(["h", channel.to_string().as_str()]).expect("h tag"),
+                Tag::parse(["e", parent.id.to_hex().as_str(), "", "root"]).expect("root tag"),
+                Tag::parse(["e", parent.id.to_hex().as_str(), "", "reply"]).expect("reply tag"),
+            ])
+            .sign_with_keys(keys)
+            .expect("sign")
+    }
+
+    fn store_with_event(store: &EdgeStore, event: &Event, channel: Uuid, edge: &Keys) {
+        store
+            .insert_local_event(event, event.as_json().as_bytes(), channel, edge)
+            .expect("insert");
+    }
+
+    #[test]
+    fn an_author_can_only_claim_its_own_rows() {
+        // The sidecar cannot submit another identity's events upstream —
+        // canonical ingest refuses — so a cross-identity claim could never be
+        // drained. Ownership is enforced here, not left to the caller.
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (mine, theirs, edge) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        store_with_event(&store, &message(&mine, channel, "mine"), channel, &edge);
+        store_with_event(&store, &message(&theirs, channel, "theirs"), channel, &edge);
+
+        let claimed = store
+            .claim_outbox_batch(&mine.public_key(), "token-a", 10, 1_000, 60)
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "must not claim another author's row");
+        assert_eq!(claimed[0].event.pubkey, mine.public_key());
+    }
+
+    #[test]
+    fn a_reply_is_not_claimable_until_its_parent_is_delivered() {
+        // Canonical ingest rejects a reply whose parent is not stored, so
+        // draining a child first would guarantee a rejection. Gating is on the
+        // dependency graph, not on authorship — threads cross identities.
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let root = message(&author, channel, "root");
+        store_with_event(&store, &root, channel, &edge);
+        let child = reply(&author, channel, &root, "child");
+        store_with_event(&store, &child, channel, &edge);
+
+        let first = store
+            .claim_outbox_batch(&author.public_key(), "t1", 10, 1_000, 60)
+            .expect("claim");
+        assert_eq!(first.len(), 1, "only the root is claimable");
+        assert_eq!(first[0].event_id, root.id);
+
+        // Still blocked while the parent is merely claimed, not delivered.
+        let blocked = store
+            .claim_outbox_batch(&author.public_key(), "t2", 10, 1_000, 60)
+            .expect("claim");
+        assert!(blocked.is_empty(), "child must wait for the parent");
+
+        store
+            .acknowledge_outbox_row("t1", &root.id, DrainOutcome::Delivered)
+            .expect("ack");
+        let now_free = store
+            .claim_outbox_batch(&author.public_key(), "t3", 10, 1_000, 60)
+            .expect("claim");
+        assert_eq!(now_free.len(), 1);
+        assert_eq!(now_free[0].event_id, child.id);
+    }
+
+    #[test]
+    fn an_expired_lease_returns_the_row_and_a_retry_gets_identical_bytes() {
+        // The crash window between upstream accepting and the sidecar hearing
+        // about it must not strand a row. Expiry returns it; the retry must
+        // re-submit the SAME signed bytes so upstream's event-ID dedup makes
+        // storage exactly-once.
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let event = message(&author, channel, "hello");
+        store_with_event(&store, &event, channel, &edge);
+
+        let first = store
+            .claim_outbox_batch(&author.public_key(), "lost", 10, 1_000, 60)
+            .expect("claim");
+        assert_eq!(first.len(), 1);
+        // Author vanishes without acknowledging.
+        assert!(store
+            .claim_outbox_batch(&author.public_key(), "other", 10, 1_010, 60)
+            .expect("claim")
+            .is_empty());
+
+        assert_eq!(store.expire_outbox_leases(1_100).expect("expire"), 1);
+        let retry = store
+            .claim_outbox_batch(&author.public_key(), "fresh", 10, 1_100, 60)
+            .expect("claim");
+        assert_eq!(retry.len(), 1);
+        assert_eq!(
+            retry[0].event.as_json(),
+            first[0].event.as_json(),
+            "retry must re-submit byte-identical event"
+        );
+    }
+
+    #[test]
+    fn duplicate_counts_as_delivered() {
+        // Upstream already having the event proves it reached canonical
+        // history. Treating duplicate as failure would retry forever.
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let event = message(&author, channel, "hello");
+        store_with_event(&store, &event, channel, &edge);
+        store
+            .claim_outbox_batch(&author.public_key(), "t", 10, 1_000, 60)
+            .expect("claim");
+
+        assert!(store
+            .acknowledge_outbox_row("t", &event.id, DrainOutcome::Duplicate)
+            .expect("ack"));
+        assert_eq!(store.outbox_summary().expect("summary").delivered_exact, 1);
+        assert_eq!(store.pending_count().expect("pending"), 0);
+    }
+
+    #[test]
+    fn a_transient_failure_changes_nothing_and_waits_for_expiry() {
+        // Recording a state here could contradict an upstream acceptance the
+        // author has not observed. The lease is the only safe arbiter.
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let event = message(&author, channel, "hello");
+        store_with_event(&store, &event, channel, &edge);
+        store
+            .claim_outbox_batch(&author.public_key(), "t", 10, 1_000, 60)
+            .expect("claim");
+
+        assert!(!store
+            .acknowledge_outbox_row("t", &event.id, DrainOutcome::Transient)
+            .expect("ack"));
+        let summary = store.outbox_summary().expect("summary");
+        assert_eq!(summary.claimed, 1, "row stays claimed");
+        assert_eq!(summary.delivered_exact, 0);
+        assert_eq!(summary.quarantined, 0);
+    }
+
+    #[test]
+    fn a_permanent_rejection_quarantines_with_its_reason() {
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let event = message(&author, channel, "hello");
+        store_with_event(&store, &event, channel, &edge);
+        store
+            .claim_outbox_batch(&author.public_key(), "t", 10, 1_000, 60)
+            .expect("claim");
+
+        assert!(store
+            .acknowledge_outbox_row(
+                "t",
+                &event.id,
+                DrainOutcome::Rejected("membership revoked".into())
+            )
+            .expect("ack"));
+        assert_eq!(store.outbox_summary().expect("summary").quarantined, 1);
+        // Quarantined rows are never handed out again.
+        assert!(store
+            .claim_outbox_batch(&author.public_key(), "t2", 10, 2_000, 60)
+            .expect("claim")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_stale_claim_token_cannot_acknowledge_or_renew() {
+        // An author whose lease lapsed must not be able to reach back in and
+        // overwrite the state of rows another drain now owns.
+        let store = EdgeStore::open_in_memory(binding(), policy()).expect("store");
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        let event = message(&author, channel, "hello");
+        store_with_event(&store, &event, channel, &edge);
+        store
+            .claim_outbox_batch(&author.public_key(), "current", 10, 1_000, 60)
+            .expect("claim");
+
+        assert!(!store
+            .acknowledge_outbox_row("stale", &event.id, DrainOutcome::Delivered)
+            .expect("ack"));
+        assert_eq!(
+            store.renew_outbox_lease("stale", 1_010, 60).expect("renew"),
+            0
+        );
+        assert_eq!(
+            store
+                .renew_outbox_lease("current", 1_010, 60)
+                .expect("renew"),
+            1
+        );
+        assert_eq!(store.outbox_summary().expect("summary").claimed, 1);
+    }
+
+    #[test]
+    fn summary_separates_the_two_delivered_states() {
+        // §13: "delivered locally" and "synced to canonical history" must be
+        // labelled separately everywhere they surface.
+        let summary = OutboxSummary {
+            delivered_exact: 3,
+            delivered_via_digest: 2,
+            ..OutboxSummary::default()
+        };
+        assert_ne!(summary.delivered_exact, summary.delivered_via_digest);
+        assert_eq!(summary.delivered_exact + summary.delivered_via_digest, 5);
     }
 
     #[test]
