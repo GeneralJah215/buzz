@@ -54,7 +54,7 @@ pub fn relay_api_base_url_with_override(state: &AppState) -> String {
     }
 }
 
-mod edge;
+pub(crate) mod edge;
 pub use edge::{apply_agent_env, edge_relay_binding, set_active_community, EdgeRelayBinding};
 
 /// Selects the relay a managed agent should use for a relay operation.

@@ -212,6 +212,78 @@ async fn query_edge_relay(
     parse_json_response(response).await
 }
 
+/// The exact error the status calls return when no sidecar is reachable.
+///
+/// The frontend keys off this string to stay silent instead of showing an
+/// error banner. Edge routing is optional and off by default, so "not running"
+/// is the normal state for most installs, not a fault worth reporting.
+pub const EDGE_UNAVAILABLE: &str = "edge sidecar not running";
+
+/// Read the operator-facing sync status from the sidecar.
+///
+/// Returns metadata only — counts, identifiers, failure reasons. The sidecar
+/// deliberately does not include message content in this payload, and neither
+/// should anything built on it.
+pub async fn fetch_edge_status(
+    state: &AppState,
+    limit: usize,
+) -> Result<serde_json::Value, String> {
+    edge_post(state, "/status", serde_json::json!({ "limit": limit })).await
+}
+
+/// Ask the sidecar to move one quarantined event back to `pending`.
+///
+/// Which rows this can touch is decided by the NIP-98 identity on the request,
+/// not by the body, so this can only ever retry the operator's own event.
+pub async fn requeue_edge_event(
+    state: &AppState,
+    event_id: &str,
+) -> Result<serde_json::Value, String> {
+    edge_post(state, "/requeue", serde_json::json!({ "event_id": event_id })).await
+}
+
+/// Look up the delivery state of specific events for the message list.
+pub async fn fetch_edge_delivery_states(
+    state: &AppState,
+    event_ids: &[String],
+) -> Result<serde_json::Value, String> {
+    edge_post(
+        state,
+        "/delivery-states",
+        serde_json::json!({ "event_ids": event_ids }),
+    )
+    .await
+}
+
+/// Shared POST path for the status routes.
+///
+/// Unlike `try_query`/`try_submit`, a failure here is surfaced rather than
+/// swallowed: there is no canonical fallback for sidecar status, and silently
+/// returning empty state would tell the operator "nothing is stuck" when the
+/// truth is "nobody asked".
+async fn edge_post(
+    state: &AppState,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let binding = edge_relay_binding(state).ok_or_else(|| EDGE_UNAVAILABLE.to_string())?;
+    let url = format!("{}{path}", binding.http_url);
+    let body = serde_json::to_vec(&body)
+        .map_err(|error| format!("edge request serialization failed: {error}"))?;
+    let auth = build_nip98_auth_header(&Method::POST, &url, &body, state)?;
+    let response = with_binding_headers(state.http_client.post(&url), &binding)
+        .header("Authorization", auth)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| EDGE_UNAVAILABLE.to_string())?;
+    if !response.status().is_success() {
+        return Err(relay_error_message(response).await);
+    }
+    parse_json_response(response).await
+}
+
 /// Hand the edge route down to a managed agent, but only when the agent is
 /// pointed at the same canonical relay this binding was derived from. An agent
 /// on another relay must never inherit this community's sidecar.

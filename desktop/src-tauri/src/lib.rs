@@ -913,6 +913,11 @@ pub fn run() {
             tray_menu::take_tray_actions,
             #[cfg(target_os = "macos")]
             tray_menu::update_tray_agent_activity,
+            edge_delivery_summary,
+            edge_quarantined_events,
+            edge_waiting_authors,
+            edge_event_delivery_states,
+            edge_requeue_quarantined,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

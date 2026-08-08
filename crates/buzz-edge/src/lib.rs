@@ -35,9 +35,12 @@ use uuid::Uuid;
 use protocol::{
     auth_challenge, auth_tag_json, binding_result, bounded_filters, closed, count, drain_batch,
     eose, event_channel, event_message, filter_channels, notice, ok, parse_client_message,
-    ClientMessage,
+    requeue_reply, status_payload, status_reply, ClientMessage, MAX_STATUS_PAGE,
 };
-use storage::{CommunityBinding, DrainOutcome, EdgeStore, InsertOutcome, StorageError};
+use storage::{
+    CommunityBinding, DrainOutcome, EdgeStore, InsertOutcome, OutboxSummary, QuarantinedRow,
+    StorageError, WaitingAuthor,
+};
 
 /// Lease granted by a drain claim. Long enough to submit a batch upstream,
 /// short enough that a vanished author's rows return promptly.
@@ -774,6 +777,9 @@ pub async fn run_server(listener: TcpListener, relay: EdgeRelay) -> Result<(), E
         .route("/events", post(http_submit_event))
         .route("/query", post(http_query))
         .route("/count", post(http_count))
+        .route("/status", post(http_status))
+        .route("/requeue", post(http_requeue))
+        .route("/delivery-states", post(http_delivery_states))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_MESSAGE_BYTES))
         .with_state(relay);
     axum::serve(listener, app).await?;
@@ -1133,6 +1139,30 @@ async fn handle_websocket(relay: EdgeRelay, socket: WebSocket, _permit: OwnedSem
                                 .await;
                         }
                     }
+                    ClientMessage::Status { req_id, limit } => {
+                        let frame = match collect_status(&relay.state.store, limit, now_seconds()) {
+                            Ok((summary, quarantined, waiting)) => {
+                                status_reply(&req_id, &summary, &quarantined, &waiting)
+                            }
+                            Err(error) => notice(&format!("error: status failed: {error}")),
+                        };
+                        let _ = outbound.send(Message::Text(frame.into())).await;
+                    }
+                    ClientMessage::Requeue { req_id, event_id } => {
+                        // `principal` — not the request — decides whose row
+                        // this is, exactly as it does for `Drain`. The storage
+                        // layer filters on author, so a client cannot retry
+                        // someone else's quarantined event.
+                        let frame = match relay.state.store.requeue_quarantined(
+                            &event_id,
+                            &principal,
+                            now_seconds(),
+                        ) {
+                            Ok(requeued) => requeue_reply(&req_id, requeued),
+                            Err(error) => notice(&format!("error: requeue failed: {error}")),
+                        };
+                        let _ = outbound.send(Message::Text(frame.into())).await;
+                    }
                     ClientMessage::Auth(_) | ClientMessage::Handshake { .. } => {}
                 }
             }
@@ -1221,6 +1251,138 @@ async fn http_count(State(relay): State<EdgeRelay>, headers: HeaderMap, body: By
         .await
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "local count failed"))?;
     Ok(Json(serde_json::json!({"count": value})))
+}
+
+/// Seconds since the epoch, saturating to 0 on a clock before 1970.
+///
+/// Lease and quarantine arithmetic is all in Unix seconds; a system clock the
+/// standard library refuses to subtract must not panic the sidecar.
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Gather the three operator-facing status reads in one place so the
+/// WebSocket and HTTP surfaces can never drift apart.
+fn collect_status(
+    store: &EdgeStore,
+    limit: usize,
+    now: i64,
+) -> Result<(OutboxSummary, Vec<QuarantinedRow>, Vec<WaitingAuthor>), StorageError> {
+    Ok((
+        store.outbox_summary()?,
+        store.quarantined_rows(limit)?,
+        store.waiting_authors(now)?,
+    ))
+}
+
+/// Operator-facing sync status for the bound community.
+///
+/// Authenticated like every other route, but deliberately not filtered to the
+/// calling principal: the Desktop operator must be able to see that an agent's
+/// events are stuck. The payload carries identifiers, counts, and failure
+/// reasons only — never message content — so this stays a status surface and
+/// not a way to read another identity's messages.
+async fn http_status(State(relay): State<EdgeRelay>, headers: HeaderMap, body: Bytes) -> ApiResult {
+    let _principal = authenticate_http(&relay, &headers, &body, "/status").await?;
+    let limit = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("limit").and_then(serde_json::Value::as_u64))
+        .map(|value| value as usize)
+        .unwrap_or(MAX_STATUS_PAGE)
+        .clamp(1, MAX_STATUS_PAGE);
+    let (summary, quarantined, waiting) = collect_status(&relay.state.store, limit, now_seconds())
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "local status failed"))?;
+    Ok(Json(status_payload(&summary, &quarantined, &waiting)))
+}
+
+/// Manual retry of one quarantined event (§11, "manual retry from the
+/// quarantine UI").
+///
+/// Reading status is community-wide; writing is not. The authenticated
+/// principal — never the request body — decides whose row this is, exactly as
+/// it does for a drain claim.
+async fn http_requeue(
+    State(relay): State<EdgeRelay>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    let principal = authenticate_http(&relay, &headers, &body, "/requeue").await?;
+    let event_id = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("event_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "event_id must be a string"))?;
+    let event_id = nostr::EventId::from_hex(&event_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid event_id"))?;
+    let requeued = relay
+        .state
+        .store
+        .requeue_quarantined(&event_id, &principal, now_seconds())
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "local requeue failed"))?;
+    Ok(Json(serde_json::json!({ "requeued": requeued })))
+}
+
+/// Largest batch of event IDs one delivery-state lookup may ask about.
+///
+/// The caller is a rendered message list, so this is bounded by what fits on a
+/// screen with room to spare, not by what SQLite could survive.
+const MAX_DELIVERY_STATE_BATCH: usize = 500;
+
+/// Per-event delivery state for the message list's labels.
+///
+/// Unknown IDs are simply absent from the reply rather than reported as an
+/// error: an event with no outbox row came from upstream, which is a perfectly
+/// ordinary thing for the caller to have asked about.
+async fn http_delivery_states(
+    State(relay): State<EdgeRelay>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    let _principal = authenticate_http(&relay, &headers, &body, "/delivery-states").await?;
+    let requested = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("event_ids")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "event_ids must be an array"))?;
+    if requested.len() > MAX_DELIVERY_STATE_BATCH {
+        return Err(api_error(StatusCode::BAD_REQUEST, "too many event_ids"));
+    }
+    let mut event_ids = Vec::with_capacity(requested.len());
+    for value in &requested {
+        let hex = value
+            .as_str()
+            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "event_ids must be strings"))?;
+        event_ids.push(
+            nostr::EventId::from_hex(hex)
+                .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid event_id"))?,
+        );
+    }
+    let states = relay
+        .state
+        .store
+        .event_delivery_states(&event_ids)
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "local state lookup failed",
+            )
+        })?;
+    let payload: Vec<serde_json::Value> = states
+        .into_iter()
+        .map(|(event_id, state)| serde_json::json!([event_id.to_hex(), state]))
+        .collect();
+    Ok(Json(serde_json::json!(payload)))
 }
 
 async fn authenticate_http(

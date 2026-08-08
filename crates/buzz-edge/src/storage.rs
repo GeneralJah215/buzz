@@ -19,6 +19,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+// Delivery-state, quarantine, and waiting-for-author read surfaces live in a
+// sibling file: this one is already far past the repository's 1000-line file
+// budget, and files over the budget may not grow.
+#[path = "storage_status.rs"]
+mod storage_status;
+pub use storage_status::{EventDeliveryState, QuarantinedRow, WaitingAuthor, MAX_QUARANTINE_PAGE};
+
 const RECEIPT_KIND: u16 = 20_900;
 const AUTHORIZATION_SNAPSHOT_KIND: u16 = 20_901;
 const MAX_DIGEST_CONTENT_BYTES: usize = 200 * 1024;
