@@ -294,6 +294,13 @@ pub fn status_payload(
                 "ancestorBlocked": row.ancestor_blocked,
                 "pendingViaDigest": row.pending_via_digest,
                 "oldestPendingAt": row.oldest_pending_at,
+                // Per bucket, because an age shown beside a count must be an
+                // age some row in THAT count has. `oldestPendingAt` spans all
+                // three, so it is the author's overall wait and nothing else.
+                // `null` when the bucket is empty — never a zero, which would
+                // render as an age of decades.
+                "oldestClaimableAt": row.oldest_claimable_at,
+                "oldestAncestorBlockedAt": row.oldest_ancestor_blocked_at,
             })
         })
         .collect();
@@ -325,6 +332,11 @@ pub fn delivery_states_payload(states: &[EventDeliveryRow]) -> Value {
             serde_json::json!({
                 "eventId": row.event_id.to_hex(),
                 "state": row.state,
+                // Spelled exactly as the quarantine list spells it, because it
+                // is the same fact about the same row (BUG-023). A quarantined
+                // row the edge is already carrying upstream must not read as
+                // "stuck" on the badge while the list says "nothing to do".
+                "carriedByDigest": row.carried_by_digest,
                 "demotionReason": row.demotion_reason,
             })
         })
@@ -348,6 +360,20 @@ pub fn requeue_reply(req_id: &str, outcome: RequeueOutcome) -> String {
 }
 
 /// The requeue body shared by the WebSocket reply and the `/requeue` route.
+///
+/// **`requeued` is redundant with `outcome`, and stays.** It is derived here
+/// and only here, by [`RequeueOutcome::requeued`], so the two cannot disagree
+/// unless something rewrote one of them in transit — and the desktop refuses a
+/// reply where they do (`parse_requeue_reply` in
+/// `desktop/src-tauri/src/commands/edge_status.rs`). That turns the redundancy
+/// into a live cross-check the single field could not provide.
+///
+/// Dropping it would be a wire break with nothing to gain: the sidecar is
+/// installed and upgraded separately from the desktop, so a desktop older than
+/// the sidecar would find `requeued` missing and fail every retry outright —
+/// the exact version-skew failure this surface has already been bitten by
+/// (BUG-022). The one thing that must never happen is a second, independent
+/// computation of the boolean; keep it derived.
 pub fn requeue_payload(outcome: RequeueOutcome) -> Value {
     serde_json::json!({
         "requeued": outcome.requeued(),
@@ -973,6 +999,11 @@ mod tests {
             ancestor_blocked: 19,
             pending_via_digest: 23,
             oldest_pending_at: 1_699_999_999,
+            // Both later than the aggregate above, as the storage layer
+            // guarantees: `oldest_pending_at` is the minimum over all three
+            // buckets, so no single bucket can be older than it.
+            oldest_claimable_at: Some(1_700_000_007),
+            oldest_ancestor_blocked_at: Some(1_700_000_008),
         };
 
         let frame = status_reply(
@@ -1040,6 +1071,61 @@ mod tests {
         assert_eq!(waiting["ancestorBlocked"], 19);
         assert_eq!(waiting["pendingViaDigest"], 23);
         assert_eq!(waiting["oldestPendingAt"], 1_699_999_999);
+        // Each count travels with its OWN oldest arrival time. The aggregate
+        // above spans all three buckets, so printing it beside the blocked
+        // count claimed an age no blocked row has (BUG-023).
+        assert_eq!(waiting["oldestClaimableAt"], 1_700_000_007);
+        assert_eq!(waiting["oldestAncestorBlockedAt"], 1_700_000_008);
+        let mut waiting_keys: Vec<&str> = waiting
+            .as_object()
+            .expect("waiting author object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        waiting_keys.sort_unstable();
+        assert_eq!(
+            waiting_keys,
+            [
+                "ancestorBlocked",
+                "author",
+                "oldestAncestorBlockedAt",
+                "oldestClaimableAt",
+                "oldestPendingAt",
+                "pending",
+                "pendingViaDigest"
+            ],
+            "the waiting-author key set is a contract with Desktop"
+        );
+    }
+
+    #[test]
+    fn an_empty_bucket_sends_a_null_age_rather_than_a_borrowed_one() {
+        // The failure this guards is a zero, not a missing key: `0` renders as
+        // an age of decades, and `oldest_pending_at`'s value would render as an
+        // age no row in the empty bucket has. `null` is the only honest answer
+        // for "there is nothing in this bucket to be old".
+        let waiting = WaitingAuthor {
+            author: Keys::generate().public_key(),
+            pending: 0,
+            ancestor_blocked: 4,
+            pending_via_digest: 0,
+            oldest_pending_at: 1_699_999_999,
+            oldest_claimable_at: None,
+            oldest_ancestor_blocked_at: Some(1_699_999_999),
+        };
+        let payload = status_payload(&OutboxSummary::default(), &[], &[waiting]);
+        let row = &payload["waitingAuthors"][0];
+        assert!(
+            row["oldestClaimableAt"].is_null(),
+            "an author with no claimable row must not borrow another bucket's age: {row}"
+        );
+        assert_eq!(row["oldestAncestorBlockedAt"], 1_699_999_999);
+        assert!(
+            row.as_object()
+                .expect("waiting author object")
+                .contains_key("oldestClaimableAt"),
+            "null must be sent explicitly; an absent key reads as version skew"
+        );
     }
 
     #[test]
@@ -1142,11 +1228,13 @@ mod tests {
             EventDeliveryRow {
                 event_id: normal.id,
                 state: EventDeliveryState::Pending,
+                carried_by_digest: false,
                 demotion_reason: None,
             },
             EventDeliveryRow {
                 event_id: demoted.id,
                 state: EventDeliveryState::PendingViaDigest,
+                carried_by_digest: true,
                 demotion_reason: Some("older than the relay drift window".to_string()),
             },
         ]);
@@ -1158,6 +1246,77 @@ mod tests {
             payload[1]["demotionReason"],
             "older than the relay drift window"
         );
+    }
+
+    /// The badge has to be able to say what the quarantine list says about the
+    /// same row (BUG-023): the exact replay failed permanently AND the edge is
+    /// already carrying it upstream, so the refused retry is correct and there
+    /// is nothing for the operator to do. Before the flag travelled with the
+    /// label, `quarantined` was all the badge could ever say.
+    #[test]
+    fn a_quarantined_row_on_the_digest_path_says_so_on_the_wire() {
+        let author = Keys::generate();
+        let channel = Uuid::new_v4();
+        let stuck = signed_message(&author, channel, "refused and stuck");
+        let carried = signed_message(&author, channel, "refused, now carried");
+        let payload = delivery_states_payload(&[
+            EventDeliveryRow {
+                event_id: stuck.id,
+                state: EventDeliveryState::Quarantined,
+                carried_by_digest: false,
+                demotion_reason: None,
+            },
+            EventDeliveryRow {
+                event_id: carried.id,
+                state: EventDeliveryState::Quarantined,
+                carried_by_digest: true,
+                demotion_reason: Some("permanently rejected upstream".to_string()),
+            },
+        ]);
+
+        // Same label, different advice — which is only possible because the
+        // flag is on the wire beside it.
+        assert_eq!(payload[0]["state"], "quarantined");
+        assert_eq!(payload[1]["state"], "quarantined");
+        assert_eq!(
+            payload[0]["carriedByDigest"], false,
+            "a genuinely stuck row must not be dressed up as handled"
+        );
+        assert_eq!(
+            payload[1]["carriedByDigest"], true,
+            "the badge cannot say 'nothing to do' if the wire never said it"
+        );
+
+        // Spelled the same as the quarantine list spells it, or the two
+        // surfaces disagree again by way of a rename.
+        let quarantine_row = QuarantinedRow {
+            event_id: carried.id,
+            channel_id: channel,
+            author: author.public_key(),
+            created_at: 1_700_000_001,
+            attempts: 2,
+            reason: "permanently refused".to_string(),
+            carried_by_digest: true,
+            demotion_reason: Some("permanently rejected upstream".to_string()),
+            updated_at: 1_700_000_002,
+        };
+        let status = status_payload(&OutboxSummary::default(), &[quarantine_row], &[]);
+        assert_eq!(
+            status["quarantined"][0]["carriedByDigest"], payload[1]["carriedByDigest"],
+            "one row, one answer, on both surfaces"
+        );
+
+        // And it is a REQUIRED key on every row, including the ordinary ones:
+        // a desktop that defaults an absent flag to `false` would re-arm a
+        // "this is stuck" badge on a row that is on its way.
+        for row in payload.as_array().expect("rows") {
+            assert!(
+                row.as_object()
+                    .expect("row object")
+                    .contains_key("carriedByDigest"),
+                "every delivery-state row carries the flag: {row}"
+            );
+        }
     }
 
     #[test]

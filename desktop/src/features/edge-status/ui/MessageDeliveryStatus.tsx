@@ -68,6 +68,7 @@ export function MessageDeliveryStatus({
 
   const badge = (
     <DeliveryStateBadge
+      carriedByDigest={entry.carriedByDigest}
       className={className}
       data-testid="message-delivery-state"
       demotionReason={entry.demotionReason}

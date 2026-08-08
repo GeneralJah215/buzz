@@ -31,7 +31,9 @@ fn sidecar_payload() -> serde_json::Value {
             "pending": 3,
             "ancestorBlocked": 19,
             "pendingViaDigest": 23,
-            "oldestPendingAt": 1_699_999_000_i64
+            "oldestPendingAt": 1_699_999_000_i64,
+            "oldestClaimableAt": 1_699_999_100_i64,
+            "oldestAncestorBlockedAt": 1_699_999_200_i64
         }]
     })
 }
@@ -60,6 +62,41 @@ fn parses_the_sidecar_status_payload() {
     assert_eq!(parsed.waiting_authors[0].ancestor_blocked, 19);
     assert_eq!(parsed.waiting_authors[0].pending_via_digest, 23);
     assert_eq!(parsed.waiting_authors[0].oldest_pending_at, 1_699_999_000);
+    assert_eq!(
+        parsed.waiting_authors[0].oldest_claimable_at,
+        Some(1_699_999_100)
+    );
+    assert_eq!(
+        parsed.waiting_authors[0].oldest_ancestor_blocked_at,
+        Some(1_699_999_200)
+    );
+}
+
+/// The per-bucket ages are nullable but NOT optional, for the same reason
+/// `demotionReason` is: an absent key is a sidecar too old to answer, and
+/// reading that as "this bucket is empty" would put the aggregate age back
+/// beside a count it does not belong to — the BUG-023 defect, restored by
+/// silence instead of by code.
+#[test]
+fn a_missing_per_bucket_age_is_version_skew_not_an_empty_bucket() {
+    for dropped in ["oldestClaimableAt", "oldestAncestorBlockedAt"] {
+        let mut payload = sidecar_payload();
+        payload["waitingAuthors"][0]
+            .as_object_mut()
+            .expect("waiting author")
+            .remove(dropped);
+        assert!(
+            serde_json::from_value::<EdgeStatusPayload>(payload).is_err(),
+            "a waiting author without '{dropped}' must fail loudly, not default to null"
+        );
+    }
+
+    // An explicit null is the sidecar saying "that bucket is empty", and is
+    // the answer an author with no blocked rows must get.
+    let mut payload = sidecar_payload();
+    payload["waitingAuthors"][0]["oldestAncestorBlockedAt"] = serde_json::Value::Null;
+    let parsed: EdgeStatusPayload = serde_json::from_value(payload).expect("parse");
+    assert_eq!(parsed.waiting_authors[0].oldest_ancestor_blocked_at, None);
 }
 
 /// The rename alarm. The sidecar settled on `synced*` for canonical history in
@@ -407,15 +444,36 @@ fn a_self_contradicting_requeue_reply_is_refused() {
 #[test]
 fn parses_delivery_state_rows_with_their_demotion_reason() {
     let value = serde_json::json!([
-        { "eventId": "aa".repeat(32), "state": "pending", "demotionReason": null },
+        {
+            "eventId": "aa".repeat(32),
+            "state": "pending",
+            "carriedByDigest": false,
+            "demotionReason": null
+        },
         {
             "eventId": "bb".repeat(32),
             "state": "pendingViaDigest",
+            "carriedByDigest": true,
             "demotionReason": "older than the relay drift window"
         },
-        { "eventId": "cc".repeat(32), "state": "syncedExact", "demotionReason": null },
-        { "eventId": "dd".repeat(32), "state": "syncedViaDigest", "demotionReason": null },
-        { "eventId": "ee".repeat(32), "state": "quarantined", "demotionReason": null },
+        {
+            "eventId": "cc".repeat(32),
+            "state": "syncedExact",
+            "carriedByDigest": false,
+            "demotionReason": null
+        },
+        {
+            "eventId": "dd".repeat(32),
+            "state": "syncedViaDigest",
+            "carriedByDigest": true,
+            "demotionReason": null
+        },
+        {
+            "eventId": "ee".repeat(32),
+            "state": "quarantined",
+            "carriedByDigest": false,
+            "demotionReason": null
+        },
     ]);
     let parsed: Vec<EdgeEventDeliveryState> = serde_json::from_value(value).expect("parse");
     assert_eq!(parsed.len(), 5);
@@ -440,6 +498,67 @@ fn parses_delivery_state_rows_with_their_demotion_reason() {
     );
 }
 
+/// BUG-023. Two rows, one label, opposite advice: a quarantined row the edge is
+/// already carrying upstream is not a stuck row, and the badge can only say so
+/// if `carriedByDigest` survives the parse. The quarantine list has always
+/// carried this flag; the badge did not, so one row got two answers.
+#[test]
+fn a_quarantined_delivery_row_says_whether_the_digest_is_carrying_it() {
+    let value = serde_json::json!([
+        {
+            "eventId": "aa".repeat(32),
+            "state": "quarantined",
+            "carriedByDigest": false,
+            "demotionReason": null
+        },
+        {
+            "eventId": "bb".repeat(32),
+            "state": "quarantined",
+            "carriedByDigest": true,
+            "demotionReason": "permanently rejected upstream"
+        },
+    ]);
+    let parsed: Vec<EdgeEventDeliveryState> = serde_json::from_value(value).expect("parse");
+    assert_eq!(
+        parsed[0].state, parsed[1].state,
+        "the label cannot separate them"
+    );
+    assert!(
+        !parsed[0].carried_by_digest,
+        "a genuinely stuck row must not be reported as handled"
+    );
+    assert!(
+        parsed[1].carried_by_digest,
+        "the flag is what lets the badge agree with the quarantine list"
+    );
+}
+
+/// The flag is required on every delivery row, exactly as it is on every
+/// quarantine row. Defaulting an absent one to `false` would put "this is
+/// stuck, act now" back on a row that is on its way upstream.
+#[test]
+fn a_delivery_row_without_the_carried_flag_is_refused() {
+    let value = serde_json::json!([
+        { "eventId": "aa".repeat(32), "state": "quarantined", "demotionReason": null }
+    ]);
+    assert!(
+        serde_json::from_value::<Vec<EdgeEventDeliveryState>>(value).is_err(),
+        "a missing carriedByDigest must fail, not default to 'this row is stuck'"
+    );
+
+    // Both values are read rather than assumed.
+    for carried in [true, false] {
+        let value = serde_json::json!([{
+            "eventId": "aa".repeat(32),
+            "state": "quarantined",
+            "carriedByDigest": carried,
+            "demotionReason": null
+        }]);
+        let parsed: Vec<EdgeEventDeliveryState> = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed[0].carried_by_digest, carried);
+    }
+}
+
 /// The pair shape is gone. A build still reading `[eventId, state]` would lose
 /// the demotion reason silently, so the old shape must be a hard error.
 #[test]
@@ -456,7 +575,13 @@ fn the_old_event_id_state_pair_shape_no_longer_parses() {
 /// "this sidecar is too old to say".
 #[test]
 fn a_delivery_row_without_a_demotion_reason_key_is_refused() {
-    let value = serde_json::json!([{ "eventId": "aa".repeat(32), "state": "pending" }]);
+    // Every OTHER required key is present, so this fails for the reason the
+    // test is named for and not incidentally.
+    let value = serde_json::json!([{
+        "eventId": "aa".repeat(32),
+        "state": "pending",
+        "carriedByDigest": false
+    }]);
     assert!(serde_json::from_value::<Vec<EdgeEventDeliveryState>>(value).is_err());
 }
 
@@ -466,10 +591,16 @@ fn a_delivery_row_without_a_demotion_reason_key_is_refused() {
 #[test]
 fn an_unknown_delivery_state_string_still_parses() {
     let value = serde_json::json!([
-        { "eventId": "aa".repeat(32), "state": "pending", "demotionReason": null },
+        {
+            "eventId": "aa".repeat(32),
+            "state": "pending",
+            "carriedByDigest": false,
+            "demotionReason": null
+        },
         {
             "eventId": "bb".repeat(32),
             "state": "syncedSomehowInTheFuture",
+            "carriedByDigest": false,
             "demotionReason": null
         },
     ]);

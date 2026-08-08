@@ -116,14 +116,27 @@ pub enum EventDeliveryState {
     Quarantined,
 }
 
+/// The `delivery_path` value that means "the edge identity carries this row
+/// upstream inside a catch-up digest, not its author".
+///
+/// Named once because three surfaces test for it — the quarantine list, the
+/// per-event labels, and the requeue refusal — and they must agree on the
+/// spelling or one of them silently stops recognising the digest path.
+pub(crate) const DIGEST_DELIVERY_PATH: &str = "digest";
+
 impl EventDeliveryState {
     /// Map one `(state, delivery_path)` outbox pair onto a label.
+    ///
+    /// **The quarantined arm deliberately ignores the path**, and that is not
+    /// the old bug returning: the path now travels beside the label on
+    /// [`EventDeliveryRow::carried_by_digest`] instead of being folded into it.
+    /// See that field for why it is a flag rather than a seventh variant.
     fn from_row(state: &str, delivery_path: &str) -> Option<Self> {
         match (state, delivery_path) {
-            ("pending", "digest") => Some(Self::PendingViaDigest),
+            ("pending", DIGEST_DELIVERY_PATH) => Some(Self::PendingViaDigest),
             ("pending", _) => Some(Self::Pending),
             ("claimed", _) => Some(Self::Claimed),
-            ("delivered", "digest") => Some(Self::SyncedViaDigest),
+            ("delivered", DIGEST_DELIVERY_PATH) => Some(Self::SyncedViaDigest),
             ("delivered", _) => Some(Self::SyncedExact),
             ("quarantined", _) => Some(Self::Quarantined),
             _ => None,
@@ -143,6 +156,29 @@ pub struct EventDeliveryRow {
     pub event_id: EventId,
     /// Where the event stands.
     pub state: EventDeliveryState,
+    /// True when this row sits on the digest path, exactly as
+    /// [`QuarantinedRow::carried_by_digest`] reports it (BUG-023).
+    ///
+    /// Without this the two surfaces answered differently about one row: the
+    /// quarantine *list* could say a quarantined row was already being carried
+    /// upstream by the edge identity — so its refused retry was correct and
+    /// there was nothing to do — while the per-message *badge* for that same
+    /// event could only say `Quarantined`, which reads as "stuck, act now".
+    ///
+    /// A **flag**, not a seventh `EventDeliveryState`, for the same reason
+    /// `QuarantinedRow` uses one: a quarantined digest row really is
+    /// quarantined — its own replay was permanently refused, which is the whole
+    /// content of that state — plus one extra fact about who carries it now.
+    /// `PendingViaDigest` by contrast is a genuinely different *state*, because
+    /// no author will ever claim it and `Pending`'s advice ("wait for its
+    /// author") would be wrong. Six wire strings are also pinned by tests on
+    /// both the Rust and TypeScript sides; a seventh is a contract change and
+    /// this fact does not need one.
+    ///
+    /// True on every digest-path row, not only the quarantined ones, so the
+    /// meaning is the literal column and never a per-state special case:
+    /// `carried_by_digest == (delivery_path == "digest")`, always.
+    pub carried_by_digest: bool,
     /// Why it left the exact path, when it has.
     pub demotion_reason: Option<String>,
 }
@@ -209,9 +245,42 @@ pub struct WaitingAuthor {
     /// upstream instead. No author action is possible or needed; they are here
     /// so the pending total has an explanation on screen.
     pub pending_via_digest: u64,
-    /// Local arrival time of the oldest waiting row, in Unix seconds. This is
-    /// how long the author has kept the edge waiting.
+    /// Local arrival time of the oldest unsynced row **across all three
+    /// buckets**, in Unix seconds — how long this author has kept the edge
+    /// waiting overall, and the sort key for the list.
+    ///
+    /// Deliberately NOT the age to print beside any one of the three counts:
+    /// see [`WaitingAuthor::oldest_claimable_at`].
     pub oldest_pending_at: i64,
+    /// Arrival time of the oldest row this author's drain client can claim
+    /// **right now**, or `None` when `pending` is 0.
+    ///
+    /// The aggregate above cannot be used for this (BUG-023). It is one
+    /// `MIN(received_at)` over pending, ancestor-blocked and digest rows
+    /// together, so an author with one fresh claimable row and one week-old
+    /// digest row was reported as "oldest waiting 7d" — an age no waiting row
+    /// actually has. A per-bucket minimum is the only figure that matches the
+    /// count it is printed beside.
+    pub oldest_claimable_at: Option<i64>,
+    /// Arrival time of the oldest row blocked behind an unreplayable ancestor,
+    /// or `None` when `ancestor_blocked` is 0. Same reason as above, and it
+    /// matters more here: this is the bucket whose entire point is that these
+    /// rows are *not* waiting for anybody.
+    pub oldest_ancestor_blocked_at: Option<i64>,
+}
+
+/// The earlier of two optional timestamps, ignoring the absent ones.
+///
+/// `None` means "this bucket had no rows in this chunk", which must never win a
+/// minimum — an author's channels are queried in several passes when the
+/// accessible set is large, and treating an empty pass as time zero would
+/// report an age no row has.
+fn earlier(current: Option<i64>, candidate: Option<i64>) -> Option<i64> {
+    match (current, candidate) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, right) => right,
+    }
 }
 
 /// What a manual quarantine retry actually did.
@@ -385,7 +454,7 @@ impl EdgeStore {
                     attempts: u32::try_from(attempts)
                         .map_err(|error| StorageError::Corrupt(error.to_string()))?,
                     reason,
-                    carried_by_digest: delivery_path == "digest",
+                    carried_by_digest: delivery_path == DIGEST_DELIVERY_PATH,
                     demotion_reason: demotion_reason
                         .map(|reason| truncate_quarantine_reason(&reason)),
                     updated_at,
@@ -424,6 +493,11 @@ impl EdgeStore {
     /// operator to wait for an author whose drain client was running and
     /// correctly claiming nothing, forever.
     ///
+    /// Each count comes back with **its own** oldest arrival time, because an
+    /// age printed beside a count has to be an age some row in that count
+    /// actually has. The aggregate `oldest_pending_at` spans all three buckets
+    /// and remains the sort key.
+    ///
     /// Sorted oldest-waiting first, then by author, so the order is stable.
     pub fn waiting_authors(
         &self,
@@ -446,7 +520,11 @@ impl EdgeStore {
                         SUM(CASE WHEN o.delivery_path = 'exact' AND {blocked}
                                  THEN 1 ELSE 0 END),
                         SUM(CASE WHEN o.delivery_path = 'digest' THEN 1 ELSE 0 END),
-                        MIN(e.received_at)
+                        MIN(e.received_at),
+                        MIN(CASE WHEN o.delivery_path = 'exact' AND NOT {blocked}
+                                 THEN e.received_at END),
+                        MIN(CASE WHEN o.delivery_path = 'exact' AND {blocked}
+                                 THEN e.received_at END)
                    FROM outbox o
                    JOIN events e ON e.event_id = o.event_id
                   WHERE e.channel_id IN ({channels})
@@ -475,10 +553,20 @@ impl EdgeStore {
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
                 ))
             })?;
             for row in rows {
-                let (author, pending, ancestor_blocked, via_digest, oldest) = row?;
+                let (
+                    author,
+                    pending,
+                    ancestor_blocked,
+                    via_digest,
+                    oldest,
+                    oldest_claimable,
+                    oldest_blocked,
+                ) = row?;
                 let entry = merged.entry(author.clone()).or_insert(WaitingAuthor {
                     author: PublicKey::from_hex(&author)
                         .map_err(|error| StorageError::Corrupt(error.to_string()))?,
@@ -486,11 +574,16 @@ impl EdgeStore {
                     ancestor_blocked: 0,
                     pending_via_digest: 0,
                     oldest_pending_at: oldest,
+                    oldest_claimable_at: None,
+                    oldest_ancestor_blocked_at: None,
                 });
                 entry.pending += pending as u64;
                 entry.ancestor_blocked += ancestor_blocked as u64;
                 entry.pending_via_digest += via_digest as u64;
                 entry.oldest_pending_at = entry.oldest_pending_at.min(oldest);
+                entry.oldest_claimable_at = earlier(entry.oldest_claimable_at, oldest_claimable);
+                entry.oldest_ancestor_blocked_at =
+                    earlier(entry.oldest_ancestor_blocked_at, oldest_blocked);
             }
         }
         drop(connection);
@@ -535,7 +628,8 @@ impl EdgeStore {
             return Ok(Vec::new());
         }
 
-        let mut found: HashMap<String, (EventDeliveryState, Option<String>)> = HashMap::new();
+        // `(label, carried_by_digest, demotion_reason)` per event id.
+        let mut found: HashMap<String, (EventDeliveryState, bool, Option<String>)> = HashMap::new();
         let connection = self.connection.lock();
         for chunk in event_ids.chunks(DELIVERY_STATE_CHUNK) {
             let sql = format!(
@@ -574,6 +668,7 @@ impl EdgeStore {
                     event_id,
                     (
                         label,
+                        delivery_path == DIGEST_DELIVERY_PATH,
                         demotion_reason.map(|reason| truncate_quarantine_reason(&reason)),
                     ),
                 );
@@ -585,13 +680,14 @@ impl EdgeStore {
         let mut emitted = HashSet::new();
         for event_id in event_ids {
             let hex = event_id.to_hex();
-            let Some((label, demotion_reason)) = found.get(&hex) else {
+            let Some((label, carried_by_digest, demotion_reason)) = found.get(&hex) else {
                 continue;
             };
             if emitted.insert(hex) {
                 states.push(EventDeliveryRow {
                     event_id: *event_id,
                     state: *label,
+                    carried_by_digest: *carried_by_digest,
                     demotion_reason: demotion_reason.clone(),
                 });
             }
@@ -656,7 +752,7 @@ impl EdgeStore {
         if !self.principal_can_access_at(channel, author, now)? {
             return Ok(RequeueOutcome::NotFound);
         }
-        if delivery_path == "digest" {
+        if delivery_path == DIGEST_DELIVERY_PATH {
             return Ok(RequeueOutcome::CarriedByDigest);
         }
 
@@ -1406,7 +1502,233 @@ mod tests {
         );
     }
 
+    /// BUG-023, the waiting-author half: one `MIN(received_at)` across all
+    /// three buckets, printed beside whichever count the UI happened to be
+    /// drawing. The age shown next to "4 events blocked" could belong to a
+    /// perfectly claimable row, and the age next to "2 events queued" could
+    /// belong to a digest row no author is coming for — overstating a wait that
+    /// no waiting row has.
+    #[test]
+    fn each_waiting_count_carries_the_age_of_its_own_bucket() {
+        let store = store();
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        authorize_one(&store, &edge, channel, &[&author]);
+
+        let claimable = message(&author, channel, "claimable");
+        let root = message(&author, channel, "root that will be refused");
+        insert(&store, &claimable, channel, &edge);
+        insert(&store, &root, channel, &edge);
+        let blocked = reply(&author, channel, &root, "blocked behind the root");
+        insert(&store, &blocked, channel, &edge);
+        let demoted = message(&author, channel, "carried by the digest");
+        insert(&store, &demoted, channel, &edge);
+
+        // The root leaves the live buckets entirely, and takes its reply's
+        // claimability with it.
+        quarantine(&store, &author, &root.id, "refused upstream");
+        store
+            .connection
+            .lock()
+            .execute(
+                "UPDATE outbox SET delivery_path = 'digest' WHERE event_id = ?1",
+                [demoted.id.to_hex()],
+            )
+            .expect("demote");
+
+        // Each bucket gets a distinct arrival time, and the digest row — the
+        // one with NO author coming for it — is the oldest of the three.
+        for (event, received_at) in [(&claimable, 500), (&blocked, 300), (&demoted, 100)] {
+            set_received_at(&store, &event.id, received_at);
+        }
+
+        let key = author.public_key();
+        let waiting = store.waiting_authors(&key, 2_000).expect("waiting");
+        assert_eq!(waiting.len(), 1);
+        let row = &waiting[0];
+        assert_eq!(
+            (row.pending, row.ancestor_blocked, row.pending_via_digest),
+            (1, 1, 1)
+        );
+
+        assert_eq!(
+            row.oldest_pending_at, 100,
+            "the aggregate still spans all three buckets"
+        );
+        assert_eq!(
+            row.oldest_claimable_at,
+            Some(500),
+            "the age beside 'queued' must belong to a row an author can claim, \
+             not to the digest row that is oldest overall"
+        );
+        assert_eq!(
+            row.oldest_ancestor_blocked_at,
+            Some(300),
+            "and the age beside 'blocked' must belong to a blocked row"
+        );
+        assert_ne!(
+            row.oldest_claimable_at,
+            Some(row.oldest_pending_at),
+            "a per-bucket age that merely echoes the aggregate is the bug"
+        );
+        assert_ne!(row.oldest_ancestor_blocked_at, Some(row.oldest_pending_at));
+    }
+
+    #[test]
+    fn an_empty_waiting_bucket_reports_no_age_at_all() {
+        // `None`, never 0 and never a neighbouring bucket's timestamp: a 0
+        // renders as an age of decades and a borrowed timestamp is the bug
+        // above wearing a different hat.
+        let store = store();
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        authorize_one(&store, &edge, channel, &[&author]);
+        let only_pending = message(&author, channel, "nothing is blocked here");
+        insert(&store, &only_pending, channel, &edge);
+        set_received_at(&store, &only_pending.id, 700);
+
+        let waiting = store
+            .waiting_authors(&author.public_key(), 2_000)
+            .expect("waiting");
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].ancestor_blocked, 0);
+        assert_eq!(
+            waiting[0].oldest_ancestor_blocked_at, None,
+            "an empty bucket has no oldest row, so it must report none"
+        );
+        assert_eq!(waiting[0].oldest_claimable_at, Some(700));
+    }
+
     // ── Per-event delivery state (§13) ──────────────────────────────────────
+
+    /// BUG-023: the quarantine list and the per-message badge disagreed about
+    /// one row. `from_row` kept `delivery_path` for the pending and delivered
+    /// arms and dropped it for quarantined, so the list could say "the digest
+    /// is already carrying this, the refused retry was correct, do nothing"
+    /// while the badge for that same event said only "Sync failed" — which
+    /// reads as "stuck, act now".
+    #[test]
+    fn the_badge_and_the_quarantine_list_agree_about_a_digest_carried_row() {
+        let store = store();
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        authorize_one(&store, &edge, channel, &[&author]);
+        let stuck = message(&author, channel, "refused and genuinely stuck");
+        let carried = message(&author, channel, "refused, then demoted");
+        insert(&store, &stuck, channel, &edge);
+        insert(&store, &carried, channel, &edge);
+        quarantine(&store, &author, &stuck.id, "permanently refused");
+        quarantine(&store, &author, &carried.id, "permanently refused");
+
+        // Only the second row is moved onto the digest path, by the real
+        // demotion pass rather than by hand.
+        store
+            .connection
+            .lock()
+            .execute(
+                "UPDATE outbox SET delivery_path = 'digest' WHERE event_id = ?1",
+                [carried.id.to_hex()],
+            )
+            .expect("demote");
+        assert_eq!(delivery_path(&store, &stuck.id), "exact");
+        assert_eq!(delivery_path(&store, &carried.id), "digest");
+
+        let key = author.public_key();
+        let list = store.quarantined_rows(&key, 2_000, 10).expect("rows");
+        let badges = store
+            .event_delivery_states(&key, 2_000, &[stuck.id, carried.id])
+            .expect("states");
+        assert_eq!(badges.len(), 2);
+
+        // Both rows are quarantined, so the label alone cannot tell them apart
+        // — which is exactly why the flag has to travel with it.
+        assert_eq!(badges[0].state, EventDeliveryState::Quarantined);
+        assert_eq!(badges[1].state, EventDeliveryState::Quarantined);
+        assert!(
+            !badges[0].carried_by_digest,
+            "a genuinely stuck row must not be dressed up as handled"
+        );
+        assert!(
+            badges[1].carried_by_digest,
+            "the badge for a digest-carried row still said only 'quarantined'"
+        );
+
+        // The property the bug is about: one row, one answer, on both surfaces.
+        for badge in &badges {
+            let listed = list
+                .iter()
+                .find(|row| row.event_id == badge.event_id)
+                .expect("every quarantined row is in the list");
+            assert_eq!(
+                listed.carried_by_digest,
+                badge.carried_by_digest,
+                "the list and the badge disagree about {}",
+                badge.event_id.to_hex()
+            );
+        }
+
+        // And the answer is the one the retry path acts on, so the operator is
+        // never told "nothing to do" about a row that would in fact requeue.
+        assert_eq!(
+            store
+                .requeue_quarantined(&carried.id, &key, 2_000)
+                .expect("requeue carried"),
+            RequeueOutcome::CarriedByDigest
+        );
+        assert_eq!(
+            store
+                .requeue_quarantined(&stuck.id, &key, 2_000)
+                .expect("requeue stuck"),
+            RequeueOutcome::Requeued
+        );
+    }
+
+    #[test]
+    fn the_carried_flag_is_the_delivery_path_in_every_state() {
+        // The flag means one thing — "this row is on the digest path" — in
+        // every state, so a reader never has to know which states it applies
+        // to. A per-state special case is how the two surfaces drifted apart
+        // in the first place.
+        let store = store();
+        let (author, edge) = (Keys::generate(), Keys::generate());
+        let channel = Uuid::new_v4();
+        authorize_one(&store, &edge, channel, &[&author]);
+        let exact = message(&author, channel, "exact");
+        let digest = message(&author, channel, "digest");
+        insert(&store, &exact, channel, &edge);
+        insert(&store, &digest, channel, &edge);
+        store
+            .connection
+            .lock()
+            .execute(
+                "UPDATE outbox SET delivery_path = 'digest' WHERE event_id = ?1",
+                [digest.id.to_hex()],
+            )
+            .expect("demote");
+
+        let key = author.public_key();
+        for state in ["pending", "claimed", "delivered", "quarantined"] {
+            store
+                .connection
+                .lock()
+                .execute(
+                    "UPDATE outbox SET state = ?1 WHERE event_id IN (?2, ?3)",
+                    params![state, exact.id.to_hex(), digest.id.to_hex()],
+                )
+                .expect("set state");
+            let states = store
+                .event_delivery_states(&key, 2_000, &[exact.id, digest.id])
+                .expect("states");
+            assert_eq!(states.len(), 2, "state '{state}'");
+            for row in states {
+                let expected = delivery_path(&store, &row.event_id) == "digest";
+                assert_eq!(
+                    row.carried_by_digest, expected,
+                    "state '{state}': carried_by_digest must mirror delivery_path"
+                );
+            }
+        }
+    }
 
     #[test]
     fn event_delivery_states_maps_every_state() {

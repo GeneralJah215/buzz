@@ -112,7 +112,21 @@ pub struct EdgeWaitingAuthor {
     /// Rows the edge identity carries upstream in a digest. No author is
     /// coming for them, so they must never be summed into a "waiting" figure.
     pending_via_digest: u64,
+    /// Oldest arrival time across **all three** buckets. The author's overall
+    /// wait, and nothing to print beside any one count — see below.
     oldest_pending_at: i64,
+    /// Oldest row this author can actually claim, `null` when `pending` is 0.
+    ///
+    /// Required-but-nullable for the same reason `demotion_reason` is: an
+    /// absent key is a sidecar too old to answer, and silently reading that as
+    /// "this bucket is empty" would hide the count's age instead of showing it.
+    #[serde(deserialize_with = "required_nullable")]
+    oldest_claimable_at: Option<i64>,
+    /// Oldest ancestor-blocked row, `null` when `ancestor_blocked` is 0. The
+    /// aggregate above cannot stand in for it: it spans the claimable and
+    /// digest buckets too, so it can be an age no blocked row has (BUG-023).
+    #[serde(deserialize_with = "required_nullable")]
+    oldest_ancestor_blocked_at: Option<i64>,
 }
 
 /// One event's delivery label, plus the reason it left the exact path.
@@ -133,6 +147,16 @@ pub struct EdgeWaitingAuthor {
 pub struct EdgeEventDeliveryState {
     event_id: String,
     state: String,
+    /// True when the edge identity is already carrying this event upstream in a
+    /// catch-up digest — the same flag, spelled the same way, that the
+    /// quarantine list carries on `EdgeQuarantinedEvent`.
+    ///
+    /// Without it the badge for a quarantined-and-demoted row could only say
+    /// "Sync failed" while the quarantine list said "already on its way, the
+    /// refused retry was correct" (BUG-023). Required, never defaulted: a
+    /// missing key reading as `false` would put the alarming half of that
+    /// disagreement back on screen.
+    carried_by_digest: bool,
     #[serde(deserialize_with = "required_nullable")]
     demotion_reason: Option<String>,
 }

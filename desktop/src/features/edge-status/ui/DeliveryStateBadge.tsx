@@ -23,6 +23,16 @@ type DeliveryStateBadgeProps = {
    * a problem, and the second half is the actionable one.
    */
   demotionReason?: string | null;
+  /**
+   * The sidecar's `carriedByDigest` for this same event.
+   *
+   * It only changes what a `quarantined` row says, and there it changes it
+   * completely: "Sync failed" alone reads as stuck and actionable, while a row
+   * the edge is already carrying upstream is neither. The quarantine list has
+   * always drawn that distinction; this is how the badge draws the same one
+   * about the same row (BUG-023).
+   */
+  carriedByDigest?: boolean;
   className?: string;
 } & Omit<React.HTMLAttributes<HTMLSpanElement>, "children">;
 
@@ -37,16 +47,17 @@ type DeliveryStateBadgeProps = {
 export function DeliveryStateBadge({
   state,
   demotionReason,
+  carriedByDigest = false,
   className,
   ...props
 }: DeliveryStateBadgeProps) {
-  const label = deliveryLabel(state);
+  const label = deliveryLabel(state, carriedByDigest);
 
   return (
     <Badge
       className={cn("gap-1", className)}
-      title={deliveryDescription(state, demotionReason)}
-      variant={deliveryTone(state)}
+      title={deliveryDescription(state, demotionReason, carriedByDigest)}
+      variant={deliveryTone(state, carriedByDigest)}
       {...props}
     >
       {label}

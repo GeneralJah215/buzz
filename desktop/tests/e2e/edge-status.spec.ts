@@ -55,6 +55,9 @@ const EDGE_SEED = {
       ancestorBlocked: 0,
       pendingViaDigest: 4,
       oldestPendingAt: 1_780_000_000,
+      oldestClaimableAt: 1_780_000_400,
+      // No blocked rows, so no blocked age — never a borrowed one.
+      oldestAncestorBlockedAt: null,
     },
   ],
 } as const;
@@ -204,6 +207,28 @@ test.describe("edge status surfaces", () => {
     const alices = rows.nth(1);
     await expect(mine.getByTestId("message-delivery-state")).toHaveCount(1);
     await expect(alices.getByTestId("message-delivery-state")).toHaveCount(0);
+  });
+
+  test("a quarantined message the digest is carrying does not read as stuck", async ({
+    page,
+  }) => {
+    // BUG-023 through the assembled app: the same row, the same `quarantined`
+    // label, and opposite advice. The quarantine list has always been able to
+    // say "the edge is already carrying this upstream"; the badge could only
+    // ever say "Sync failed", which reads as something to act on.
+    await installMockBridge(page, {
+      edgeStatus: {
+        ...EDGE_SEED,
+        deliveryStateForAll: "quarantined",
+        carriedByDigestForAll: true,
+      },
+    });
+    await openGeneralChannel(page);
+
+    const badge = page.getByTestId("message-delivery-state").first();
+    await expect(badge).toBeVisible({ timeout: 10_000 });
+    await expect(badge).toHaveText("Sync failed, carried by digest");
+    await expect(badge).toHaveAttribute("title", /nothing to retry/i);
   });
 
   test("a message that reached canonical history is not badged", async ({

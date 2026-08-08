@@ -106,6 +106,10 @@ export type MockEdgeStatusSeed = {
     ancestorBlocked: number;
     pendingViaDigest: number;
     oldestPendingAt: number;
+    /** Oldest claimable row, or `null` when `pending` is 0. */
+    oldestClaimableAt: number | null;
+    /** Oldest ancestor-blocked row, or `null` when `ancestorBlocked` is 0. */
+    oldestAncestorBlockedAt: number | null;
   }>;
   /** `eventId` -> wire state name, for the per-message badges. */
   deliveryStates?: Record<string, string>;
@@ -118,6 +122,18 @@ export type MockEdgeStatusSeed = {
   deliveryStateForAll?: string;
   /** `eventId` -> demotion reason, for the badge tooltips. */
   demotionReasons?: Record<string, string>;
+  /**
+   * `eventId` -> whether the edge is already carrying that event upstream in a
+   * catch-up digest. Ids not named here are reported as `false`, and the flag
+   * is sent on every row because the parser requires it.
+   */
+  carriedByDigestStates?: Record<string, boolean>;
+  /**
+   * `carriedByDigest` applied to every requested id, the counterpart of
+   * `deliveryStateForAll`. A spec cannot know the ids of messages the mock
+   * relay generated at runtime.
+   */
+  carriedByDigestForAll?: boolean;
 };
 
 /**
@@ -11692,6 +11708,10 @@ export function maybeInstallE2eTauriMocks() {
             .map((eventId) => ({
               eventId,
               state: states[eventId] ?? edge.deliveryStateForAll,
+              carriedByDigest:
+                edge.carriedByDigestStates?.[eventId] ??
+                edge.carriedByDigestForAll ??
+                false,
               demotionReason: edge.demotionReasons?.[eventId] ?? null,
             }))
             .filter((row) => row.state !== undefined);

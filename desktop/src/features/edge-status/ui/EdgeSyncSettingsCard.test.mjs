@@ -93,6 +93,8 @@ const WAITING_AUTHORS = [
     ancestorBlocked: 0,
     pendingViaDigest: 4,
     oldestPendingAt: 1_780_000_000,
+    oldestClaimableAt: 1_780_000_400,
+    oldestAncestorBlockedAt: null,
   },
   {
     // NOT waiting for anyone: present, draining, and correctly claiming
@@ -102,6 +104,8 @@ const WAITING_AUTHORS = [
     ancestorBlocked: 3,
     pendingViaDigest: 0,
     oldestPendingAt: 1_780_000_500,
+    oldestClaimableAt: null,
+    oldestAncestorBlockedAt: 1_780_000_500,
   },
 ];
 

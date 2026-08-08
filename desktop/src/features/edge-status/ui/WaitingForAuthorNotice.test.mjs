@@ -47,13 +47,19 @@ const WAITING_LABEL = "Identities with events waiting to sync";
 const BLOCKED_LABEL =
   "Events blocked behind an ancestor that never reached canonical history";
 
+const NOW_SECONDS = Math.floor(Date.now() / 1000);
+
 function author(overrides = {}) {
   return {
     author: AUTHOR,
     pending: 0,
     ancestorBlocked: 0,
     pendingViaDigest: 0,
-    oldestPendingAt: Math.floor(Date.now() / 1000) - 7200,
+    // The aggregate spans all three buckets, so it is the oldest of the three
+    // and belongs to none of them in particular.
+    oldestPendingAt: NOW_SECONDS - 7200,
+    oldestClaimableAt: NOW_SECONDS - 7200,
+    oldestAncestorBlockedAt: NOW_SECONDS - 7200,
     ...overrides,
   };
 }
@@ -220,10 +226,9 @@ test("each identity is listed under the sections that apply to it", async () => 
 });
 
 test("the ancestor-blocked age is not labelled as waiting", async () => {
-  // The sidecar sends ONE timestamp per author across all three buckets
-  // (BUG-023), so this figure may come from a genuinely pending row. Calling it
-  // "oldest waiting" inside the section whose whole point is that these events
-  // are NOT waiting for anybody claims more than the data knows.
+  // These events are not waiting for anybody — their author is online and
+  // correctly claiming nothing — so the section must not describe its age as a
+  // wait, which would send the operator back to the advice it exists to refuse.
   await render([author({ ancestorBlocked: 2 })]);
 
   const blocked = section(BLOCKED_LABEL);
@@ -232,5 +237,59 @@ test("the ancestor-blocked age is not labelled as waiting", async () => {
     !/oldest waiting/i.test(blocked.textContent),
     `the blocked section must not call its age "waiting": ${blocked.textContent}`,
   );
-  assert.match(blocked.textContent, /oldest queued event from this author/);
+  assert.match(blocked.textContent, /oldest blocked/);
+});
+
+/**
+ * BUG-023's second half. `oldestPendingAt` is one `MIN(received_at)` over the
+ * claimable, blocked and digest rows together, so printing it beside a count
+ * claims an age that count need not have. Here the author's claimable row is
+ * two minutes old, the blocked row is an hour old, and a digest row nobody is
+ * waiting for is a day old — so the aggregate ("1d") is wrong for both
+ * sections, and each section has to read its own bucket.
+ */
+test("each section shows the age of its own rows, not the author's oldest", async () => {
+  await render([
+    author({
+      pending: 1,
+      ancestorBlocked: 1,
+      pendingViaDigest: 1,
+      oldestPendingAt: NOW_SECONDS - 86_400,
+      oldestClaimableAt: NOW_SECONDS - 120,
+      oldestAncestorBlockedAt: NOW_SECONDS - 3_600,
+    }),
+  ]);
+
+  assert.match(section(WAITING_LABEL).textContent, /oldest waiting 2m/);
+  assert.match(section(BLOCKED_LABEL).textContent, /oldest blocked 1h/);
+  assert.ok(
+    !/1d/.test(container.textContent),
+    `the digest row's age belongs to neither section: ${container.textContent}`,
+  );
+});
+
+/**
+ * `null` means the bucket is empty. A section only renders when its own count
+ * is above zero so it should not arise, but if a sidecar ever sends a count
+ * without its age the row must drop the AGE and keep the count — never fall
+ * back to the aggregate, which is the substitution this fix removed.
+ */
+test("a missing bucket age drops the age, not the count", async () => {
+  await render([
+    author({
+      pending: 1,
+      ancestorBlocked: 1,
+      oldestPendingAt: NOW_SECONDS - 86_400,
+      oldestClaimableAt: null,
+      oldestAncestorBlockedAt: null,
+    }),
+  ]);
+
+  assert.match(section(WAITING_LABEL).textContent, /1 event queued/);
+  assert.match(section(BLOCKED_LABEL).textContent, /1 event blocked/);
+  assert.ok(
+    !/oldest/i.test(container.textContent),
+    `no age may be invented: ${container.textContent}`,
+  );
+  assert.ok(!/1d/.test(container.textContent));
 });

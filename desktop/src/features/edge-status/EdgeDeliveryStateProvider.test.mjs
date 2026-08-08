@@ -114,6 +114,7 @@ function statesHandler(statesById) {
       .map((id) => ({
         eventId: id,
         state: statesById[id].state,
+        carriedByDigest: statesById[id].carriedByDigest ?? false,
         demotionReason: statesById[id].demotionReason ?? null,
       }));
   };
@@ -310,6 +311,45 @@ test("a stuck own message is badged and a synced one is not", async () => {
   assert.match(badges[0].getAttribute("title"), /rejected upstream/);
 });
 
+/**
+ * BUG-023, through the same seam the operator sees: sidecar reply -> parser ->
+ * lookup entry -> `MessageDeliveryStatus` -> badge. Both rows are
+ * `quarantined`, so the label alone cannot separate them; only the flag can,
+ * and it has to survive every hop. The quarantine list already draws this
+ * distinction, and the badge disagreeing with it about one row is the bug.
+ */
+test("a quarantined row the digest is carrying is badged differently", async () => {
+  const stuck = eventId(1);
+  const carried = eventId(2);
+  invokeHandler = statesHandler({
+    [stuck]: { state: "quarantined", demotionReason: null },
+    [carried]: {
+      state: "quarantined",
+      carriedByDigest: true,
+      demotionReason: "permanently rejected upstream",
+    },
+  });
+
+  await renderRows([{ eventId: stuck }, { eventId: carried }]);
+
+  const badges = [
+    ...container.querySelectorAll('[data-testid="message-delivery-state"]'),
+  ];
+  assert.equal(badges.length, 2, "neither row has reached canonical history");
+  assert.equal(badges[0].textContent, deliveryLabel("quarantined"));
+  assert.equal(badges[1].textContent, deliveryLabel("quarantined", true));
+  assert.notEqual(
+    badges[1].textContent,
+    badges[0].textContent,
+    "the flag never reached the badge: one row, two surfaces, two answers",
+  );
+  assert.match(
+    badges[1].getAttribute("title"),
+    /nothing to retry/i,
+    "and the hover copy has to say there is nothing to do",
+  );
+});
+
 test("every not-yet-synced state is badged with its own label", async () => {
   const pending = eventId(1);
   const viaDigest = eventId(2);
@@ -386,6 +426,7 @@ test("one failed chunk does not discard the chunks that answered", async () => {
     return args.eventIds.map((id) => ({
       eventId: id,
       state: "quarantined",
+      carriedByDigest: false,
       demotionReason: null,
     }));
   };
@@ -487,7 +528,12 @@ test("unmounting schedules no flush the provider will never run", async () => {
 test("a state this build predates renders no badge rather than a broken one", async () => {
   const unknown = eventId(1);
   invokeHandler = () => [
-    { eventId: unknown, state: "teleported", demotionReason: null },
+    {
+      eventId: unknown,
+      state: "teleported",
+      carriedByDigest: false,
+      demotionReason: null,
+    },
   ];
 
   await renderRows([{ eventId: unknown }]);

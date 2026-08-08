@@ -159,10 +159,86 @@ test("quarantined reads as a failure, not as delivered", () => {
   assert.notEqual(label, deliveryLabel(WIRE.syncedExact));
 });
 
-test("allDeliveryLabels matches the per-state labels", () => {
-  assert.deepEqual(
-    allDeliveryLabels(),
-    EDGE_DELIVERY_STATES.map((state) => deliveryLabel(state)),
+/**
+ * BUG-023. The quarantine list flags a row `carriedByDigest` and drops its
+ * Retry button, because the sidecar refuses that retry: the edge identity is
+ * already carrying the event upstream in a catch-up digest. The badge for the
+ * same event could only say "Sync failed" — the same words a genuinely stuck
+ * row gets, and the opposite advice.
+ */
+test("a quarantined row the digest is carrying does not read as stuck", () => {
+  const stuck = deliveryLabel(WIRE.quarantined);
+  const carried = deliveryLabel(WIRE.quarantined, true);
+
+  assert.notEqual(
+    carried,
+    stuck,
+    "the two rows need different words, or the badge cannot say which is which",
+  );
+  // Both halves have to be there: the replay failed AND the digest has it.
+  assert.match(carried, /failed/i, "the exact replay did fail; do not hide it");
+  assert.match(carried, /digest/i, "and the digest is carrying it");
+
+  // Red is this app's "act now" colour and there is nothing to act on.
+  assert.equal(deliveryTone(WIRE.quarantined), "destructive");
+  assert.notEqual(deliveryTone(WIRE.quarantined, true), "destructive");
+  assert.ok(BADGE_VARIANTS.has(deliveryTone(WIRE.quarantined, true)));
+
+  // The hover copy says what to do, which is nothing.
+  const description = deliveryDescription(
+    WIRE.quarantined,
+    "permanently rejected upstream",
+    true,
+  );
+  assert.match(description, /nothing to retry/i);
+  assert.match(
+    description,
+    /permanently rejected upstream/,
+    "the demotion reason still reaches the tooltip",
+  );
+  assert.notEqual(description, deliveryDescription(WIRE.quarantined, null));
+});
+
+/**
+ * The flag is the sidecar's, not this module's guess. Every state has to accept
+ * it, and the five whose labels already say where the event went must not
+ * change — a second spelling of "via digest" is how two surfaces drift apart.
+ */
+test("the digest flag changes only the state whose label was ambiguous", () => {
+  for (const state of EDGE_DELIVERY_STATES) {
+    if (state === WIRE.quarantined) continue;
+    assert.equal(
+      deliveryLabel(state, true),
+      deliveryLabel(state),
+      `${state} already says what it is; the flag must not restate it`,
+    );
+    assert.equal(deliveryTone(state, true), deliveryTone(state));
+  }
+
+  // An unreadable state stays neutral rather than borrowing the carried copy.
+  assert.equal(deliveryLabel("brandNewState", true), UNKNOWN_DELIVERY_LABEL);
+  assert.equal(deliveryTone("brandNewState", true), UNKNOWN_DELIVERY_TONE);
+
+  // And the predicate answers for a quarantined row too, which is the whole
+  // fact that could not be read off the state before.
+  assert.equal(isCarriedByDigest(WIRE.quarantined, true), true);
+  assert.equal(isCarriedByDigest(WIRE.quarantined), false);
+  assert.equal(isCarriedByDigest("brandNewState", true), false);
+});
+
+test("allDeliveryLabels covers the carried variants too", () => {
+  const labels = allDeliveryLabels();
+  for (const state of EDGE_DELIVERY_STATES) {
+    assert.ok(labels.includes(deliveryLabel(state)), `${state} label listed`);
+    assert.ok(
+      labels.includes(deliveryLabel(state, true)),
+      `${state} carried-by-digest label listed`,
+    );
+  }
+  assert.equal(
+    new Set(labels).size,
+    labels.length,
+    `every label this module produces is distinct, got ${JSON.stringify(labels)}`,
   );
 });
 

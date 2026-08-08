@@ -90,11 +90,23 @@ const GOOD_WAITING = {
   ancestorBlocked: 5,
   pendingViaDigest: 9,
   oldestPendingAt: 1_780_000_000,
+  oldestClaimableAt: 1_780_000_400,
+  oldestAncestorBlockedAt: 1_780_000_200,
 };
 
 /** One delivery-state row in the sidecar's object shape. */
-function deliveryRow(eventId, state, demotionReason = null) {
-  return { eventId, state, demotionReason };
+function deliveryRow(
+  eventId,
+  state,
+  demotionReason = null,
+  carriedByDigest = false,
+) {
+  return { eventId, state, carriedByDigest, demotionReason };
+}
+
+/** The parsed entry a `deliveryRow` with these arguments turns into. */
+function deliveryEntry(state, demotionReason = null, carriedByDigest = false) {
+  return { state, carriedByDigest, demotionReason };
 }
 
 async function assertShapeError(promiseFactory, expectedFragment) {
@@ -141,8 +153,8 @@ test("event delivery states turn rows into a lookup", async () => {
     deliveryRow(CHANNEL, "syncedViaDigest"),
   ]);
   assert.deepEqual(await fetchEdgeEventDeliveryStates([EVENT_ID, CHANNEL]), {
-    [EVENT_ID]: { state: "pending", demotionReason: null },
-    [CHANNEL]: { state: "syncedViaDigest", demotionReason: null },
+    [EVENT_ID]: deliveryEntry("pending"),
+    [CHANNEL]: deliveryEntry("syncedViaDigest"),
   });
   assert.deepEqual(calls[0].args, { eventIds: [EVENT_ID, CHANNEL] });
 });
@@ -183,10 +195,65 @@ test("a demoted row carries the reason it was demoted", async () => {
  * deferred event and look exactly like a normal undemoted row.
  */
 test("a delivery row without a demotionReason key is a shape error", async () => {
-  stubInvoke(() => [{ eventId: EVENT_ID, state: "pending" }]);
+  // Every other required field is present, so this fails for the reason the
+  // test is named for rather than incidentally.
+  stubInvoke(() => [
+    { eventId: EVENT_ID, state: "pending", carriedByDigest: false },
+  ]);
   await assertShapeError(
     () => fetchEdgeEventDeliveryStates([EVENT_ID]),
     /'demotionReason' is missing/,
+  );
+});
+
+/**
+ * BUG-023. The quarantine list has always been told that a row is on the digest
+ * path; the badge for that same event was not, so one surface said "already on
+ * its way upstream, the refused retry was correct" while the other said only
+ * "Sync failed". The flag has to reach the badge for the two to agree.
+ */
+test("a quarantined row carries whether the digest is already taking it", async () => {
+  const CARRIED = `2${EVENT_ID.slice(1)}`;
+  stubInvoke(() => [
+    deliveryRow(EVENT_ID, "quarantined", null, false),
+    deliveryRow(CARRIED, "quarantined", "permanently rejected upstream", true),
+  ]);
+
+  const lookup = await fetchEdgeEventDeliveryStates([EVENT_ID, CARRIED]);
+  assert.equal(
+    lookup[EVENT_ID].state,
+    lookup[CARRIED].state,
+    "the label alone cannot tell the two apart, which is the point",
+  );
+  assert.equal(lookup[EVENT_ID].carriedByDigest, false);
+  assert.equal(lookup[CARRIED].carriedByDigest, true);
+});
+
+/**
+ * Required, never defaulted. `false` is the alarming reading — "this event is
+ * stuck and you should do something" — so inferring it from silence would put
+ * the disagreement back on screen the moment a sidecar dropped the key.
+ */
+test("a delivery row without carriedByDigest is a shape error", async () => {
+  stubInvoke(() => [
+    { eventId: EVENT_ID, state: "quarantined", demotionReason: null },
+  ]);
+  await assertShapeError(
+    () => fetchEdgeEventDeliveryStates([EVENT_ID]),
+    /'carriedByDigest' must be a boolean/,
+  );
+
+  stubInvoke(() => [
+    {
+      eventId: EVENT_ID,
+      state: "quarantined",
+      carriedByDigest: "yes",
+      demotionReason: null,
+    },
+  ]);
+  await assertShapeError(
+    () => fetchEdgeEventDeliveryStates([EVENT_ID]),
+    /'carriedByDigest' must be a boolean, got string/,
   );
 });
 
@@ -413,6 +480,46 @@ test("a waiting-author row must carry all three stall counts", async () => {
   assert.equal(row.pending, 1);
   assert.equal(row.ancestorBlocked, 2);
   assert.equal(row.pendingViaDigest, 3);
+});
+
+/**
+ * BUG-023's second half. `oldestPendingAt` is one `MIN(received_at)` across all
+ * three buckets, so printing it beside a count claims an age that count may not
+ * have — "oldest waiting 7d" for an author whose only claimable row arrived a
+ * minute ago, because a digest row nobody is waiting for is a week old. Each
+ * count now travels with its own age, and the parser must not let either of
+ * them be inferred back from the aggregate.
+ */
+test("each waiting-author count carries its own age", async () => {
+  stubInvoke(() => [{ ...GOOD_WAITING }]);
+  const [row] = await fetchEdgeWaitingAuthors();
+  assert.equal(row.oldestClaimableAt, 1_780_000_400);
+  assert.equal(row.oldestAncestorBlockedAt, 1_780_000_200);
+  assert.notEqual(
+    row.oldestClaimableAt,
+    row.oldestPendingAt,
+    "a per-bucket age that merely echoes the aggregate is the bug",
+  );
+
+  // Absent is version skew, not an empty bucket: reading it as `null` would
+  // send the UI back to the aggregate it stopped using.
+  for (const dropped of ["oldestClaimableAt", "oldestAncestorBlockedAt"]) {
+    const partial = { ...GOOD_WAITING };
+    delete partial[dropped];
+    stubInvoke(() => [partial]);
+    await assertShapeError(fetchEdgeWaitingAuthors, new RegExp(`'${dropped}'`));
+  }
+
+  // An explicit null is the sidecar saying "that bucket is empty".
+  stubInvoke(() => [
+    { ...GOOD_WAITING, ancestorBlocked: 0, oldestAncestorBlockedAt: null },
+  ]);
+  const [empty] = await fetchEdgeWaitingAuthors();
+  assert.equal(empty.oldestAncestorBlockedAt, null);
+
+  // And a non-integer age is still a broken producer, not a small one.
+  stubInvoke(() => [{ ...GOOD_WAITING, oldestClaimableAt: "soon" }]);
+  await assertShapeError(fetchEdgeWaitingAuthors, /'oldestClaimableAt'/);
 });
 
 /**

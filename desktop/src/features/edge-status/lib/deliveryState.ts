@@ -65,6 +65,49 @@ const DELIVERY_TONES: Record<EdgeDeliveryStateKey, DeliveryTone> = {
   quarantined: "destructive",
 };
 
+/**
+ * What changes when the sidecar also says the digest is carrying this row.
+ *
+ * One entry per state, holding label + tone + description together, so the
+ * three cannot drift apart — a warning-toned badge still reading "Sync failed"
+ * would be worse than either alone.
+ *
+ * Only `quarantined` is here, and that is the whole point of the flag. For the
+ * other five states it adds nothing a reader does not already have:
+ * `pendingViaDigest` and `syncedViaDigest` say "digest" in their own labels,
+ * and `pending` / `claimed` / `syncedExact` are by definition not on the digest
+ * path. A quarantined row is the one case where the label alone is ambiguous
+ * and, until BUG-023, wrong: the quarantine list could say "the edge is already
+ * carrying this upstream, the refused retry was correct, nothing to do" while
+ * the badge for the same event said "Sync failed" — which reads as stuck.
+ *
+ * The tone moves off `destructive` deliberately. Red is the app's "act now"
+ * colour and there is nothing to act on here; amber matches how the quarantine
+ * list already draws these rows.
+ */
+const CARRIED_BY_DIGEST_OVERRIDES: Partial<
+  Record<
+    EdgeDeliveryStateKey,
+    { label: string; tone: DeliveryTone; description: string }
+  >
+> = {
+  quarantined: {
+    label: "Sync failed, carried by digest",
+    tone: "warning",
+    description:
+      "Its own replay was refused upstream, so this machine is carrying it to canonical history inside a catch-up digest instead. There is nothing to retry.",
+  },
+};
+
+/** The override in force for a state, or `null` when nothing changes. */
+function carriedOverride(state: unknown, carriedByDigest: boolean) {
+  if (!carriedByDigest) {
+    return null;
+  }
+  const key = edgeDeliveryStateKey(state);
+  return key === null ? null : (CARRIED_BY_DIGEST_OVERRIDES[key] ?? null);
+}
+
 const DELIVERY_DESCRIPTIONS: Record<EdgeDeliveryStateKey, string> = {
   pending: "Everyone on this machine has it. Not in canonical history yet.",
   pendingViaDigest:
@@ -91,14 +134,29 @@ export function coerceDeliveryState(value: unknown): EdgeDeliveryState | null {
  * The canonical-history label for a delivery state. `pending` reads
  * "Delivered locally" precisely because local delivery already happened and
  * the upstream sync has not.
+ *
+ * @param carriedByDigest the sidecar's `carriedByDigest` for this same row.
+ *   Pass it whenever you have it: for a quarantined row it is the difference
+ *   between "this is stuck" and "this is handled".
  */
-export function deliveryLabel(state: unknown): string {
+export function deliveryLabel(state: unknown, carriedByDigest = false): string {
+  const override = carriedOverride(state, carriedByDigest);
+  if (override !== null) {
+    return override.label;
+  }
   const key = edgeDeliveryStateKey(state);
   return key === null ? UNKNOWN_DELIVERY_LABEL : DELIVERY_LABELS[key];
 }
 
 /** Badge tone for a delivery state, from the repo's existing variant set. */
-export function deliveryTone(state: unknown): DeliveryTone {
+export function deliveryTone(
+  state: unknown,
+  carriedByDigest = false,
+): DeliveryTone {
+  const override = carriedOverride(state, carriedByDigest);
+  if (override !== null) {
+    return override.tone;
+  }
   const key = edgeDeliveryStateKey(state);
   return key === null ? UNKNOWN_DELIVERY_TONE : DELIVERY_TONES[key];
 }
@@ -115,12 +173,18 @@ export function deliveryTone(state: unknown): DeliveryTone {
 export function deliveryDescription(
   state: unknown,
   demotionReason?: string | null,
+  carriedByDigest = false,
 ): string {
+  const override = carriedOverride(state, carriedByDigest);
   const key = edgeDeliveryStateKey(state);
-  const base =
-    key === null
-      ? "This build does not recognise the state the edge sidecar reported."
-      : DELIVERY_DESCRIPTIONS[key];
+  let base: string;
+  if (override !== null) {
+    base = override.description;
+  } else if (key === null) {
+    base = "This build does not recognise the state the edge sidecar reported.";
+  } else {
+    base = DELIVERY_DESCRIPTIONS[key];
+  }
   const reason =
     typeof demotionReason === "string" ? demotionReason.trim() : "";
   return reason.length === 0 ? base : `${base} Reason: ${reason}`;
@@ -146,20 +210,41 @@ export function isLocalOnly(state: unknown): boolean {
 }
 
 /**
- * True when the event is queued but NO author can move it: this machine's edge
- * identity carries it upstream in a digest instead.
+ * True when NO author can move this event: this machine's edge identity carries
+ * it upstream in a digest instead.
  *
  * Kept separate from `isLocalOnly` because the two answer different questions.
  * Anything summing a "waiting for an author" figure has to exclude these rows
  * — there is no author to wait for.
+ *
+ * `pendingViaDigest` answers it from the state alone. Every other state needs
+ * the sidecar's flag, which is why it is a parameter: a quarantined row on the
+ * digest path is also carried, and reading that off the state was exactly the
+ * thing that could not be done (BUG-023). An unrecognised state still answers
+ * `false` — this build cannot say what such a row is doing.
  */
-export function isCarriedByDigest(state: unknown): boolean {
-  return edgeDeliveryStateKey(state) === "pendingViaDigest";
+export function isCarriedByDigest(
+  state: unknown,
+  carriedByDigest = false,
+): boolean {
+  const key = edgeDeliveryStateKey(state);
+  if (key === null) {
+    return false;
+  }
+  return key === "pendingViaDigest" || carriedByDigest;
 }
 
-/** Every label this module can produce, for exhaustiveness assertions. */
+/**
+ * Every label this module can produce, for exhaustiveness assertions: one per
+ * state, then the digest-carried variants that read differently.
+ */
 export function allDeliveryLabels(): string[] {
-  return EDGE_DELIVERY_STATE_KEYS.map((key) => DELIVERY_LABELS[key]);
+  return [
+    ...EDGE_DELIVERY_STATE_KEYS.map((key) => DELIVERY_LABELS[key]),
+    ...EDGE_DELIVERY_STATE_KEYS.flatMap(
+      (key) => CARRIED_BY_DIGEST_OVERRIDES[key]?.label ?? [],
+    ),
+  ];
 }
 
 const MINUTE_SECONDS = 60;

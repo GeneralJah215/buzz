@@ -101,6 +101,8 @@ const WAITING = [
     ancestorBlocked: 0,
     pendingViaDigest: 4,
     oldestPendingAt: 1_780_000_000,
+    oldestClaimableAt: 1_780_000_400,
+    oldestAncestorBlockedAt: null,
   },
 ];
 

@@ -176,13 +176,42 @@ export type EdgeWaitingAuthor = {
    * so they must never be added into a "waiting for an author" figure.
    */
   pendingViaDigest: number;
-  /** Unix seconds of the oldest queued event for this author. */
+  /**
+   * Unix seconds of the oldest queued event for this author, across ALL three
+   * counts above. It is the author's overall wait and the sidecar's sort key —
+   * never the age to print beside one count, because it can come from a bucket
+   * that count knows nothing about.
+   */
   oldestPendingAt: number;
+  /**
+   * Unix seconds of the oldest row the author can claim right now, or `null`
+   * when `pending` is 0. This is the age that belongs beside `pending`.
+   */
+  oldestClaimableAt: number | null;
+  /**
+   * Unix seconds of the oldest ancestor-blocked row, or `null` when
+   * `ancestorBlocked` is 0. This is the age that belongs beside
+   * `ancestorBlocked` — the aggregate above could be a claimable or
+   * digest-carried row's age, in the one section whose point is that these
+   * events are not waiting for anybody.
+   */
+  oldestAncestorBlockedAt: number | null;
 };
 
 /** One event's delivery label plus the reason it left the exact path. */
 export type EdgeDeliveryStateEntry = {
   state: EdgeDeliveryState;
+  /**
+   * True when this machine's edge identity is already carrying the event
+   * upstream in a catch-up digest — the same fact the quarantine list reports
+   * on `EdgeQuarantinedEvent.carriedByDigest`, for the same row.
+   *
+   * It is what lets a `quarantined` badge say what the quarantine list says:
+   * the event's own replay was refused AND the digest has it, so there is
+   * nothing to do. Without it the badge could only say "Sync failed", which
+   * reads as stuck.
+   */
+  carriedByDigest: boolean;
   /** Why it was demoted, or `null` when it was not. */
   demotionReason: string | null;
 };
@@ -382,6 +411,29 @@ function requireTimestamp(
   return value;
 }
 
+/**
+ * A timestamp field that may be `null` but may NOT be absent, with the same
+ * rule as `requireNullableString`: `null` is the sidecar saying "that bucket is
+ * empty", while a missing key is a sidecar too old to answer. Reading the
+ * second as the first would silently put an unrelated bucket's age back on
+ * screen, which is the defect this field exists to end.
+ */
+function requireNullableTimestamp(
+  source: Record<string, unknown>,
+  field: string,
+  context: string,
+): number | null {
+  if (!Object.hasOwn(source, field)) {
+    throw new EdgeStatusShapeError(
+      `${context}: field '${field}' is missing — 'null' means "nothing queued in that bucket", an absent key means the sidecar never said`,
+    );
+  }
+  if (source[field] === null) {
+    return null;
+  }
+  return requireTimestamp(source, field, context);
+}
+
 /** Narrowing guard over the wire value of a delivery state. */
 export function isEdgeDeliveryState(
   value: unknown,
@@ -432,6 +484,19 @@ function parseWaitingAuthor(raw: unknown, index: number): EdgeWaitingAuthor {
     ancestorBlocked: requireCount(record, "ancestorBlocked", context),
     pendingViaDigest: requireCount(record, "pendingViaDigest", context),
     oldestPendingAt: requireTimestamp(record, "oldestPendingAt", context),
+    // Required, never inferred from the aggregate. Falling back to
+    // `oldestPendingAt` is exactly the substitution that put a digest row's age
+    // beside a count of claimable rows.
+    oldestClaimableAt: requireNullableTimestamp(
+      record,
+      "oldestClaimableAt",
+      context,
+    ),
+    oldestAncestorBlockedAt: requireNullableTimestamp(
+      record,
+      "oldestAncestorBlockedAt",
+      context,
+    ),
   };
 }
 
@@ -466,6 +531,14 @@ function parseDeliveryStateLookup(raw: unknown): EdgeDeliveryStateLookup {
       );
     }
     const state = requireString(record, "state", rowContext);
+    // Required, never defaulted: a missing flag read as `false` would badge a
+    // quarantined row the digest is already carrying as plain "Sync failed",
+    // which is the disagreement with the quarantine list this field ends.
+    const carriedByDigest = requireBoolean(
+      record,
+      "carriedByDigest",
+      rowContext,
+    );
     const demotionReason = requireNullableString(
       record,
       "demotionReason",
@@ -482,7 +555,11 @@ function parseDeliveryStateLookup(raw: unknown): EdgeDeliveryStateLookup {
     Object.defineProperty(lookup, eventId, {
       configurable: true,
       enumerable: true,
-      value: { state, demotionReason } satisfies EdgeDeliveryStateEntry,
+      value: {
+        state,
+        carriedByDigest,
+        demotionReason,
+      } satisfies EdgeDeliveryStateEntry,
       writable: true,
     });
   });
