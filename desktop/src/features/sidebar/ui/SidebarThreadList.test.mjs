@@ -11,6 +11,7 @@ import {
   ThreadDirectoryRow,
   ThreadDirectoryResults,
   legacySidebarThreadItems,
+  localRenameDraftTransition,
   threadDirectoryActionPatch,
   threadDirectoryCanTogglePin,
   threadDirectoryNavigationSearch,
@@ -18,6 +19,10 @@ import {
   threadDirectoryRenameValidationMessage,
   stopSidebarThreadInteraction,
 } from "./SidebarThreadList.tsx";
+import {
+  localThreadNameIsValid,
+  resolveLocalThreadName,
+} from "../lib/localThreadNames.ts";
 
 const UI_SOURCE = await readFile(
   new URL("./SidebarThreadList.tsx", import.meta.url),
@@ -302,6 +307,188 @@ test("navigation and pointer guards preserve thread routing and channel isolatio
     },
   });
   assert.equal(stopped, 1);
+});
+
+const LEGACY_ITEMS = [
+  { rootId: ROOT_ID, title: "Derived first line", lastReplyAt: 200 },
+];
+
+function renderLegacy(overrides = {}) {
+  return renderToStaticMarkup(
+    React.createElement(LegacySidebarThreadList, {
+      items: LEGACY_ITEMS,
+      onNavigate() {},
+      ...overrides,
+    }),
+  );
+}
+
+/** The unsupported-relay branch, where the machine-local rename dialog lives. */
+const LOCAL_BRANCH_SOURCE = UI_SOURCE.slice(
+  UI_SOURCE.indexOf("if (directory.isUnsupported)"),
+  UI_SOURCE.indexOf("<fieldset"),
+);
+
+test("the local rename control renders with a label and a keyboard-reachable style", () => {
+  const html = renderLegacy({ onRename() {} });
+  assert.match(html, /aria-label="Rename Derived first line"/);
+  // `hidden` is display:none, which drops the button out of the tab order
+  // entirely — the focus ring can never fire and a keyboard-only user can
+  // never rename a thread. Reveal must be opacity-based and must respond to
+  // focus as well as hover.
+  const pencil =
+    /<button[^>]*aria-label="Rename Derived first line"[^>]*>/.exec(html)[0];
+  const pencilClasses = /class="([^"]*)"/.exec(pencil)[1].split(/\s+/);
+  assert.ok(
+    !pencilClasses.includes("hidden"),
+    "display:none removes the rename control from the tab order",
+  );
+  assert.ok(pencilClasses.includes("group-hover/thread:opacity-100"));
+  assert.ok(pencilClasses.includes("group-focus-within/thread:opacity-100"));
+  assert.ok(pencilClasses.includes("focus-visible:ring-2"));
+
+  // No rename callback (read-only contexts) means no control at all.
+  assert.doesNotMatch(renderLegacy(), /aria-label="Rename /);
+});
+
+test("the local rename control reserves its column instead of covering the title", () => {
+  // The pencil is absolutely positioned at right-1 over a 24px box. Without a
+  // right-padding reserve a long title's ellipsis renders underneath it, the
+  // same reason ThreadDirectoryRow uses pl-2 pr-8.
+  const withRename = /<button[^>]*class="([^"]*)"[^>]*type="button"/.exec(
+    renderLegacy({ onRename() {} }),
+  )[1];
+  assert.match(withRename, /\bpr-8\b/);
+  assert.doesNotMatch(withRename, /\bpx-2\b/);
+});
+
+test("a machine-local name replaces the derived label everywhere it is shown", () => {
+  const html = renderLegacy({
+    localNames: { [ROOT_ID]: "Dungeon planning" },
+    onRename() {},
+  });
+  assert.match(html, /Dungeon planning/);
+  assert.doesNotMatch(html, /Derived first line/);
+  // The tooltip, the visible text, and the rename control's label all follow.
+  assert.match(html, /title="Dungeon planning"/);
+  assert.match(html, /aria-label="Rename Dungeon planning"/);
+
+  // A name set on a different thread must not bleed onto this row.
+  const otherOnly = renderLegacy({
+    localNames: { ["f".repeat(64)]: "Somebody else's label" },
+  });
+  assert.match(otherOnly, /Derived first line/);
+  assert.doesNotMatch(otherOnly, /Somebody else's label/);
+});
+
+test("a shared thread name still wins over a machine-local one", () => {
+  // The shared name is what everyone in the channel sees. A relay that can
+  // serve the directory renders it, and the local override never applies.
+  assert.equal(resolveLocalThreadName("Shared", "Local", "Derived"), "Shared");
+  const itemHtml = renderResults({ items: [ITEM] });
+  assert.match(itemHtml, /Shared thread title/);
+  assert.doesNotMatch(itemHtml, /Generated thread title/);
+  // The directory row has no local-name input at all, structurally.
+  const directoryRowSource = UI_SOURCE.slice(
+    UI_SOURCE.indexOf("export function ThreadDirectoryRow"),
+    UI_SOURCE.indexOf("export function ThreadDirectoryResults"),
+  );
+  assert.ok(directoryRowSource.length > 0);
+  assert.doesNotMatch(directoryRowSource, /localNames/);
+});
+
+test("the local rename draft never carries one thread's text onto another", () => {
+  const first = localRenameDraftTransition(null, {
+    type: "open",
+    rootId: ROOT_ID,
+    currentName: "Half-typed name",
+  });
+  assert.deepEqual(first, { rootId: ROOT_ID, name: "Half-typed name" });
+
+  const otherRoot = "f".repeat(64);
+  const second = localRenameDraftTransition(first, {
+    type: "open",
+    rootId: otherRoot,
+    currentName: "",
+  });
+  assert.deepEqual(
+    second,
+    { rootId: otherRoot, name: "" },
+    "reopening rebuilds the draft from the row that was clicked",
+  );
+
+  // Cancel/dismiss discards the draft rather than leaving it to reappear.
+  assert.equal(localRenameDraftTransition(second, { type: "close" }), null);
+  assert.equal(localRenameDraftTransition(null, { type: "close" }), null);
+
+  // And the component routes both through it instead of setting state inline.
+  assert.match(
+    LOCAL_BRANCH_SOURCE,
+    /onRename=\{[\s\S]*localRenameDraftTransition\(draft, \{\s*type: "open"/,
+  );
+  assert.equal(
+    (
+      LOCAL_BRANCH_SOURCE.match(
+        /localRenameDraftTransition\(draft, \{ type: "close" \}\)/g,
+      ) ?? []
+    ).length,
+    2,
+    "both the dialog dismiss and the Cancel button clear the draft",
+  );
+});
+
+test("the local rename dialog is labelled and announces its own error", () => {
+  // The sibling shared dialog in this file does all of this; the local one
+  // shipped with a bare Input and an unannounced validation paragraph.
+  assert.match(LOCAL_BRANCH_SOURCE, /htmlFor=\{renameInputId\}/);
+  assert.match(LOCAL_BRANCH_SOURCE, /id=\{renameInputId\}/);
+  assert.match(
+    LOCAL_BRANCH_SOURCE,
+    /aria-describedby=\{[\s\S]*renameValidationId/,
+  );
+  assert.match(LOCAL_BRANCH_SOURCE, /aria-invalid=\{/);
+  assert.match(
+    LOCAL_BRANCH_SOURCE,
+    /id=\{renameValidationId\}\s*\n\s*role="alert"/,
+  );
+  // maxLength counts UTF-16 units, so a 120 cap stops an emoji typist at 60.
+  assert.match(
+    LOCAL_BRANCH_SOURCE,
+    /maxLength=\{MAX_LOCAL_THREAD_NAME_LENGTH \* 2\}/,
+  );
+});
+
+test("the local name validator agrees with the shared rename validator", () => {
+  // A local name is promotable to a shared one the day the relay supports it,
+  // so the two rules must not disagree in either direction.
+  const corpus = [
+    "Normal name",
+    "",
+    "   ",
+    "line one\nline two",
+    "bell\u0007",
+    "line\u2028separator",
+    "paragraph\u2029separator",
+    "next\u0085line",
+    "csi\u009bescape",
+    "delete\u007fcharacter",
+    "lone \ud800 surrogate",
+    "🎲".repeat(100),
+    "🎲".repeat(120),
+    "🎲".repeat(121),
+    "x".repeat(120),
+    "x".repeat(121),
+  ];
+  for (const value of corpus) {
+    assert.equal(
+      localThreadNameIsValid(value),
+      threadDirectoryRenameValidationMessage(value) === null,
+      `validators disagree on ${JSON.stringify(value)}`,
+    );
+  }
+  // Spot-check the two directions the review actually caught.
+  assert.equal(localThreadNameIsValid("csi\u009bescape"), false);
+  assert.equal(localThreadNameIsValid("🎲".repeat(100)), true);
 });
 
 test("production JSX wires navigation, drag isolation, and mutation rollback errors", () => {

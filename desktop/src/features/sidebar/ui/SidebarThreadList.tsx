@@ -147,7 +147,12 @@ export function LegacySidebarThreadList({
         return (
           <li key={item.rootId} className="group/thread relative">
             <button
-              className="flex h-8 w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs text-sidebar-foreground/80 outline-hidden transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+              className={cn(
+                "flex h-8 w-full min-w-0 items-center gap-1.5 rounded-md py-1 pl-2 text-left text-xs text-sidebar-foreground/80 outline-hidden transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring",
+                // Reserve the pencil's column, as ThreadDirectoryRow does, or a
+                // long title's ellipsis renders underneath the button.
+                onRename ? "pr-8" : "pr-2",
+              )}
               onClick={() => onNavigate(item.rootId)}
               type="button"
             >
@@ -164,7 +169,13 @@ export function LegacySidebarThreadList({
             {onRename ? (
               <button
                 aria-label={`Rename ${label}`}
-                className="absolute right-1 top-1 hidden h-6 w-6 items-center justify-center rounded-sm text-sidebar-foreground/60 outline-hidden transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring group-hover/thread:flex"
+                // Revealed on hover AND on keyboard focus. `hidden` is
+                // display:none, which takes the button out of the tab order
+                // entirely — its focus ring could never fire and a keyboard-only
+                // or screen-reader user could never rename a thread. Same
+                // hover/focus-within pairing as ChannelBrowserDialog and
+                // MembersSidebarMemberCard.
+                className="pointer-events-none absolute right-1 top-1 flex h-6 w-6 items-center justify-center rounded-sm text-sidebar-foreground/60 opacity-0 outline-hidden transition-[opacity,background-color,color] duration-150 ease-out hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring group-hover/thread:pointer-events-auto group-hover/thread:opacity-100 group-focus-within/thread:pointer-events-auto group-focus-within/thread:opacity-100"
                 onClick={(event) => {
                   stopSidebarThreadInteraction(event);
                   onRename(item.rootId, local ?? "");
@@ -245,6 +256,27 @@ export function stopSidebarThreadInteraction(event: {
   stopPropagation: () => void;
 }) {
   event.stopPropagation();
+}
+
+export type LocalRenameDraft = { rootId: string; name: string };
+
+/**
+ * Open/close transition for the machine-local rename dialog.
+ *
+ * Opening always rebuilds the draft from the row that was clicked, and closing
+ * always discards it — so thread A's half-typed name can never appear in the
+ * dialog when thread B is reopened. It is a function rather than an inline
+ * setState because the test runner has no DOM: extracting the transition is
+ * the only way to pin the no-leak rule with a test that fails if it breaks.
+ */
+export function localRenameDraftTransition(
+  _draft: LocalRenameDraft | null,
+  action:
+    | { type: "open"; rootId: string; currentName: string }
+    | { type: "close" },
+): LocalRenameDraft | null {
+  if (action.type === "close") return null;
+  return { rootId: action.rootId, name: action.currentName };
 }
 
 export function SidebarThreadDisclosure({ channel }: { channel: Channel }) {
@@ -553,10 +585,8 @@ export function SidebarThreadList({
     () =>
       loadLocalThreadNames(localNamesScope.pubkey, localNamesScope.relayUrl),
   );
-  const [localRenameDraft, setLocalRenameDraft] = React.useState<{
-    rootId: string;
-    name: string;
-  } | null>(null);
+  const [localRenameDraft, setLocalRenameDraft] =
+    React.useState<LocalRenameDraft | null>(null);
   // Reload when the identity or relay changes: names are scoped to that pair,
   // and carrying one community's labels into another would be wrong.
   React.useEffect(() => {
@@ -604,13 +634,23 @@ export function SidebarThreadList({
             void goChannel(channelId, threadDirectoryNavigationSearch(rootId));
           }}
           onRename={(rootId, currentName) =>
-            setLocalRenameDraft({ rootId, name: currentName })
+            setLocalRenameDraft((draft) =>
+              localRenameDraftTransition(draft, {
+                type: "open",
+                rootId,
+                currentName,
+              }),
+            )
           }
         />
         <Dialog
           open={localRenameDraft !== null}
           onOpenChange={(open) => {
-            if (!open) setLocalRenameDraft(null);
+            if (!open) {
+              setLocalRenameDraft((draft) =>
+                localRenameDraftTransition(draft, { type: "close" }),
+              );
+            }
           }}
         >
           <DialogContent className="sm:max-w-md">
@@ -621,32 +661,52 @@ export function SidebarThreadList({
                 thread names, so nobody else will see it.
               </DialogDescription>
             </DialogHeader>
-            <Input
-              autoFocus
-              maxLength={MAX_LOCAL_THREAD_NAME_LENGTH}
-              onChange={(event) =>
-                setLocalRenameDraft((draft) =>
-                  draft ? { ...draft, name: event.target.value } : draft,
-                )
-              }
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && localRenameIsValid) {
-                  event.preventDefault();
-                  saveLocalRename();
+            <label className="space-y-1.5 text-sm" htmlFor={renameInputId}>
+              <span>Thread name</span>
+              <Input
+                aria-describedby={
+                  localRenameIsValid ? undefined : renameValidationId
                 }
-              }}
-              placeholder="Leave empty to restore the original name"
-              value={localRenameDraft?.name ?? ""}
-            />
+                aria-invalid={localRenameIsValid ? undefined : true}
+                autoFocus
+                id={renameInputId}
+                // UTF-16 units, not characters: the real cap is 120 code
+                // points, and one emoji costs two units. Capping at 120 here
+                // would stop an emoji-typing user dead at 60. The validator
+                // enforces the true bound; this is only a runaway-paste stop.
+                maxLength={MAX_LOCAL_THREAD_NAME_LENGTH * 2}
+                onChange={(event) =>
+                  setLocalRenameDraft((draft) =>
+                    draft ? { ...draft, name: event.target.value } : draft,
+                  )
+                }
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && localRenameIsValid) {
+                    event.preventDefault();
+                    saveLocalRename();
+                  }
+                }}
+                placeholder="Leave empty to restore the original name"
+                value={localRenameDraft?.name ?? ""}
+              />
+            </label>
             {!localRenameIsValid ? (
-              <p className="text-xs text-destructive">
+              <p
+                className="text-xs text-destructive"
+                id={renameValidationId}
+                role="alert"
+              >
                 Thread names must be a single line of at most{" "}
                 {MAX_LOCAL_THREAD_NAME_LENGTH} characters.
               </p>
             ) : null}
             <DialogFooter>
               <Button
-                onClick={() => setLocalRenameDraft(null)}
+                onClick={() =>
+                  setLocalRenameDraft((draft) =>
+                    localRenameDraftTransition(draft, { type: "close" }),
+                  )
+                }
                 type="button"
                 variant="ghost"
               >
