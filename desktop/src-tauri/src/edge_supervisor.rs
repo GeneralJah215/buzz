@@ -31,14 +31,24 @@
 //! here:
 //!
 //! * every repair and every spawn is capped at [`MAX_REPAIR_ATTEMPTS`]
-//!   consecutive failures, counted in a **persisted** ledger, after which the
-//!   supervisor gives up and says so exactly once;
+//!   consecutive failures, counted in a **persisted** ledger that is written
+//!   **before** the effect it counts (see `ledger.rs` for why write-ahead is
+//!   the whole point), after which the supervisor gives up and says so once;
 //! * a repair counts as successful only when a **re-query confirms** it — an
 //!   `Ok(())` from the effect layer is not evidence, which is precisely the
 //!   assumption that produced the 1,316 attempts;
+//! * a spawn counts as successful only when the sidecar **answers healthy**,
+//!   polled up to [`spawn_confirm_window`] because a cold-starting Rust binary
+//!   that opens SQLite and binds a loopback port is not listening the
+//!   microsecond `CreateProcess` returns. Probing once and immediately would
+//!   score every successful launch as a failure and latch `GIVING UP` against
+//!   a spawn path that works;
 //! * [`SidecarHealth::Indeterminate`] is its own outcome and never triggers a
 //!   spawn, and neither does [`SidecarHealth::RunningUnhealthy`] — spawning a
-//!   second copy onto the same loopback port makes a bad state worse.
+//!   second copy onto the same loopback port makes a bad state worse;
+//! * a state that stays unreadable is escalated after
+//!   [`MAX_UNDETERMINED_LAUNCHES`] launches rather than reprinting the same
+//!   line forever, which is the 1,316-restart bug wearing different clothes.
 //!
 //! # Off by default
 //!
@@ -46,14 +56,56 @@
 //! unset [`supervise_launch`] performs **no** task query, **no** probe, **no**
 //! file write and emits **no** log line — an unset variable is exactly today's
 //! canonical-only behavior, which is also the spec's first-line rollback.
+//!
+//! # Unverified: what needs a real machine (do not read these as settled)
+//!
+//! Nothing in this crate registers a scheduled task, so the following are
+//! *open questions*, not passing checks. They are recorded here rather than
+//! guessed at.
+//!
+//! * **S1 — quotes inside `<Command>`.** Both writers put a literal quoted
+//!   path inside `<Command>`, which Task Scheduler documents as a *program
+//!   path* field, with `<Arguments>` absent. If Task Scheduler strips the
+//!   quotes when it stores the definition, the read-back in
+//!   `host::WindowsHost::query_task` sees an unquoted path containing a space,
+//!   [`command_line_matches`] returns false **by design**, and three launches
+//!   latch `GIVING UP` against a task that works perfectly. This is the
+//!   highest-impact unknown here. Verifying it needs one registration on a
+//!   real machine followed by `schtasks /Query /XML`.
+//! * **S2 — element order in `<Settings>`.** Both writers place
+//!   `<RestartOnFailure>` between `<RunOnlyIfNetworkAvailable>` and
+//!   `<AllowStartOnDemand>`; exported task XML places it after `<Priority>`,
+//!   and the task schema is a *sequence*, so order is significant. Because the
+//!   two writers agree with each other, the drift test is green either way —
+//!   it proves agreement, not validity.
+//! * **S3 — task existence by substring.** `query_task` decides existence with
+//!   `listing.contains(task_name)` over every task on the machine. A task
+//!   named `Buzz Edge Sidecar (old)`, a same-named task in a subfolder, or the
+//!   string appearing in another task's fields all read as "exists"; a
+//!   subfolder match then makes the follow-up `/TN` query fail, which returns
+//!   `Unknown` → [`TaskAction::Undetermined`] forever. The escalation added
+//!   for [`MAX_UNDETERMINED_LAUNCHES`] makes that state *loud* instead of
+//!   silent, but it does not fix the matching, which needs a real listing to
+//!   settle.
+//! * **S4 — doubled timeouts in the probe.** [`probe_with_deadline`]'s
+//!   deadline and reqwest's own client timeout are both
+//!   [`READINESS_DEADLINE`], so the outer timeout branch is probably
+//!   unreachable in production, and each timed-out probe leaks a thread plus a
+//!   blocking runtime until the inner timeout expires.
+//! * **S5 — the uninstall taskkill filter.** `windows/edge-task.nsi` scopes
+//!   its `taskkill` with `/FI "USERNAME eq <user>"` read from the environment.
+//!   Whether `taskkill` matches a bare user name or requires `DOMAIN\user` is
+//!   not settled here. If it does not match, the kill is a no-op and the
+//!   scheduled task's `/End` is the only stop — which is the normal case
+//!   anyway. It never widens the kill.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
 pub mod host;
+pub mod ledger;
+
+pub use ledger::{LedgerLoad, SupervisorLedger};
 
 /// Scheduled-task name. MUST stay identical to the `TASK_NAME` define in
 /// `windows/edge-task.nsi`; a test asserts both files agree, because a drift
@@ -74,6 +126,31 @@ pub const READINESS_DEADLINE: Duration = Duration::from_secs(2);
 /// buzz-ops GRD-009. Something that has failed three times in a row is not
 /// going to succeed on the fourth; stop and leave it for a human.
 pub const MAX_REPAIR_ATTEMPTS: u32 = 3;
+
+/// How many consecutive launches may report an unreadable task state before it
+/// is escalated. An unreadable state takes no action, so it is not a failure
+/// cap — it is the point at which "I cannot tell" stops being transient.
+pub const MAX_UNDETERMINED_LAUNCHES: u32 = 5;
+
+/// How many times the post-spawn confirmation probes before giving up, and how
+/// long it waits between probes.
+///
+/// A sidecar that has just been started has to open its SQLite database and
+/// bind a loopback port before it will accept a connection; until it does, the
+/// probe gets ECONNREFUSED, which [`classify_probe_failure`] correctly reports
+/// as [`SidecarHealth::NotRunning`]. Confirming with a single immediate probe
+/// therefore scores **every successful spawn** as a failure. This window runs
+/// on the detached supervision worker (`host::start` spawns it), so waiting
+/// here cannot delay app startup, and the routing decision for this launch was
+/// already taken from the first probe against [`READINESS_DEADLINE`].
+pub const SPAWN_CONFIRM_ATTEMPTS: u32 = 6;
+pub const SPAWN_CONFIRM_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Total time the post-spawn confirmation may take, for the operator-facing
+/// message. Only the gaps between probes are waits, hence `- 1`.
+pub fn spawn_confirm_window() -> Duration {
+    SPAWN_CONFIRM_INTERVAL * (SPAWN_CONFIRM_ATTEMPTS.saturating_sub(1))
+}
 
 /// Persisted ledger file name, stored in the app data directory.
 pub const LEDGER_FILE: &str = "edge-supervisor.json";
@@ -160,6 +237,15 @@ pub enum TaskAction {
     /// The task's state could not be determined, so no repair is attempted.
     /// This is *not* a pass — it is reported and retried at the next launch.
     Undetermined { reason: String },
+    /// The sidecar binary is not on disk, so nothing is registered. A logon
+    /// task pointing at a file that does not exist fails at *every* logon,
+    /// forever, and is exactly the orphan the installer refuses to create.
+    SkippedMissingSidecar { path: PathBuf },
+    /// The write-ahead attempt record could not be persisted, so the repair
+    /// was not attempted. Produced by the orchestration, never by
+    /// [`decide_task_repair`]: an attempt counter that cannot be written is
+    /// not a cap, and acting without one is the unbounded loop.
+    Deferred { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +260,12 @@ pub enum HealthAction {
     Observe { reason: String },
     /// Spawn cap spent.
     GiveUp { attempts: u32 },
+    /// Proven not running, but there is no binary to start. Spawning would
+    /// fail every launch until the cap latched against a fault that is really
+    /// "this build ships no sidecar".
+    SkippedMissingSidecar { path: PathBuf },
+    /// Write-ahead counterpart of [`TaskAction::Deferred`].
+    Deferred { reason: String },
 }
 
 /// Whether message traffic may use the edge on this launch.
@@ -187,7 +279,11 @@ pub enum ReadinessDecision {
 
 /// Decide what to do about the scheduled-task registration.
 ///
-/// Pure. The order matters: a healthy registration is recognised *before* the
+/// Pure. `sidecar_present` is passed in rather than read from the filesystem
+/// so the missing-binary rule is testable; the caller gets it from
+/// [`SupervisorHost::sidecar_exists`].
+///
+/// The order matters: a healthy registration is recognised *before* the
 /// give-up latch is consulted, so a genuine one-off failure still self-heals
 /// once the task is observed correct (GRD-009's "cleared the moment the agent
 /// is heard from again").
@@ -195,6 +291,7 @@ pub fn decide_task_repair(
     registration: &TaskRegistration,
     spec: &TaskSpec,
     ledger: &SupervisorLedger,
+    sidecar_present: bool,
 ) -> TaskAction {
     let reason = match registration {
         TaskRegistration::Unknown { reason } => {
@@ -214,6 +311,14 @@ pub fn decide_task_repair(
         }
     };
 
+    // `schtasks /Create /XML` does not check that the <Command> path exists,
+    // so without this the supervisor happily creates the orphaned logon task
+    // the installer goes out of its way to delete.
+    if !sidecar_present {
+        return TaskAction::SkippedMissingSidecar {
+            path: spec.sidecar_exe.clone(),
+        };
+    }
     if ledger.task_cap_spent() {
         return TaskAction::GiveUp {
             attempts: ledger.task_failures,
@@ -225,8 +330,14 @@ pub fn decide_task_repair(
 /// Decide what to do about the sidecar process.
 ///
 /// Pure, and deliberately conservative: only [`SidecarHealth::NotRunning`] —
-/// a *refused* loopback connection — authorises a spawn.
-pub fn decide_health_action(health: &SidecarHealth, ledger: &SupervisorLedger) -> HealthAction {
+/// a *refused* loopback connection — authorises a spawn, and only when there
+/// is a binary to spawn.
+pub fn decide_health_action(
+    health: &SidecarHealth,
+    ledger: &SupervisorLedger,
+    sidecar_present: bool,
+    sidecar_exe: &Path,
+) -> HealthAction {
     match health {
         SidecarHealth::Healthy => HealthAction::None,
         SidecarHealth::RunningUnhealthy { reason } => HealthAction::ReportUnhealthy {
@@ -236,7 +347,11 @@ pub fn decide_health_action(health: &SidecarHealth, ledger: &SupervisorLedger) -
             reason: reason.clone(),
         },
         SidecarHealth::NotRunning => {
-            if ledger.spawn_cap_spent() {
+            if !sidecar_present {
+                HealthAction::SkippedMissingSidecar {
+                    path: sidecar_exe.to_path_buf(),
+                }
+            } else if ledger.spawn_cap_spent() {
                 HealthAction::GiveUp {
                     attempts: ledger.spawn_failures,
                 }
@@ -324,6 +439,9 @@ pub fn classify_probe_response(status: u16, body: &str) -> SidecarHealth {
 /// by Windows as `C:\Program.exe` with arguments — the classic unquoted
 /// service-path privilege problem. A path that itself contains a double quote
 /// cannot be quoted safely, so it is refused rather than mangled.
+///
+/// The result still has to be XML-escaped before it goes into a task
+/// definition — see [`host::escape_xml_text`]. Quoting is not escaping.
 pub fn quoted_task_command(exe: &Path) -> Result<String, String> {
     let text = exe
         .to_str()
@@ -369,141 +487,6 @@ fn normalize_path(value: &str) -> String {
     value.replace('/', "\\").to_ascii_lowercase()
 }
 
-// ───────────────────────────── ledger ──────────────────────────────
-
-/// Persisted failure state. Persistence is the point: an in-memory counter
-/// resets every launch, and "3 attempts per launch, forever" is still an
-/// unbounded loop across a day of restarts.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SupervisorLedger {
-    /// Consecutive failed task repairs.
-    pub task_failures: u32,
-    /// Latched once the task cap is spent, so `GIVING UP` is logged once.
-    pub task_gave_up: bool,
-    /// App version the task was last confirmed registered for.
-    pub registered_version: Option<String>,
-    /// Consecutive failed sidecar spawns.
-    pub spawn_failures: u32,
-    /// Latched once the spawn cap is spent.
-    pub spawn_gave_up: bool,
-    /// Most recent failure text, for the operator.
-    pub last_failure: Option<String>,
-}
-
-/// A ledger read plus anything that went wrong reading it. The warning is
-/// carried rather than swallowed: a corrupt ledger silently resetting the
-/// failure cap is how a bounded retry becomes an unbounded one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LedgerLoad {
-    pub ledger: SupervisorLedger,
-    pub warning: Option<String>,
-}
-
-impl SupervisorLedger {
-    /// Record a failed task repair.
-    ///
-    /// The `gave_up` latch is deliberately *not* set here. It exists only to
-    /// make `GIVING UP` appear exactly once, and it is set by the reporting
-    /// path (`latch_task_give_up`) at the moment that line is written. Setting
-    /// it here would latch silently and the operator would never be told.
-    pub fn record_task_failure(&mut self, reason: String) {
-        self.task_failures = self.task_failures.saturating_add(1);
-        self.last_failure = Some(reason);
-    }
-
-    /// True once the task cap is spent.
-    pub fn task_cap_spent(&self) -> bool {
-        self.task_gave_up || self.task_failures >= MAX_REPAIR_ATTEMPTS
-    }
-
-    /// True once the spawn cap is spent.
-    pub fn spawn_cap_spent(&self) -> bool {
-        self.spawn_gave_up || self.spawn_failures >= MAX_REPAIR_ATTEMPTS
-    }
-
-    /// Task confirmed registered for `version` — clear the cap.
-    pub fn record_task_success(&mut self, version: &str) {
-        self.task_failures = 0;
-        self.task_gave_up = false;
-        self.registered_version = Some(version.to_string());
-    }
-
-    /// Record a failed spawn. See [`Self::record_task_failure`] for why the
-    /// latch is not set here.
-    pub fn record_spawn_failure(&mut self, reason: String) {
-        self.spawn_failures = self.spawn_failures.saturating_add(1);
-        self.last_failure = Some(reason);
-    }
-
-    /// The sidecar was heard from. Clear the spawn cap.
-    pub fn record_sidecar_healthy(&mut self) {
-        self.spawn_failures = 0;
-        self.spawn_gave_up = false;
-    }
-
-    /// Read the ledger. A missing file is a fresh install; an unreadable or
-    /// corrupt one falls back to a fresh ledger **and** reports why.
-    pub fn load_from(path: &Path) -> LedgerLoad {
-        let raw = match std::fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return LedgerLoad {
-                    ledger: Self::default(),
-                    warning: None,
-                }
-            }
-            Err(error) => {
-                return LedgerLoad {
-                    ledger: Self::default(),
-                    warning: Some(format!(
-                        "edge supervisor ledger unreadable at {}: {error} — failure counters \
-                         restart from zero this launch",
-                        path.display()
-                    )),
-                }
-            }
-        };
-        match serde_json::from_str::<Self>(&raw) {
-            Ok(ledger) => LedgerLoad {
-                ledger,
-                warning: None,
-            },
-            Err(error) => LedgerLoad {
-                ledger: Self::default(),
-                warning: Some(format!(
-                    "edge supervisor ledger at {} is corrupt: {error} — failure counters restart \
-                     from zero this launch",
-                    path.display()
-                )),
-            },
-        }
-    }
-
-    /// Write the ledger atomically. A torn write here would corrupt the exact
-    /// state that bounds the retry loop.
-    pub fn store_to(&self, path: &Path) -> Result<(), String> {
-        use atomic_write_file::AtomicWriteFile;
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                format!(
-                    "create edge supervisor ledger directory {}: {error}",
-                    parent.display()
-                )
-            })?;
-        }
-        let body = serde_json::to_vec_pretty(self)
-            .map_err(|error| format!("serialize edge supervisor ledger: {error}"))?;
-        let mut file = AtomicWriteFile::open(path)
-            .map_err(|error| format!("open {} for atomic write: {error}", path.display()))?;
-        file.write_all(&body)
-            .map_err(|error| format!("write {}: {error}", path.display()))?;
-        file.commit()
-            .map_err(|error| format!("commit {}: {error}", path.display()))
-    }
-}
-
 // ───────────────────────── effects seam + report ─────────────────────────
 
 /// Every effect the supervisor can have on the machine. Production wires
@@ -518,6 +501,14 @@ pub trait SupervisorHost {
     fn probe_health(&self) -> SidecarHealth;
     /// Start the sidecar.
     fn spawn_sidecar(&self, exe: &Path) -> Result<(), String>;
+    /// Whether the sidecar binary is on disk. A required method rather than a
+    /// filesystem call inside the policy, so the missing-binary rule is
+    /// testable without a real install.
+    fn sidecar_exists(&self, exe: &Path) -> bool;
+    /// Wait between post-spawn confirmation probes. A required method rather
+    /// than a `thread::sleep` in the policy, so a test cannot accidentally
+    /// spend real seconds.
+    fn wait_before_reprobe(&self, delay: Duration);
     fn load_ledger(&self) -> LedgerLoad;
     fn store_ledger(&self, ledger: &SupervisorLedger) -> Result<(), String>;
 }
@@ -596,14 +587,27 @@ pub fn supervise_launch<H: SupervisorHost>(host: &H, env: &SupervisorEnv) -> Sup
     supervise_task(host, &spec, &mut ledger, &mut report);
     supervise_health(host, &spec, &mut ledger, &mut report);
 
+    // The *outcome* write. Every attempt was already charged and persisted
+    // before its effect ran, so losing this one can only leave a counter too
+    // high — never too low, which is the direction that unbounds the loop.
     if let Err(error) = host.store_ledger(&ledger) {
-        // Losing the ledger means losing the attempt cap, so this is loud.
         report.guardrail(format!(
-            "could not persist supervisor ledger ({error}); the repair cap is not durable this \
-             launch"
+            "could not persist the supervisor ledger outcome ({error}); attempt counters may read \
+             high until the next successful write"
         ));
     }
     report
+}
+
+/// Charge an attempt and persist it before the effect runs. `Err` carries the
+/// operator message for why the effect is being skipped.
+fn charge_and_persist<H: SupervisorHost>(
+    host: &H,
+    ledger: &mut SupervisorLedger,
+    charge: impl FnOnce(&mut SupervisorLedger),
+) -> Result<(), String> {
+    charge(ledger);
+    host.store_ledger(ledger)
 }
 
 fn supervise_task<H: SupervisorHost>(
@@ -613,30 +617,56 @@ fn supervise_task<H: SupervisorHost>(
     report: &mut SupervisionReport,
 ) {
     let registration = host.query_task(&spec.task_name);
-    let action = decide_task_repair(&registration, spec, ledger);
+    let sidecar_present = host.sidecar_exists(&spec.sidecar_exe);
+    let action = decide_task_repair(&registration, spec, ledger, sidecar_present);
+    if !matches!(action, TaskAction::Undetermined { .. }) {
+        ledger.clear_undetermined();
+    }
     match &action {
         TaskAction::LeaveAlone => {
             ledger.record_task_success(&spec.app_version);
         }
         TaskAction::Undetermined { reason } => {
             // Not a pass. No repair is attempted, and it is said out loud.
+            ledger.charge_undetermined();
             report.guardrail(format!(
                 "scheduled-task state for \"{}\" could not be determined ({reason}); no repair \
                  attempted this launch",
                 spec.task_name
             ));
+            escalate_undetermined(spec, ledger, report);
         }
+        TaskAction::SkippedMissingSidecar { path } => {
+            report.guardrail(format!(
+                "the edge sidecar is not installed at {}; refusing to register a logon task that \
+                 would fail at every logon. Routing stays canonical-only",
+                path.display()
+            ));
+        }
+        // Produced only by the write-ahead branch below, never by the decision.
+        TaskAction::Deferred { .. } => {}
         TaskAction::GiveUp { .. } => latch_task_give_up(spec, ledger, report),
         TaskAction::Register { reason } => {
+            // Write-ahead: the attempt is durable before the effect happens.
+            if let Err(error) =
+                charge_and_persist(host, ledger, SupervisorLedger::charge_task_attempt)
+            {
+                report.guardrail(format!(
+                    "could not persist the scheduled-task repair attempt ({error}); skipping the \
+                     repair this launch. An attempt counter that cannot be written is not a cap, \
+                     and repairing without one is the unbounded retry loop GRD-009 exists to stop"
+                ));
+                report.task_action = Some(TaskAction::Deferred { reason: error });
+                return;
+            }
             report.auto_heal(format!(
                 "repairing scheduled task \"{}\" ({reason:?}), attempt {} of {MAX_REPAIR_ATTEMPTS}",
-                spec.task_name,
-                ledger.task_failures + 1
+                spec.task_name, ledger.task_failures
             ));
             match host.register_task(spec) {
                 Ok(()) => confirm_task_repair(host, spec, ledger, report),
                 Err(error) => {
-                    ledger.record_task_failure(format!("register task: {error}"));
+                    ledger.note_failure(format!("register task: {error}"));
                     report.guardrail(format!(
                         "scheduled-task repair failed ({error}); {} of {MAX_REPAIR_ATTEMPTS} \
                          consecutive failures",
@@ -685,9 +715,33 @@ fn latch_spawn_give_up(ledger: &mut SupervisorLedger, report: &mut SupervisionRe
     ));
 }
 
+/// A task state that never resolves is reported once as persistent rather than
+/// producing the same line at every launch forever. An unreadable state takes
+/// no action, so this is not a cap — it is the point at which "I cannot tell"
+/// stops being a transient hiccup and becomes something to escalate.
+fn escalate_undetermined(
+    spec: &TaskSpec,
+    ledger: &mut SupervisorLedger,
+    report: &mut SupervisionReport,
+) {
+    if !ledger.undetermined_cap_spent() || ledger.undetermined_escalated {
+        return;
+    }
+    ledger.undetermined_escalated = true;
+    report.guardrail(format!(
+        "the state of scheduled task \"{}\" has been unreadable for {} consecutive launches; this \
+         is not transient and nothing will repair it. Edge routing stays canonical-only until a \
+         human looks at Task Scheduler",
+        spec.task_name, ledger.undetermined_streak
+    ));
+}
+
 /// Re-query after a repair. An `Ok(())` from the effect layer is a claim, not
 /// evidence — trusting it is exactly how a broken restart path logged success
 /// 1,316 times while nothing recovered (GRD-009).
+///
+/// The attempt was already charged before `register_task` ran, so the failure
+/// arms here only annotate it; charging again would halve the cap.
 fn confirm_task_repair<H: SupervisorHost>(
     host: &H,
     spec: &TaskSpec,
@@ -703,7 +757,7 @@ fn confirm_task_repair<H: SupervisorHost>(
         TaskRegistration::Unknown { reason } => {
             // Unverified is not verified. It consumes an attempt so a
             // permanently unreadable task cannot be retried forever.
-            ledger.record_task_failure(format!("repair could not be verified: {reason}"));
+            ledger.note_failure(format!("repair could not be verified: {reason}"));
             report.guardrail(format!(
                 "scheduled-task repair could not be verified ({reason}); counted as failure {} of \
                  {MAX_REPAIR_ATTEMPTS}",
@@ -712,8 +766,7 @@ fn confirm_task_repair<H: SupervisorHost>(
             latch_task_give_up(spec, ledger, report);
         }
         other => {
-            ledger
-                .record_task_failure(format!("repair reported success but query shows {other:?}"));
+            ledger.note_failure(format!("repair reported success but query shows {other:?}"));
             report.guardrail(format!(
                 "scheduled-task repair reported success but the task is still wrong; failure {} \
                  of {MAX_REPAIR_ATTEMPTS}",
@@ -731,8 +784,12 @@ fn supervise_health<H: SupervisorHost>(
     report: &mut SupervisionReport,
 ) {
     let health = host.probe_health();
+    // Taken from the first probe only. The post-spawn confirmation below may
+    // run past READINESS_DEADLINE, and this launch's routing decision is not
+    // allowed to wait on it.
     report.readiness = Some(decide_readiness(&health));
-    let action = decide_health_action(&health, ledger);
+    let sidecar_present = host.sidecar_exists(&spec.sidecar_exe);
+    let action = decide_health_action(&health, ledger, sidecar_present, &spec.sidecar_exe);
     match &action {
         HealthAction::None => ledger.record_sidecar_healthy(),
         HealthAction::ReportUnhealthy { reason } => {
@@ -747,16 +804,37 @@ fn supervise_health<H: SupervisorHost>(
                  canonical-only"
             ));
         }
+        HealthAction::SkippedMissingSidecar { path } => {
+            report.guardrail(format!(
+                "the edge sidecar is not installed at {}; there is nothing to start. Routing stays \
+                 canonical-only",
+                path.display()
+            ));
+        }
+        // Produced only by the write-ahead branch below, never by the decision.
+        HealthAction::Deferred { .. } => {}
         HealthAction::GiveUp { .. } => latch_spawn_give_up(ledger, report),
         HealthAction::Spawn => {
+            // Write-ahead: the attempt is durable before the effect happens.
+            if let Err(error) =
+                charge_and_persist(host, ledger, SupervisorLedger::charge_spawn_attempt)
+            {
+                report.guardrail(format!(
+                    "could not persist the sidecar spawn attempt ({error}); not starting the \
+                     sidecar this launch. An attempt counter that cannot be written is not a cap, \
+                     and spawning without one is the unbounded retry loop GRD-009 exists to stop"
+                ));
+                report.health_action = Some(HealthAction::Deferred { reason: error });
+                return;
+            }
             report.auto_heal(format!(
                 "sidecar is not running; starting it, attempt {} of {MAX_REPAIR_ATTEMPTS}",
-                ledger.spawn_failures + 1
+                ledger.spawn_failures
             ));
             match host.spawn_sidecar(&spec.sidecar_exe) {
                 Ok(()) => confirm_spawn(host, ledger, report),
                 Err(error) => {
-                    ledger.record_spawn_failure(format!("spawn sidecar: {error}"));
+                    ledger.note_failure(format!("spawn sidecar: {error}"));
                     report.guardrail(format!(
                         "sidecar spawn failed ({error}); {} of {MAX_REPAIR_ATTEMPTS} consecutive \
                          failures",
@@ -770,28 +848,48 @@ fn supervise_health<H: SupervisorHost>(
     report.health_action = Some(action);
 }
 
-/// Re-probe after a spawn. Only a healthy answer clears the cap — a spawn that
-/// returns `Ok` and then dies must still count.
+/// Re-probe after a spawn, polling until the sidecar answers healthy or the
+/// confirmation window is spent. Only a healthy answer clears the cap — a
+/// spawn that returns `Ok` and then dies must still count.
+///
+/// The polling is the point. `CreateProcess` returns before the child has
+/// opened its database or bound its port, so an immediate probe gets
+/// ECONNREFUSED and classifies as `NotRunning` — a *successful* launch scored
+/// as a failure, three of which latch `GIVING UP` against a working spawn
+/// path. The attempt was charged before the spawn, so the failure arm here
+/// only annotates it.
 fn confirm_spawn<H: SupervisorHost>(
     host: &H,
     ledger: &mut SupervisorLedger,
     report: &mut SupervisionReport,
 ) {
-    match host.probe_health() {
-        SidecarHealth::Healthy => {
-            ledger.record_sidecar_healthy();
-            report.auto_heal("sidecar started and answered healthy");
+    let mut last = SidecarHealth::Indeterminate {
+        reason: "the confirmation probe never ran".to_string(),
+    };
+    for attempt in 0..SPAWN_CONFIRM_ATTEMPTS {
+        if attempt > 0 {
+            host.wait_before_reprobe(SPAWN_CONFIRM_INTERVAL);
         }
-        other => {
-            ledger.record_spawn_failure(format!("spawn not confirmed healthy: {other:?}"));
-            report.guardrail(format!(
-                "sidecar spawn was not confirmed healthy ({other:?}); {} of \
-                 {MAX_REPAIR_ATTEMPTS} consecutive failures",
-                ledger.spawn_failures
-            ));
-            latch_spawn_give_up(ledger, report);
+        match host.probe_health() {
+            SidecarHealth::Healthy => {
+                ledger.record_sidecar_healthy();
+                report.auto_heal(format!(
+                    "sidecar started and answered healthy after {} probe(s)",
+                    attempt + 1
+                ));
+                return;
+            }
+            other => last = other,
         }
     }
+    ledger.note_failure(format!("spawn not confirmed healthy: {last:?}"));
+    report.guardrail(format!(
+        "sidecar spawn was not confirmed healthy within {:?} ({last:?}); {} of \
+         {MAX_REPAIR_ATTEMPTS} consecutive failures",
+        spawn_confirm_window(),
+        ledger.spawn_failures
+    ));
+    latch_spawn_give_up(ledger, report);
 }
 
 /// Run `probe` on a detached worker and give up on it at `deadline`.
@@ -800,6 +898,11 @@ fn confirm_spawn<H: SupervisorHost>(
 /// connection and then never answers would otherwise block for as long as it
 /// pleases, so the wait is bounded here rather than trusted to the caller, and
 /// a blown deadline is `Indeterminate` — unknown, not dead.
+///
+/// See S4 in the module header: in production the caller passes the same
+/// duration reqwest is already using as its own timeout, so this branch is
+/// probably unreachable there and each blown deadline leaks the worker until
+/// the inner timeout fires.
 pub fn probe_with_deadline<F>(probe: F, deadline: Duration) -> SidecarHealth
 where
     F: FnOnce() -> SidecarHealth + Send + 'static,
@@ -837,8 +940,16 @@ pub fn launch_env(app_version: &str) -> Option<SupervisorEnv> {
 }
 
 #[cfg(test)]
+#[path = "edge_supervisor_test_host.rs"]
+mod test_host;
+
+#[cfg(test)]
 #[path = "edge_supervisor_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "edge_supervisor_loop_tests.rs"]
+mod loop_tests;
 
 #[cfg(test)]
 #[path = "edge_supervisor_packaging_tests.rs"]

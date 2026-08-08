@@ -6,11 +6,13 @@
 //! The policy that decides *whether* to do any of it lives in the parent
 //! module and is tested without this file ever being constructed.
 //!
-//! [`task_definition_xml`] and [`health_probe_url`] are the exceptions: both
-//! are pure and both are tested. The XML must stay in lockstep with what
-//! `windows/edge-task.nsi` writes at install time — if a repair used a plain
-//! `schtasks /Create /TR`, it would silently drop the installer's
-//! restart-on-failure policy, so both paths register the same definition.
+//! The pure helpers at the top of this file are the exceptions: XML escaping,
+//! the task definition, the `schtasks` argument vectors, the element reader,
+//! and the probe URL are all pure and all tested. The XML must stay in
+//! lockstep with what `windows/edge-task.nsi` writes at install time — if a
+//! repair used a plain `schtasks /Create /TR`, it would silently drop the
+//! installer's restart-on-failure policy, so both paths register the same
+//! definition, and a test compares them line by line.
 
 use std::path::PathBuf;
 
@@ -21,22 +23,82 @@ use crate::edge_supervisor::{quoted_task_command, TaskSpec, LEDGER_FILE};
 pub const RESTART_COUNT: u32 = 3;
 pub const RESTART_INTERVAL: &str = "PT1M";
 
+/// Escape text for XML element content.
+///
+/// `&` is a legal character in a Windows path, and with Tauri's default
+/// `currentUser` install mode `$INSTDIR` sits under `%LOCALAPPDATA%`, which
+/// contains the Windows user name. A user called `Tom & Jerry` produces
+/// `C:\Users\Tom & Jerry\...`; interpolated raw, that is malformed XML,
+/// `schtasks /Create /XML` fails, and the supervisor then generates the same
+/// malformed XML at every launch until the cap latches `GIVING UP` against a
+/// machine where nothing is actually wrong.
+///
+/// `&` must be replaced first or the replacement's own ampersands get escaped
+/// a second time.
+pub fn escape_xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Inverse of [`escape_xml_text`], for text read back out of Task Scheduler's
+/// XML.
+///
+/// Without this, escaping the write side alone turns a hard failure into a
+/// worse one: Task Scheduler stores `C:\Users\Tom & Jerry\...` and re-emits it
+/// as `&amp;`, the raw read-back never equals the expected path,
+/// `command_line_matches` reports a mismatch, and the supervisor re-registers
+/// a perfectly good task on every launch until it gives up.
+///
+/// `&amp;` must be replaced last, for the same reason it is replaced first
+/// above.
+pub fn unescape_xml_text(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Read one element's text out of a task XML document, unescaped.
+///
+/// Deliberately not an XML parser: this reads a single well-known element out
+/// of `schtasks /Query /XML` output. It is pure and tested so the read-back
+/// half of the escaping round trip is covered.
+pub fn extract_xml_element(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(unescape_xml_text(xml[start..end].trim()))
+}
+
 /// The Task Scheduler definition for the logon task.
 ///
 /// * `<Command>` is **quoted** (acceptance item 17) — this path contains
 ///   `Program Files`, and an unquoted one is the classic unquoted-path
-///   privilege problem.
+///   privilege problem. The quotes are then XML-escaped like everything else;
+///   `&quot;` and `"` are the same character to any XML parser.
 /// * `<RunLevel>LeastPrivilege</RunLevel>` on an interactive token is the
 ///   **user scope** of acceptance item 17: no elevation, ever.
 /// * `<LogonTrigger>` carries no `<UserId>`, so the task binds to the account
 ///   that registers it — the installing user.
+///
+/// See S1 and S2 in the parent module header for what about this definition
+/// is not verified.
 pub fn task_definition_xml(spec: &TaskSpec) -> Result<String, String> {
-    let command = quoted_task_command(&spec.sidecar_exe)?;
-    let working_directory = spec
-        .sidecar_exe
-        .parent()
-        .map(|parent| parent.display().to_string())
-        .unwrap_or_default();
+    let command = escape_xml_text(&quoted_task_command(&spec.sidecar_exe)?);
+    let working_directory = escape_xml_text(
+        &spec
+            .sidecar_exe
+            .parent()
+            .map(|parent| parent.display().to_string())
+            .unwrap_or_default(),
+    );
+    let version = escape_xml_text(&spec.app_version);
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -79,10 +141,53 @@ pub fn task_definition_xml(spec: &TaskSpec) -> Result<String, String> {
   </Actions>
 </Task>
 "#,
-        version = spec.app_version,
         interval = RESTART_INTERVAL,
         count = RESTART_COUNT,
     ))
+}
+
+/// The `schtasks` arguments that register the task.
+///
+/// A value rather than a string literal buried in `register_task`, so a test
+/// can assert the actual argument vector instead of grepping this file — a
+/// source-text check passes even when the vector is built and thrown away.
+///
+/// `/XML` carries the principal, so the scope lives in the definition rather
+/// than in flags; `/F` overwrites, which is the upgrade path. `/RU`, `/RP` and
+/// `/RL` are never passed — any of them would move the task off the invoking
+/// user or elevate it, silently defeating the XML principal.
+pub fn register_task_args(task_name: &str, xml_path: &str) -> Vec<String> {
+    vec![
+        "/Create".to_string(),
+        "/TN".to_string(),
+        task_name.to_string(),
+        "/XML".to_string(),
+        xml_path.to_string(),
+        "/F".to_string(),
+    ]
+}
+
+/// The locale-independent existence query: list every task as CSV with no
+/// header. See S3 in the parent module header for what substring matching on
+/// this listing cannot distinguish.
+pub fn query_listing_args() -> Vec<String> {
+    vec![
+        "/Query".to_string(),
+        "/FO".to_string(),
+        "CSV".to_string(),
+        "/NH".to_string(),
+    ]
+}
+
+/// The follow-up query that reads one task's definition back.
+pub fn query_definition_args(task_name: &str) -> Vec<String> {
+    vec![
+        "/Query".to_string(),
+        "/TN".to_string(),
+        task_name.to_string(),
+        "/XML".to_string(),
+        "ONE".to_string(),
+    ]
 }
 
 /// Turn the configured edge URL into the health-probe URL.
@@ -142,8 +247,12 @@ mod windows_host {
     use std::os::windows::process::CommandExt as _;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::time::Duration;
 
-    use crate::edge_supervisor::host::{health_probe_url, ledger_path, task_definition_xml};
+    use crate::edge_supervisor::host::{
+        extract_xml_element, health_probe_url, ledger_path, query_definition_args,
+        query_listing_args, register_task_args, task_definition_xml,
+    };
     use crate::edge_supervisor::{
         classify_probe_failure, classify_probe_response, launch_env, probe_with_deadline,
         supervise_launch, LedgerLoad, SidecarHealth, SupervisorHost, SupervisorLedger,
@@ -195,14 +304,6 @@ mod windows_host {
         String::from_utf8_lossy(bytes).into_owned()
     }
 
-    fn extract_xml_element(xml: &str, tag: &str) -> Option<String> {
-        let open = format!("<{tag}>");
-        let close = format!("</{tag}>");
-        let start = xml.find(&open)? + open.len();
-        let end = xml[start..].find(&close)? + start;
-        Some(xml[start..end].trim().to_string())
-    }
-
     impl SupervisorHost for WindowsHost {
         /// Two read-only queries, deliberately.
         ///
@@ -212,9 +313,7 @@ mod windows_host {
         /// listing that *succeeded* and does not contain the name proves
         /// `Missing`. Every other failure is `Unknown`.
         fn query_task(&self, task_name: &str) -> TaskRegistration {
-            let listing =
-                Self::schtasks(&["/Query".into(), "/FO".into(), "CSV".into(), "/NH".into()]);
-            let listing = match listing {
+            let listing = match Self::schtasks(&query_listing_args()) {
                 Ok((true, text)) => text,
                 Ok((false, text)) => {
                     return TaskRegistration::Unknown {
@@ -227,13 +326,7 @@ mod windows_host {
                 return TaskRegistration::Missing;
             }
 
-            match Self::schtasks(&[
-                "/Query".into(),
-                "/TN".into(),
-                task_name.into(),
-                "/XML".into(),
-                "ONE".into(),
-            ]) {
+            match Self::schtasks(&query_definition_args(task_name)) {
                 Ok((true, xml)) => match extract_xml_element(&xml, "Command") {
                     Some(command_line) => TaskRegistration::Registered { command_line },
                     None => TaskRegistration::Unknown {
@@ -248,9 +341,8 @@ mod windows_host {
         }
 
         /// Register from XML so a repair carries the same restart-on-failure
-        /// policy the installer set. `/F` overwrites, which is the upgrade
-        /// path; `/RU` is never passed, so the task stays in the invoking
-        /// user's scope.
+        /// policy the installer set. The argument vector comes from
+        /// [`register_task_args`], which is where the flag policy is asserted.
         fn register_task(&self, spec: &TaskSpec) -> Result<(), String> {
             let xml = task_definition_xml(spec)?;
             let directory = tempfile::tempdir()
@@ -262,14 +354,10 @@ mod windows_host {
             }
             std::fs::write(&path, &encoded)
                 .map_err(|error| format!("write task XML {}: {error}", path.display()))?;
-            let (ok, text) = Self::schtasks(&[
-                "/Create".into(),
-                "/TN".into(),
-                spec.task_name.clone(),
-                "/XML".into(),
-                path.display().to_string(),
-                "/F".into(),
-            ])?;
+            let (ok, text) = Self::schtasks(&register_task_args(
+                &spec.task_name,
+                &path.display().to_string(),
+            ))?;
             if ok {
                 Ok(())
             } else {
@@ -295,6 +383,16 @@ mod windows_host {
                 .spawn()
                 .map(|_| ())
                 .map_err(|error| format!("spawn {}: {error}", exe.display()))
+        }
+
+        fn sidecar_exists(&self, exe: &Path) -> bool {
+            exe.exists()
+        }
+
+        /// Real time, on the detached supervision worker only. Nothing on the
+        /// startup path ever waits here.
+        fn wait_before_reprobe(&self, delay: Duration) {
+            std::thread::sleep(delay);
         }
 
         fn load_ledger(&self) -> LedgerLoad {
@@ -340,6 +438,9 @@ mod windows_host {
     /// no query, no file, no log line. With it set, supervision runs on a
     /// detached worker, so the readiness probe can never delay startup; an
     /// edge that never becomes ready degrades to canonical-only instead.
+    ///
+    /// The `launch_env` guard must stay the first statement: everything below
+    /// it either logs or touches the machine.
     pub fn start(app_data_dir: Option<PathBuf>, app_version: &str) {
         let Some(env) = launch_env(app_version) else {
             return;

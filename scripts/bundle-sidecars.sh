@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SIDECARS=(buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz)
+# buzz-edge is listed in tauri.conf.json's externalBin, so it has to be staged
+# here too or the bundle step fails on a missing sidecar. Without the
+# externalBin entry the installer's IfFileExists check is always false, the
+# scheduled-task registration is dead code in every shipped build, and the
+# supervisor's repair path can never run (spec acceptance item 17).
+SIDECARS=(buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz buzz-edge)
 HOST=$(rustc -vV | sed -n 's|host: ||p')
 TARGET=${1:-$HOST}
 if [[ "$TARGET" != *windows* ]]; then
     SIDECARS+=(buzz-backend-kubernetes)
-    BUILD_HINT="cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli"
+    BUILD_HINT="cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p buzz-edge -p git-credential-nostr -p buzz-cli"
 else
-    BUILD_HINT="cargo build --release -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli"
+    BUILD_HINT="cargo build --release -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p buzz-edge -p git-credential-nostr -p buzz-cli"
 fi
 BINARIES_DIR="desktop/src-tauri/binaries"
 

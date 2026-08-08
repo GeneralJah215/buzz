@@ -1,172 +1,47 @@
-//! Edge supervisor tests.
+//! Edge supervisor tests: decisions, health, readiness, and the ledger.
 //!
-//! Every test here drives the **pure** half of the supervisor through a fake
-//! host that records calls and changes nothing. No test registers a scheduled
-//! task, starts a process, or writes outside a `tempfile` directory that is
-//! dropped when the test ends. `WindowsHost` is never constructed.
+//! Every test here drives the **pure** half of the supervisor through the fake
+//! host in `edge_supervisor_test_host.rs`, which records calls and changes
+//! nothing. No test registers a scheduled task, starts a process, sleeps, or
+//! writes outside a `tempfile` directory that is dropped when the test ends.
+//! `WindowsHost` is never constructed.
+//!
+//! The write-ahead ledger loop and the missing-sidecar rules live in
+//! `edge_supervisor_loop_tests.rs`.
 //!
 //! What that means for confidence: the *policy* is covered exhaustively, and
 //! the *effects* (schtasks argument handling, NSIS execution) are covered only
-//! as far as their inputs. See the report accompanying this milestone for the
-//! list of things that genuinely cannot be verified without registering
-//! something on a real machine.
+//! as far as their inputs. The parent module header lists, as S1 to S5, the
+//! things that genuinely cannot be verified without registering something on a
+//! real machine.
 
-use std::cell::RefCell;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::host::health_probe_url;
+use super::test_host::{
+    env_off, env_on, exe_path, registered_correctly, spec, FakeHost, EXE, VERSION,
+};
 use super::{
     classify_probe_failure, classify_probe_response, decide_health_action, decide_readiness,
-    decide_task_repair, probe_with_deadline, supervise_launch, HealthAction, LedgerLoad,
-    ReadinessDecision, RepairReason, SidecarHealth, SupervisionReport, SupervisorEnv,
-    SupervisorHost, SupervisorLedger, TaskAction, TaskRegistration, TaskSpec, MAX_REPAIR_ATTEMPTS,
-    TASK_NAME,
+    decide_task_repair, probe_with_deadline, supervise_launch, HealthAction, ReadinessDecision,
+    RepairReason, SidecarHealth, SupervisionReport, SupervisorLedger, TaskAction, TaskRegistration,
+    MAX_REPAIR_ATTEMPTS, MAX_UNDETERMINED_LAUNCHES, SPAWN_CONFIRM_ATTEMPTS, TASK_NAME,
 };
 
-const EXE: &str = r"C:\Program Files\Buzz\buzz-edge.exe";
-const VERSION: &str = "0.5.5";
-
-fn exe_path() -> PathBuf {
-    PathBuf::from(EXE)
-}
-
-fn spec() -> TaskSpec {
-    TaskSpec {
-        task_name: TASK_NAME.to_string(),
-        sidecar_exe: exe_path(),
-        app_version: VERSION.to_string(),
-    }
-}
-
-fn env_on() -> SupervisorEnv {
-    SupervisorEnv {
-        edge_relay_url: Some("ws://127.0.0.1:7777".to_string()),
-        sidecar_exe: exe_path(),
-        app_version: VERSION.to_string(),
-    }
-}
-
-fn env_off() -> SupervisorEnv {
-    SupervisorEnv {
-        edge_relay_url: None,
-        ..env_on()
-    }
-}
-
-fn registered_correctly() -> TaskRegistration {
-    TaskRegistration::Registered {
-        command_line: format!("\"{EXE}\""),
-    }
-}
-
-// ─────────────────────────── the fake host ───────────────────────────
-
-/// Records every call and performs none of them. `query_task` returns a
-/// scripted sequence so a repair-then-verify cycle can be driven exactly.
-struct FakeHost {
-    queries: RefCell<Vec<TaskRegistration>>,
-    probes: RefCell<Vec<SidecarHealth>>,
-    register_result: Result<(), String>,
-    spawn_result: Result<(), String>,
-    ledger: RefCell<SupervisorLedger>,
-    ledger_warning: Option<String>,
-    calls: RefCell<Vec<String>>,
-    stored: RefCell<Vec<SupervisorLedger>>,
-}
-
-impl FakeHost {
-    fn new() -> Self {
-        Self {
-            queries: RefCell::new(vec![registered_correctly()]),
-            probes: RefCell::new(vec![SidecarHealth::Healthy]),
-            register_result: Ok(()),
-            spawn_result: Ok(()),
-            ledger: RefCell::new(SupervisorLedger::default()),
-            ledger_warning: None,
-            calls: RefCell::new(Vec::new()),
-            stored: RefCell::new(Vec::new()),
-        }
-    }
-
-    fn with_queries(mut self, queries: Vec<TaskRegistration>) -> Self {
-        self.queries = RefCell::new(queries);
-        self
-    }
-
-    fn with_probes(mut self, probes: Vec<SidecarHealth>) -> Self {
-        self.probes = RefCell::new(probes);
-        self
-    }
-
-    fn with_ledger(self, ledger: SupervisorLedger) -> Self {
-        *self.ledger.borrow_mut() = ledger;
-        self
-    }
-
-    fn calls(&self) -> Vec<String> {
-        self.calls.borrow().clone()
-    }
-
-    fn final_ledger(&self) -> SupervisorLedger {
-        self.stored
-            .borrow()
-            .last()
-            .cloned()
-            .expect("a ledger should have been stored")
-    }
-
-    /// Pop the next scripted value, repeating the last one forever so a test
-    /// only has to script the steps it cares about.
-    fn next<T: Clone>(queue: &RefCell<Vec<T>>) -> T {
-        let mut queue = queue.borrow_mut();
-        if queue.len() > 1 {
-            queue.remove(0)
-        } else {
-            queue.first().cloned().expect("scripted value")
-        }
-    }
-}
-
-impl SupervisorHost for FakeHost {
-    fn query_task(&self, task_name: &str) -> TaskRegistration {
-        self.calls.borrow_mut().push(format!("query:{task_name}"));
-        Self::next(&self.queries)
-    }
-
-    fn register_task(&self, spec: &TaskSpec) -> Result<(), String> {
-        self.calls
-            .borrow_mut()
-            .push(format!("register:{}", spec.task_name));
-        self.register_result.clone()
-    }
-
-    fn probe_health(&self) -> SidecarHealth {
-        self.calls.borrow_mut().push("probe".to_string());
-        Self::next(&self.probes)
-    }
-
-    fn spawn_sidecar(&self, exe: &Path) -> Result<(), String> {
-        self.calls
-            .borrow_mut()
-            .push(format!("spawn:{}", exe.display()));
-        self.spawn_result.clone()
-    }
-
-    fn load_ledger(&self) -> LedgerLoad {
-        self.calls.borrow_mut().push("load_ledger".to_string());
-        LedgerLoad {
-            ledger: self.ledger.borrow().clone(),
-            warning: self.ledger_warning.clone(),
-        }
-    }
-
-    fn store_ledger(&self, ledger: &SupervisorLedger) -> Result<(), String> {
-        self.calls.borrow_mut().push("store_ledger".to_string());
-        self.stored.borrow_mut().push(ledger.clone());
-        *self.ledger.borrow_mut() = ledger.clone();
-        Ok(())
-    }
+/// Every way this module could write to a terminal without going through
+/// `SupervisionReport`. Counted after normalising, because `eprintln!`
+/// contains `println!` contains `print!` and a naive sum triple-counts.
+fn count_prints(text: &str) -> usize {
+    let normalized = text
+        .replace("eprintln!", "@PRINT@")
+        .replace("eprint!", "@PRINT@")
+        .replace("println!", "@PRINT@")
+        .replace("print!", "@PRINT@")
+        .replace("writeln!", "@PRINT@")
+        .replace("dbg!", "@PRINT@")
+        .replace("tracing::", "@PRINT@")
+        .replace("log::", "@PRINT@");
+    normalized.matches("@PRINT@").count()
 }
 
 // ───────────────────── feature-off must be truly inert ─────────────────────
@@ -203,35 +78,88 @@ fn set_edge_url_does_exercise_the_host() {
     assert!(host.calls().contains(&"probe".to_string()));
 }
 
-/// The one stderr write in the module lives in `SupervisionReport::emit`. If a
-/// direct print is added anywhere else, "the feature is off ⇒ nothing is
+/// The one stderr write in the policy lives in `SupervisionReport::emit`, and
+/// the one in the effect half lives in `start`'s missing-app-data-dir branch.
+/// If a direct print is added anywhere else, "the feature is off ⇒ nothing is
 /// logged" stops being provable from the empty log vector.
+///
+/// This replaces a check that counted `eprintln!` in one file and required
+/// exactly 1: it ignored `host.rs`, which has its own, and any `tracing::warn!`
+/// passed it. What it still cannot catch: a print reached through a helper
+/// whose name is not in `count_prints`.
 #[test]
-fn the_module_prints_only_through_the_report() {
-    let source = include_str!("edge_supervisor.rs");
+fn the_supervisor_prints_only_through_the_report_and_the_launch_hook() {
+    let policy = include_str!("edge_supervisor.rs");
+    let (before_emit, from_emit) = policy
+        .split_once("pub fn emit(&self)")
+        .expect("SupervisionReport::emit");
     assert_eq!(
-        source.matches("eprintln!").count(),
+        count_prints(before_emit),
+        0,
+        "edge_supervisor.rs must not print outside SupervisionReport::emit"
+    );
+    assert_eq!(
+        count_prints(from_emit),
         1,
-        "edge_supervisor.rs must print only via SupervisionReport::emit"
+        "SupervisionReport::emit must hold exactly one print"
+    );
+
+    assert_eq!(
+        count_prints(include_str!("edge_supervisor/ledger.rs")),
+        0,
+        "the ledger must report through its returned warning, never by printing"
+    );
+
+    let host = include_str!("edge_supervisor/host.rs");
+    let (before_start, from_start) = host
+        .split_once("pub fn start(app_data_dir")
+        .expect("windows start");
+    assert_eq!(
+        count_prints(before_start),
+        0,
+        "host.rs must not print outside the launch hook"
+    );
+    assert_eq!(
+        count_prints(from_start),
+        1,
+        "the launch hook must hold exactly one print"
     );
 }
 
-/// `start` must establish that the feature is off *before* it reaches
-/// anything that can print. The one stderr write outside
-/// `SupervisionReport::emit` is in `start`'s missing-app-data-dir branch; if
-/// that branch ever moved above the env check, a machine with the feature off
-/// would get a log line it should never see.
+/// `start` must establish that the feature is off *before* it reaches anything
+/// that can log or touch the machine.
+///
+/// This replaces a byte-offset comparison against `eprintln!` alone, which a
+/// host call, a file write, or any non-`eprintln` log added before the env
+/// check passed straight through. What it still cannot catch: a side effect
+/// reached through a helper whose name is not on this list.
 #[test]
-fn the_launch_hook_checks_the_env_var_before_anything_that_can_log() {
+fn the_launch_hook_checks_the_env_var_before_anything_with_an_effect() {
     let source = include_str!("edge_supervisor/host.rs");
     let body = source
         .split("pub fn start(app_data_dir")
         .nth(1)
         .expect("windows start body");
-    let env_check = body.find("launch_env(").expect("env check");
-    let first_print = body.find("eprintln!").expect("guarded print");
-    assert!(
-        env_check < first_print,
+    let (before_env, _) = body.split_once("launch_env(").expect("env check");
+
+    for forbidden in [
+        "ledger_path(",
+        "WindowsHost::new",
+        "thread::spawn",
+        "std::fs",
+        "File::",
+        "Command::new",
+        "schtasks",
+        "supervise_launch",
+    ] {
+        assert!(
+            !before_env.contains(forbidden),
+            "start must return early on an unset BUZZ_EDGE_RELAY_URL before it reaches {forbidden}"
+        );
+    }
+    assert_eq!(
+        count_prints(before_env),
+        0,
         "start must return early on an unset BUZZ_EDGE_RELAY_URL before it can log"
     );
 }
@@ -245,7 +173,7 @@ fn a_matching_registration_is_left_alone() {
         ..SupervisorLedger::default()
     };
     assert_eq!(
-        decide_task_repair(&registered_correctly(), &spec(), &ledger),
+        decide_task_repair(&registered_correctly(), &spec(), &ledger, true),
         TaskAction::LeaveAlone
     );
 }
@@ -256,7 +184,8 @@ fn a_missing_task_is_registered() {
         decide_task_repair(
             &TaskRegistration::Missing,
             &spec(),
-            &SupervisorLedger::default()
+            &SupervisorLedger::default(),
+            true
         ),
         TaskAction::Register {
             reason: RepairReason::Missing
@@ -274,7 +203,7 @@ fn a_task_registered_by_an_older_version_is_re_registered() {
         ..SupervisorLedger::default()
     };
     assert_eq!(
-        decide_task_repair(&registered_correctly(), &spec(), &ledger),
+        decide_task_repair(&registered_correctly(), &spec(), &ledger, true),
         TaskAction::Register {
             reason: RepairReason::VersionChanged
         }
@@ -290,7 +219,8 @@ fn a_task_with_no_confirmed_version_is_re_registered() {
         decide_task_repair(
             &registered_correctly(),
             &spec(),
-            &SupervisorLedger::default()
+            &SupervisorLedger::default(),
+            true
         ),
         TaskAction::Register {
             reason: RepairReason::VersionChanged
@@ -308,6 +238,7 @@ fn an_undeterminable_task_state_is_never_repaired() {
         },
         &spec(),
         &SupervisorLedger::default(),
+        true,
     );
     match action {
         TaskAction::Undetermined { reason } => assert!(reason.contains("schtasks")),
@@ -321,8 +252,9 @@ fn an_undeterminable_task_state_makes_no_registration_call() {
         reason: "access denied".to_string(),
     }]);
     let report = supervise_launch(&host, &env_on());
-    assert!(
-        !host.calls().iter().any(|call| call.starts_with("register")),
+    assert_eq!(
+        host.count_calls("register"),
+        0,
         "unknown state must not trigger a registration: {:?}",
         host.calls()
     );
@@ -336,6 +268,50 @@ fn an_undeterminable_task_state_makes_no_registration_call() {
     );
 }
 
+/// A state that never resolves must not just reprint the same line at every
+/// launch until the end of time — that is the 1,316-restart bug wearing
+/// different clothes. It escalates once, and only once.
+#[test]
+fn a_permanently_unreadable_task_state_escalates_exactly_once() {
+    let mut ledger = SupervisorLedger::default();
+    let mut escalations = 0;
+
+    for _ in 0..(MAX_UNDETERMINED_LAUNCHES + 4) {
+        let host = FakeHost::new()
+            .with_queries(vec![TaskRegistration::Unknown {
+                reason: "access denied".to_string(),
+            }])
+            .with_ledger(ledger.clone());
+        let report = supervise_launch(&host, &env_on());
+        escalations += report
+            .logs
+            .iter()
+            .filter(|log| log.message.contains("is not transient"))
+            .count();
+        assert_eq!(host.count_calls("register"), 0);
+        ledger = host.persisted_ledger();
+    }
+
+    assert_eq!(
+        escalations, 1,
+        "a permanently unreadable state must escalate once, not never and not every launch"
+    );
+    assert!(ledger.undetermined_escalated);
+}
+
+/// A one-off unreadable query must not creep toward the escalation: the streak
+/// clears as soon as the state is readable again.
+#[test]
+fn a_readable_task_state_clears_the_undetermined_streak() {
+    let host = FakeHost::new().with_ledger(SupervisorLedger {
+        undetermined_streak: MAX_UNDETERMINED_LAUNCHES - 1,
+        registered_version: Some(VERSION.to_string()),
+        ..SupervisorLedger::default()
+    });
+    supervise_launch(&host, &env_on());
+    assert_eq!(host.persisted_ledger().undetermined_streak, 0);
+}
+
 // ────────────────────── the 1,316-restart guardrail ──────────────────────
 
 /// GRD-009. Three consecutive failures and the supervisor stops.
@@ -346,7 +322,7 @@ fn task_repair_stops_at_the_attempt_cap() {
         ..SupervisorLedger::default()
     };
     assert_eq!(
-        decide_task_repair(&TaskRegistration::Missing, &spec(), &ledger),
+        decide_task_repair(&TaskRegistration::Missing, &spec(), &ledger, true),
         TaskAction::GiveUp {
             attempts: MAX_REPAIR_ATTEMPTS
         }
@@ -367,17 +343,13 @@ fn repeated_launches_stop_registering_after_three_failures() {
         host.register_result = Err("access denied".to_string());
         let host = host.with_ledger(ledger.clone());
         let report = supervise_launch(&host, &env_on());
-        register_calls += host
-            .calls()
-            .iter()
-            .filter(|call| call.starts_with("register"))
-            .count();
+        register_calls += host.count_calls("register");
         give_up_logs += report
             .logs
             .iter()
             .filter(|log| log.message.contains("GIVING UP"))
             .count();
-        ledger = host.final_ledger();
+        ledger = host.persisted_ledger();
     }
 
     assert_eq!(
@@ -402,10 +374,7 @@ fn a_repair_that_claims_success_but_changes_nothing_counts_as_a_failure() {
     let report = supervise_launch(&host, &env_on());
 
     assert_eq!(
-        host.calls()
-            .iter()
-            .filter(|call| call.starts_with("query"))
-            .count(),
+        host.count_calls("query"),
         2,
         "a repair must be verified by a second query"
     );
@@ -463,7 +432,7 @@ fn a_healthy_task_clears_a_latched_give_up_without_registering() {
             ..SupervisorLedger::default()
         });
     supervise_launch(&host, &env_on());
-    assert!(!host.calls().iter().any(|call| call.starts_with("register")));
+    assert_eq!(host.count_calls("register"), 0);
     assert!(!host.final_ledger().task_gave_up);
 }
 
@@ -473,7 +442,7 @@ fn a_healthy_task_clears_a_latched_give_up_without_registering() {
 fn only_a_proven_dead_sidecar_is_respawned() {
     let ledger = SupervisorLedger::default();
     assert_eq!(
-        decide_health_action(&SidecarHealth::NotRunning, &ledger),
+        decide_health_action(&SidecarHealth::NotRunning, &ledger, true, &exe_path()),
         HealthAction::Spawn
     );
 }
@@ -487,6 +456,8 @@ fn a_running_but_unhealthy_sidecar_is_never_respawned() {
             reason: "database locked".to_string(),
         },
         &SupervisorLedger::default(),
+        true,
+        &exe_path(),
     );
     match action {
         HealthAction::ReportUnhealthy { reason } => assert_eq!(reason, "database locked"),
@@ -502,6 +473,8 @@ fn an_indeterminate_health_result_is_never_respawned() {
             reason: "probe timed out".to_string(),
         },
         &SupervisorLedger::default(),
+        true,
+        &exe_path(),
     );
     match action {
         HealthAction::Observe { reason } => assert_eq!(reason, "probe timed out"),
@@ -515,11 +488,7 @@ fn indeterminate_health_makes_no_spawn_call() {
         reason: "connection reset".to_string(),
     }]);
     supervise_launch(&host, &env_on());
-    assert!(
-        !host.calls().iter().any(|call| call.starts_with("spawn")),
-        "{:?}",
-        host.calls()
-    );
+    assert_eq!(host.count_calls("spawn"), 0, "{:?}", host.calls());
     assert_eq!(host.final_ledger().spawn_failures, 0);
 }
 
@@ -530,19 +499,25 @@ fn spawn_stops_at_the_attempt_cap() {
         ..SupervisorLedger::default()
     };
     assert_eq!(
-        decide_health_action(&SidecarHealth::NotRunning, &ledger),
+        decide_health_action(&SidecarHealth::NotRunning, &ledger, true, &exe_path()),
         HealthAction::GiveUp {
             attempts: MAX_REPAIR_ATTEMPTS
         }
     );
 }
 
-/// A spawn that returns `Ok` and then does not answer is a failed spawn.
+/// A spawn that returns `Ok` and then never answers, through the whole
+/// confirmation window, is a failed spawn.
 #[test]
-fn a_spawn_that_does_not_become_healthy_counts_as_a_failure() {
+fn a_spawn_that_never_becomes_healthy_counts_as_a_failure() {
     let host = FakeHost::new().with_probes(vec![SidecarHealth::NotRunning]);
     let report = supervise_launch(&host, &env_on());
-    assert!(host.calls().iter().any(|call| call.starts_with("spawn")));
+    assert_eq!(host.count_calls("spawn"), 1);
+    assert_eq!(
+        host.count_calls("probe"),
+        1 + SPAWN_CONFIRM_ATTEMPTS as usize,
+        "the confirmation must use its whole window before declaring failure"
+    );
     assert_eq!(host.final_ledger().spawn_failures, 1);
     assert!(report
         .logs
@@ -550,6 +525,64 @@ fn a_spawn_that_does_not_become_healthy_counts_as_a_failure() {
         .any(|log| log.message.contains("not confirmed healthy")));
 }
 
+/// **Defect 2.** `CreateProcess` returns before the child has opened SQLite or
+/// bound its loopback port, so the first confirmation probe of a *successful*
+/// spawn gets ECONNREFUSED — which classifies as `NotRunning`, not
+/// `Indeterminate`. Confirming with one immediate probe therefore scored every
+/// working launch as a failure, and three of them latched `GIVING UP` against
+/// a spawn path that works.
+///
+/// The old test scripted the probe result, so it could never observe this.
+#[test]
+fn a_spawn_that_is_still_cold_starting_is_not_a_failure() {
+    let host = FakeHost::new().with_probes(vec![
+        // The pre-spawn probe: proven dead, so a spawn is authorised.
+        SidecarHealth::NotRunning,
+        // Confirmation, still binding its port.
+        SidecarHealth::NotRunning,
+        SidecarHealth::NotRunning,
+        // Up and answering.
+        SidecarHealth::Healthy,
+    ]);
+    let report = supervise_launch(&host, &env_on());
+
+    assert_eq!(host.count_calls("spawn"), 1);
+    assert_eq!(
+        host.final_ledger().spawn_failures,
+        0,
+        "a spawn that becomes healthy is not a failure: {:?}",
+        report.logs
+    );
+    assert!(
+        !host.final_ledger().spawn_gave_up,
+        "a working spawn path must never latch GIVING UP"
+    );
+    assert!(
+        !report
+            .logs
+            .iter()
+            .any(|log| log.message.contains("not confirmed healthy")),
+        "a successful spawn must not be reported as a failure: {:?}",
+        report.logs
+    );
+    assert!(
+        report
+            .logs
+            .iter()
+            .any(|log| log.message.contains("answered healthy")),
+        "{:?}",
+        report.logs
+    );
+    assert!(
+        host.calls().iter().any(|call| call.starts_with("wait:")),
+        "the confirmation must wait between probes rather than spinning: {:?}",
+        host.calls()
+    );
+}
+
+/// The cold-start allowance must not become an unbounded wait: three cold
+/// starts in a row that never answer still latch, they just take the whole
+/// window to do it.
 #[test]
 fn repeated_launches_stop_spawning_after_three_failures() {
     let mut ledger = SupervisorLedger::default();
@@ -561,17 +594,13 @@ fn repeated_launches_stop_spawning_after_three_failures() {
             .with_probes(vec![SidecarHealth::NotRunning])
             .with_ledger(ledger.clone());
         let report = supervise_launch(&host, &env_on());
-        spawn_calls += host
-            .calls()
-            .iter()
-            .filter(|call| call.starts_with("spawn"))
-            .count();
+        spawn_calls += host.count_calls("spawn");
         give_up_logs += report
             .logs
             .iter()
             .filter(|log| log.message.contains("GIVING UP"))
             .count();
-        ledger = host.final_ledger();
+        ledger = host.persisted_ledger();
     }
 
     assert_eq!(spawn_calls, MAX_REPAIR_ATTEMPTS as usize);
@@ -661,6 +690,21 @@ fn the_readiness_gate_returns_a_fast_probe_unchanged() {
     );
 }
 
+/// This launch's routing decision comes from the first probe alone. The
+/// post-spawn confirmation may run past `READINESS_DEADLINE`, and routing is
+/// not allowed to wait on it.
+#[test]
+fn readiness_is_decided_before_the_spawn_confirmation_window() {
+    let host = FakeHost::new().with_probes(vec![SidecarHealth::NotRunning, SidecarHealth::Healthy]);
+    let report = supervise_launch(&host, &env_on());
+    assert_eq!(
+        report.readiness,
+        Some(ReadinessDecision::CanonicalOnlyRetry {
+            reason: "sidecar not running".to_string()
+        })
+    );
+}
+
 // ───────────────────────── probe classification ─────────────────────────
 
 /// Only a refused connection proves nothing is listening. This is the exact
@@ -745,8 +789,11 @@ fn the_ledger_round_trips_through_a_file() {
     let path = directory.path().join("edge-supervisor.json");
 
     let mut ledger = SupervisorLedger::default();
-    ledger.record_task_failure("access denied".to_string());
-    ledger.record_spawn_failure("exe missing".to_string());
+    ledger.charge_task_attempt();
+    ledger.note_failure("access denied".to_string());
+    ledger.charge_spawn_attempt();
+    ledger.note_failure("exe missing".to_string());
+    ledger.charge_undetermined();
     ledger.store_to(&path).expect("store");
 
     let loaded = SupervisorLedger::load_from(&path);
@@ -797,8 +844,9 @@ fn the_cap_bites_at_exactly_three_prior_failures() {
             spawn_failures: prior,
             ..SupervisorLedger::default()
         };
-        let task = decide_task_repair(&TaskRegistration::Missing, &spec(), &ledger);
-        let health = decide_health_action(&SidecarHealth::NotRunning, &ledger);
+        let task = decide_task_repair(&TaskRegistration::Missing, &spec(), &ledger, true);
+        let health =
+            decide_health_action(&SidecarHealth::NotRunning, &ledger, true, &exe_path());
         if prior < MAX_REPAIR_ATTEMPTS {
             assert!(
                 matches!(task, TaskAction::Register { .. }),
@@ -818,15 +866,15 @@ fn the_cap_bites_at_exactly_three_prior_failures() {
     }
 }
 
-/// The failure recorder must not latch silently: the latch is what suppresses
+/// Charging an attempt must not latch silently: the latch is what suppresses
 /// the `GIVING UP` line, so setting it outside the reporting path would hide
 /// the one message the operator needs.
 #[test]
-fn recording_a_failure_never_latches_give_up_on_its_own() {
+fn charging_an_attempt_never_latches_give_up_on_its_own() {
     let mut ledger = SupervisorLedger::default();
     for attempt in 1..=MAX_REPAIR_ATTEMPTS + 2 {
-        ledger.record_task_failure(format!("attempt {attempt}"));
-        ledger.record_spawn_failure(format!("attempt {attempt}"));
+        ledger.charge_task_attempt();
+        ledger.charge_spawn_attempt();
         assert!(!ledger.task_gave_up, "latched silently at {attempt}");
         assert!(!ledger.spawn_gave_up, "latched silently at {attempt}");
     }
@@ -839,4 +887,24 @@ fn recording_a_failure_never_latches_give_up_on_its_own() {
     assert_eq!(ledger.spawn_failures, 0);
     assert!(!ledger.task_cap_spent());
     assert!(!ledger.spawn_cap_spent());
+}
+
+/// `note_failure` annotates an attempt that was already charged. If it
+/// incremented as well, every failure would count twice and the cap would bite
+/// after one and a half attempts.
+#[test]
+fn noting_a_failure_does_not_charge_a_second_attempt() {
+    let mut ledger = SupervisorLedger::default();
+    ledger.charge_task_attempt();
+    ledger.note_failure("register task: access denied".to_string());
+    assert_eq!(ledger.task_failures, 1);
+    assert_eq!(
+        ledger.last_failure.as_deref(),
+        Some("register task: access denied")
+    );
+}
+
+#[test]
+fn the_expected_exe_fixture_is_the_bundled_sidecar_name() {
+    assert!(EXE.ends_with(super::SIDECAR_EXE));
 }
