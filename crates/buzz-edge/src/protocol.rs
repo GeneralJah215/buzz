@@ -1,6 +1,6 @@
 //! Narrow Nostr protocol surface accepted by the phase-1 edge relay.
 
-use nostr::{Alphabet, Event, Filter, Kind, SingleLetterTag};
+use nostr::{Alphabet, Event, EventId, Filter, Kind, SingleLetterTag};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -39,6 +39,117 @@ pub enum ClientMessage {
     },
     /// Answer the connection's NIP-42 challenge.
     Auth(Event),
+    /// Claim a batch of this identity's queued events for upstream submission.
+    ///
+    /// The sidecar cannot submit another identity's events — canonical ingest
+    /// refuses — so the author does it. The session principal decides whose
+    /// rows these are; the request cannot name an author.
+    Drain {
+        /// Client-chosen token identifying this claim, used to acknowledge it.
+        claim_token: String,
+        /// Maximum rows to lease.
+        limit: usize,
+    },
+    /// Report what upstream did with one claimed event.
+    DrainAck {
+        /// The token from the corresponding [`ClientMessage::Drain`].
+        claim_token: String,
+        /// Which claimed event this result is for.
+        event_id: EventId,
+        /// `delivered`, `duplicate`, `rejected`, or `transient`.
+        outcome: String,
+        /// Why, when the outcome is `rejected`.
+        reason: Option<String>,
+    },
+}
+
+/// Largest batch a single claim may lease.
+///
+/// A lease is a 60-second promise to drain. Claiming more than can plausibly
+/// be submitted in that window just parks rows until the lease lapses.
+const MAX_DRAIN_BATCH: usize = 100;
+
+fn parse_drain(value: &Value) -> Result<ClientMessage, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "BUZZ-EDGE DRAIN requires an object".to_string())?;
+    if object.len() > 2 {
+        return Err("BUZZ-EDGE DRAIN accepts only claim_token and limit".to_string());
+    }
+    let claim_token = object
+        .get("claim_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "claim_token must be a string".to_string())?
+        .to_string();
+    if claim_token.trim().is_empty() {
+        return Err("claim_token must not be empty".to_string());
+    }
+    let limit = object
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(MAX_DRAIN_BATCH)
+        .clamp(1, MAX_DRAIN_BATCH);
+    Ok(ClientMessage::Drain { claim_token, limit })
+}
+
+fn parse_drain_ack(value: &Value) -> Result<ClientMessage, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "BUZZ-EDGE DRAIN-ACK requires an object".to_string())?;
+    let claim_token = object
+        .get("claim_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "claim_token must be a string".to_string())?
+        .to_string();
+    let event_id = object
+        .get("event_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "event_id must be a string".to_string())?;
+    let event_id =
+        EventId::from_hex(event_id).map_err(|error| format!("invalid event_id: {error}"))?;
+    let outcome = object
+        .get("outcome")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "outcome must be a string".to_string())?
+        .to_string();
+    if !matches!(
+        outcome.as_str(),
+        "delivered" | "duplicate" | "rejected" | "transient"
+    ) {
+        return Err(format!("unsupported drain outcome: {outcome}"));
+    }
+    let reason = object
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if outcome == "rejected" && reason.is_none() {
+        return Err("a rejected outcome requires a reason".to_string());
+    }
+    Ok(ClientMessage::DrainAck {
+        claim_token,
+        event_id,
+        outcome,
+        reason,
+    })
+}
+
+/// Format a leased batch for the author to submit upstream.
+pub fn drain_batch(claim_token: &str, events: &[Event], lease_expires_at: i64) -> String {
+    let payload: Vec<Value> = events
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
+        .collect();
+    serde_json::json!([
+        "BUZZ-EDGE",
+        "DRAIN-BATCH",
+        {
+            "claim_token": claim_token,
+            "lease_expires_at": lease_expires_at,
+            "events": payload,
+        }
+    ])
+    .to_string()
 }
 
 /// Parse a WebSocket frame without accepting trailing or extra message fields.
@@ -56,6 +167,11 @@ pub fn parse_client_message(raw: &str) -> Result<ClientMessage, String> {
     match verb {
         "BUZZ-EDGE" => {
             require_len(values, 3, "BUZZ-EDGE")?;
+            match values[1].as_str() {
+                Some("DRAIN") => return parse_drain(&values[2]),
+                Some("DRAIN-ACK") => return parse_drain_ack(&values[2]),
+                _ => {}
+            }
             if values[1].as_str() != Some("BIND") {
                 return Err("unsupported BUZZ-EDGE operation".to_string());
             }
@@ -279,6 +395,148 @@ fn require_len(values: &[Value], expected: usize, verb: &str) -> Result<(), Stri
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Tag};
+
+    // ── Author-drain wire format (§11) ──────────────────────────────────────
+
+    #[test]
+    fn a_drain_request_cannot_name_an_author() {
+        // Whose rows get drained is decided by the authenticated session, never
+        // by the request. An author field here would be a way to ask the
+        // sidecar for someone else's queued events.
+        let ok =
+            serde_json::json!(["BUZZ-EDGE", "DRAIN", {"claim_token":"t1","limit":10}]).to_string();
+        match parse_client_message(&ok).expect("parse") {
+            ClientMessage::Drain { claim_token, limit } => {
+                assert_eq!(claim_token, "t1");
+                assert_eq!(limit, 10);
+            }
+            other => panic!("expected Drain, got {other:?}"),
+        }
+
+        let with_author = serde_json::json!([
+            "BUZZ-EDGE", "DRAIN",
+            {"claim_token":"t1","limit":10,"author":"deadbeef"}
+        ])
+        .to_string();
+        assert!(
+            parse_client_message(&with_author).is_err(),
+            "an extra field must be refused, not silently ignored"
+        );
+    }
+
+    #[test]
+    fn drain_limit_is_defaulted_and_clamped() {
+        let no_limit = serde_json::json!(["BUZZ-EDGE", "DRAIN", {"claim_token":"t"}]).to_string();
+        match parse_client_message(&no_limit).expect("parse") {
+            ClientMessage::Drain { limit, .. } => assert_eq!(limit, MAX_DRAIN_BATCH),
+            other => panic!("expected Drain, got {other:?}"),
+        }
+        // A lease is a 60-second promise to drain; an unbounded claim would
+        // just park rows until it lapsed.
+        let huge = serde_json::json!(["BUZZ-EDGE", "DRAIN", {"claim_token":"t","limit":100000}])
+            .to_string();
+        match parse_client_message(&huge).expect("parse") {
+            ClientMessage::Drain { limit, .. } => assert_eq!(limit, MAX_DRAIN_BATCH),
+            other => panic!("expected Drain, got {other:?}"),
+        }
+        let zero =
+            serde_json::json!(["BUZZ-EDGE", "DRAIN", {"claim_token":"t","limit":0}]).to_string();
+        match parse_client_message(&zero).expect("parse") {
+            ClientMessage::Drain { limit, .. } => assert_eq!(limit, 1),
+            other => panic!("expected Drain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_claim_token_is_refused() {
+        // The token is what stops a lapsed author overwriting rows a newer
+        // drain now owns. An empty one would collide with every other empty one.
+        for bad in ["", "   "] {
+            let raw = serde_json::json!(["BUZZ-EDGE", "DRAIN", {"claim_token":bad}]).to_string();
+            assert!(parse_client_message(&raw).is_err(), "token {bad:?}");
+        }
+    }
+
+    #[test]
+    fn drain_ack_accepts_the_four_outcomes_and_nothing_else() {
+        let id = EventId::all_zeros().to_hex();
+        for outcome in ["delivered", "duplicate", "transient"] {
+            let raw = serde_json::json!([
+                "BUZZ-EDGE", "DRAIN-ACK",
+                {"claim_token":"t","event_id":id,"outcome":outcome}
+            ])
+            .to_string();
+            assert!(parse_client_message(&raw).is_ok(), "{outcome}");
+        }
+        let unknown = serde_json::json!([
+            "BUZZ-EDGE", "DRAIN-ACK",
+            {"claim_token":"t","event_id":id,"outcome":"maybe"}
+        ])
+        .to_string();
+        assert!(parse_client_message(&unknown).is_err());
+    }
+
+    #[test]
+    fn a_rejection_must_carry_its_reason() {
+        // Quarantine is permanent and surfaced to a human. "Rejected" with no
+        // explanation is not actionable.
+        let id = EventId::all_zeros().to_hex();
+        let no_reason = serde_json::json!([
+            "BUZZ-EDGE", "DRAIN-ACK",
+            {"claim_token":"t","event_id":id,"outcome":"rejected"}
+        ])
+        .to_string();
+        assert!(parse_client_message(&no_reason).is_err());
+
+        let with_reason = serde_json::json!([
+            "BUZZ-EDGE", "DRAIN-ACK",
+            {"claim_token":"t","event_id":id,"outcome":"rejected","reason":"membership revoked"}
+        ])
+        .to_string();
+        match parse_client_message(&with_reason).expect("parse") {
+            ClientMessage::DrainAck { reason, .. } => {
+                assert_eq!(reason.as_deref(), Some("membership revoked"))
+            }
+            other => panic!("expected DrainAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_event_id_is_refused() {
+        let raw = serde_json::json!([
+            "BUZZ-EDGE", "DRAIN-ACK",
+            {"claim_token":"t","event_id":"not-hex","outcome":"delivered"}
+        ])
+        .to_string();
+        assert!(parse_client_message(&raw).is_err());
+    }
+
+    #[test]
+    fn a_drain_batch_frame_round_trips_the_exact_event_bytes() {
+        // The author must re-submit byte-identical events, so the frame cannot
+        // reserialize them into a different shape.
+        let keys = Keys::generate();
+        let channel = Uuid::new_v4();
+        let event = EventBuilder::new(Kind::Custom(9), "hello")
+            .tags([Tag::parse(["h", channel.to_string().as_str()]).expect("h")])
+            .sign_with_keys(&keys)
+            .expect("sign");
+
+        let frame = drain_batch("token", std::slice::from_ref(&event), 1_234);
+        let parsed: Value = serde_json::from_str(&frame).expect("json");
+        assert_eq!(parsed[0], "BUZZ-EDGE");
+        assert_eq!(parsed[1], "DRAIN-BATCH");
+        assert_eq!(parsed[2]["claim_token"], "token");
+        assert_eq!(parsed[2]["lease_expires_at"], 1_234);
+
+        let returned: Event =
+            serde_json::from_value(parsed[2]["events"][0].clone()).expect("event");
+        assert_eq!(
+            returned.id, event.id,
+            "event id must survive the round trip"
+        );
+        assert!(returned.verify().is_ok(), "signature must still verify");
+    }
 
     #[test]
     fn rejects_unscoped_or_non_message_filters() {

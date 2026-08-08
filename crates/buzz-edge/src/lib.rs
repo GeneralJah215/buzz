@@ -33,10 +33,15 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use protocol::{
-    auth_challenge, auth_tag_json, binding_result, bounded_filters, closed, count, eose,
-    event_channel, event_message, filter_channels, notice, ok, parse_client_message, ClientMessage,
+    auth_challenge, auth_tag_json, binding_result, bounded_filters, closed, count, drain_batch,
+    eose, event_channel, event_message, filter_channels, notice, ok, parse_client_message,
+    ClientMessage,
 };
-use storage::{CommunityBinding, EdgeStore, InsertOutcome, StorageError};
+use storage::{CommunityBinding, DrainOutcome, EdgeStore, InsertOutcome, StorageError};
+
+/// Lease granted by a drain claim. Long enough to submit a batch upstream,
+/// short enough that a vanished author's rows return promptly.
+const DRAIN_LEASE_SECONDS: i64 = 60;
 
 const MAX_CONNECTIONS: usize = 128;
 const MAX_EVENT_CONTENT_BYTES: usize = 256 * 1024;
@@ -1060,6 +1065,73 @@ async fn handle_websocket(relay: EdgeRelay, socket: WebSocket, _permit: OwnedSem
                             subscription.connection_id != connection_id
                                 || subscription.sub_id != sub_id
                         })
+                    }
+                    ClientMessage::Drain { claim_token, limit } => {
+                        // Whose rows these are is decided by `principal` — the
+                        // NIP-42-authenticated session identity — never by the
+                        // request. A client cannot ask to drain someone else's
+                        // queue, and the storage layer filters on author too.
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        match relay.state.store.claim_outbox_batch(
+                            &principal,
+                            &claim_token,
+                            limit,
+                            now,
+                            DRAIN_LEASE_SECONDS,
+                        ) {
+                            Ok(rows) => {
+                                let events: Vec<Event> =
+                                    rows.iter().map(|row| row.event.clone()).collect();
+                                let expires =
+                                    rows.first().map(|row| row.lease_expires_at).unwrap_or(now);
+                                let _ = outbound
+                                    .send(Message::Text(
+                                        drain_batch(&claim_token, &events, expires).into(),
+                                    ))
+                                    .await;
+                            }
+                            Err(error) => {
+                                let _ = outbound
+                                    .send(Message::Text(
+                                        notice(&format!("error: drain claim failed: {error}"))
+                                            .into(),
+                                    ))
+                                    .await;
+                            }
+                        }
+                    }
+                    ClientMessage::DrainAck {
+                        claim_token,
+                        event_id,
+                        outcome,
+                        reason,
+                    } => {
+                        let outcome = match outcome.as_str() {
+                            "delivered" => DrainOutcome::Delivered,
+                            "duplicate" => DrainOutcome::Duplicate,
+                            "rejected" => {
+                                DrainOutcome::Rejected(reason.unwrap_or_else(|| "rejected".into()))
+                            }
+                            // Parsing already restricts this set; anything else
+                            // is treated as transient, which records nothing.
+                            _ => DrainOutcome::Transient,
+                        };
+                        // The claim token gates the write, so a lapsed author
+                        // cannot overwrite rows a newer drain now owns.
+                        if let Err(error) = relay.state.store.acknowledge_outbox_row(
+                            &claim_token,
+                            &event_id,
+                            outcome,
+                        ) {
+                            let _ = outbound
+                                .send(Message::Text(
+                                    notice(&format!("error: drain ack failed: {error}")).into(),
+                                ))
+                                .await;
+                        }
                     }
                     ClientMessage::Auth(_) | ClientMessage::Handshake { .. } => {}
                 }
