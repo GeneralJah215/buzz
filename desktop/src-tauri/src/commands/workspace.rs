@@ -261,11 +261,16 @@ pub async fn apply_workspace(
     // first so a slow stopped-status request cannot overwrite a newly restored
     // serving status, then restore managed agents after the admission identity
     // has been published (or the bounded publication attempt has timed out).
-    #[cfg(feature = "mesh-llm")]
-    {
-        let app = restore_app.clone();
-        tauri::async_runtime::spawn(async move {
-            let state = app.state::<AppState>();
+    //
+    // This task is spawned unconditionally, not only when `restore_pending`:
+    // the launch deep link held below still has to be delivered on a boot where
+    // agent restore is switched off, and a link that silently depends on the
+    // restore gate being open is the class of failure BUG-044 was.
+    let app = restore_app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        #[cfg(feature = "mesh-llm")]
+        {
             if restore_pending {
                 if let Err(error) =
                     crate::commands::mesh_llm::restore_mesh_sharing(&app, &state).await
@@ -274,28 +279,25 @@ pub async fn apply_workspace(
                 }
             }
             crate::mesh_llm::publish_current_status_once(&app, "workspace apply").await;
-            if restore_pending {
-                if let Err(error) =
-                    restore_managed_agents_on_launch(&app, &state.shutdown_started).await
-                {
-                    eprintln!("buzz-desktop: failed to restore managed agents: {error}");
-                }
-            }
-        });
-    }
-
-    #[cfg(not(feature = "mesh-llm"))]
-    if restore_pending {
-        let app = restore_app.clone();
-        tauri::async_runtime::spawn(async move {
-            let state = app.state::<AppState>();
+        }
+        if restore_pending {
             if let Err(error) =
                 restore_managed_agents_on_launch(&app, &state.shutdown_started).await
             {
                 eprintln!("buzz-desktop: failed to restore managed agents: {error}");
             }
-        });
-    }
+        }
+
+        // BUG-044: a `buzz://` link that launched the app is dispatched here,
+        // not at `setup`. Two things had to happen first, both of them above:
+        // `state.relay_url_override` is set (so a `restart-agent` link starts
+        // the agent on this workspace's relay, not the localhost fallback), and
+        // launch-time restore has finished awaiting (so the deep-link start
+        // path cannot interleave with restore's snapshot and spawn a second
+        // harness for the same nsec under a different runtime key). Draining
+        // makes the repeat calls of a workspace switch a no-op.
+        crate::deep_link::dispatch_launch_deep_links(&app);
+    });
 
     Ok(())
 }

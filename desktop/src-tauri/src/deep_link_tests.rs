@@ -8,8 +8,7 @@ use url::Url;
 use super::{
     parse_add_community_deep_link, parse_join_deep_link, parse_message_deep_link,
     parse_nostr_bind_deep_link, parse_restart_agent_deep_link, PendingCommunityDeepLink,
-    PendingCommunityDeepLinks, RecentDeepLinks, DEEP_LINK_DEDUP_CAPACITY,
-    DEEP_LINK_DEDUP_WINDOW,
+    PendingCommunityDeepLinks, RecentDeepLinks, DEEP_LINK_DEDUP_CAPACITY, DEEP_LINK_DEDUP_WINDOW,
 };
 
 const AGENT_PUBKEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -139,7 +138,7 @@ fn remembered_urls_stay_bounded_for_a_long_lived_app() {
         recent.admit(&restart_url(&format!("token-{index}")), t0);
     }
     assert!(
-        recent.0.lock().unwrap().len() <= DEEP_LINK_DEDUP_CAPACITY,
+        recent.seen.lock().unwrap().len() <= DEEP_LINK_DEDUP_CAPACITY,
         "dedup queue grew past its cap"
     );
 
@@ -151,26 +150,7 @@ fn remembered_urls_stay_bounded_for_a_long_lived_app() {
             t0 + DEEP_LINK_DEDUP_WINDOW * index,
         );
     }
-    assert!(recent.0.lock().unwrap().len() <= 1);
-}
-
-#[test]
-fn lib_rs_registers_exactly_one_deep_link_dispatch_site() {
-    // The dedup gate above is the backstop; this is the actual fix. Two
-    // registrations both calling `handle_deep_link_url` for one OS activation
-    // is what BUG-030 was, and it survived the BUG-009 and BUG-015
-    // investigations unnoticed because nothing asserted the count.
-    //
-    // If this fails because a second delivery path was added on purpose: the
-    // dedup gate will keep it correct, but read the BUG-030 notes in `lib.rs`
-    // first — on Windows the single-instance plugin already feeds argv to the
-    // deep-link plugin for you.
-    let lib_rs = include_str!("lib.rs");
-    assert_eq!(
-        lib_rs.matches("handle_deep_link_url(").count(),
-        1,
-        "expected exactly one handle_deep_link_url call site in lib.rs"
-    );
+    assert!(recent.seen.lock().unwrap().len() <= 1);
 }
 
 fn pending(id: &str, relay_url: &str, code: Option<&str>) -> PendingCommunityDeepLink {

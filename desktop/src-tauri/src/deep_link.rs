@@ -49,14 +49,10 @@ const DEEP_LINK_DEDUP_CAPACITY: usize = 64;
 ///   called in directly. Delivery #2. That scan is now removed; `on_open_url`
 ///   in `lib.rs`'s `setup` is the one authoritative path.
 ///
-/// Known gap this does not change: cold start on Windows/Linux drops the URL.
-/// The plugin scans `std::env::args()` inside its own plugin `setup`
-/// (tauri-plugin-deep-link-2.4.9 `src/lib.rs`:73-84), which Tauri runs during
-/// `Builder::build()`, whereas the app's `setup` runs later at `Ready`; and
-/// `on_open_url` is a plain `listen` with no replay (ibid. :515-527), so the
-/// cold-start emit has no listener. Recovering it needs `get_current()`. The
-/// removed argv scan never covered this either — it only ran for a *second*
-/// instance.
+/// Cold start on Windows/Linux used to drop the URL entirely (BUG-032); it is
+/// now recovered by [`recover_cold_start_deep_link`], which routes through this
+/// same gate so a link that arrives by both paths still means one action.
+/// *When* each recovered link is routed is [`LaunchDelivery`]'s job.
 ///
 /// # Why the key is the whole URL
 ///
@@ -68,7 +64,9 @@ const DEEP_LINK_DEDUP_CAPACITY: usize = 64;
 /// or sleeping would recast a deterministic double-dispatch as a timing race
 /// and let it come back.
 #[derive(Default)]
-pub(crate) struct RecentDeepLinks(Mutex<VecDeque<(String, Instant)>>);
+pub(crate) struct RecentDeepLinks {
+    seen: Mutex<VecDeque<(String, Instant)>>,
+}
 
 impl RecentDeepLinks {
     /// Return `true` the first time `url` is seen, `false` for a repeat that
@@ -82,7 +80,7 @@ impl RecentDeepLinks {
     }
 
     fn admit_within(&self, url: &str, now: Instant, window: Duration) -> bool {
-        let mut seen = self.0.lock().expect("recent deep-link queue poisoned");
+        let mut seen = self.seen.lock().expect("recent deep-link queue poisoned");
         // Entries are pushed in non-decreasing `now` order, so expiry is a
         // prefix — pop from the front until the oldest survivor is in-window.
         while seen
@@ -101,6 +99,12 @@ impl RecentDeepLinks {
         true
     }
 }
+
+#[path = "deep_link_launch.rs"]
+mod launch;
+pub(crate) use launch::{dispatch_launch_deep_links, PendingLaunchDeepLinks};
+#[cfg(desktop)]
+pub(crate) use launch::recover_cold_start_deep_link;
 
 /// The action (`restart-agent`, `join`, …) of a deep link, for logging only.
 /// Never the query string: that carries the control token.

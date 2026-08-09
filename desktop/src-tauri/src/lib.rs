@@ -48,7 +48,8 @@ use builderlab::*;
 use commands::*;
 use deep_link::{
     acknowledge_pending_community_deep_link, handle_deep_link_url,
-    take_pending_community_deep_link, PendingCommunityDeepLinks, RecentDeepLinks,
+    take_pending_community_deep_link, PendingCommunityDeepLinks, PendingLaunchDeepLinks,
+    RecentDeepLinks,
 };
 use huddle::audio_output::{
     get_audio_output_device, list_audio_output_devices, set_audio_output_device,
@@ -307,6 +308,7 @@ pub fn run() {
         .manage(build_app_state())
         .manage(ClipboardState::new())
         .manage(PendingCommunityDeepLinks::default())
+        .manage(PendingLaunchDeepLinks::default())
         .manage(RecentDeepLinks::default())
         .manage(BuilderlabSession::default())
         .manage(BuilderlabLogin::default())
@@ -513,19 +515,16 @@ pub fn run() {
             }
 
             // Mint the external-control token before any deep link can be
-            // delivered. `buzz://restart-agent` authenticates against this file,
-            // and the cold-start link is dispatched from the registration just
-            // below — so a token that appeared later would reject the very first
-            // request. Non-fatal: without it, control links simply fail closed.
+            // delivered: `buzz://restart-agent` authenticates against this file,
+            // so a later token rejects the first request. Non-fatal: fails closed.
             if let Err(error) =
                 managed_agents::control_token::load_or_create_control_token(&app_handle)
             {
                 eprintln!("buzz-desktop: failed to prepare agent control token: {error}");
             }
 
-            // The single, authoritative deep-link delivery path (BUG-030).
-            // Covers warm opens on every desktop platform; does NOT cover cold
-            // start on Windows/Linux, and never did. Proofs: `RecentDeepLinks`.
+            // The one authoritative deep-link path (BUG-030); recovery reads the
+            // launch URL and routes it by `LaunchDelivery`. Why: `deep_link`.
             #[cfg(desktop)]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
@@ -535,6 +534,7 @@ pub fn run() {
                         handle_deep_link_url(&dl_handle, url.as_str());
                     }
                 });
+                deep_link::recover_cold_start_deep_link(app.handle());
             }
 
             // Defer launch-time agent restoration until `apply_workspace` has
