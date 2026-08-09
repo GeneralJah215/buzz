@@ -164,7 +164,7 @@ function buildFailureSurface(
       "min-height:100vh",
       "padding:32px",
       "font-family:system-ui,-apple-system,'Segoe UI',sans-serif",
-      "font-size:14px",
+      "font-size:0.875rem",
       "line-height:1.5",
       "color:#f5f5f5",
       "background:#1b1b1f",
@@ -173,7 +173,7 @@ function buildFailureSurface(
 
   const heading = ownerDocument.createElement("h1");
   heading.textContent = "Buzz couldn’t finish starting";
-  styleElement(heading, "margin:0;font-size:20px;font-weight:600");
+  styleElement(heading, "margin:0;font-size:1.25rem;font-weight:600");
   container.appendChild(heading);
 
   const explanation = ownerDocument.createElement("p");
@@ -198,7 +198,7 @@ function buildFailureSurface(
       "background:#000000",
       "color:#ff9d9d",
       "font-family:ui-monospace,'JetBrains Mono',monospace",
-      "font-size:12px",
+      "font-size:0.75rem",
     ].join(";"),
   );
   container.appendChild(details);
