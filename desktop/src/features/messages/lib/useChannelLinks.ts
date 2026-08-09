@@ -2,6 +2,7 @@ import * as React from "react";
 
 import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext";
 import { detectPrefixQuery } from "@/shared/lib/detectPrefixQuery";
+import { updateDebouncedAutocompleteQuery } from "./debouncedAutocompleteQuery";
 import type { AutocompleteEdit } from "./useRichTextEditor";
 
 export type ChannelSuggestion = {
@@ -100,58 +101,31 @@ export function useChannelLinks() {
       latestValueRef.current = value;
       latestCursorRef.current = cursorPosition;
 
-      if (debounceTimerRef.current !== null) {
-        clearTimeout(debounceTimerRef.current);
-        debounceTimerRef.current = null;
-      }
-
-      // CLOSING IS NEVER DEBOUNCED (BUG-042).
-      //
-      // The debounce exists to avoid re-querying and re-rendering the
-      // suggestion list on every keystroke while the user is still typing a
-      // `#name`. There is no such cost to closing: it only ever removes a
-      // list. Delaying the close left `isChannelOpen` true for up to
-      // CHANNEL_QUERY_DEBOUNCE_MS after the `#` trigger text was already gone
-      // from the editor, and `MessageComposer` feeds that straight into the
-      // editor's `isAutocompleteOpen` ref — so a plain Enter in that window
-      // was handed to the stale suggestion list (inserting a channel chip)
-      // instead of submitting the message. Typing kept resetting the timer,
-      // so the stale list never closed at all.
+      // CLOSING IS NEVER DEBOUNCED (BUG-042, BUG-048). The invariant and the
+      // reason `detect` is re-run inside the timer both live in
+      // `debouncedAutocompleteQuery.ts`; this hook must not re-implement either.
       //
       // Detection is a bounded local string scan (`detectPrefixQuery` looks at
       // most 80 chars back from the cursor), cheap enough to run per keystroke.
-      // Only the resulting *open* state update stays behind the timer.
-      const detected = detectPrefixQuery(
-        "#",
-        value,
-        cursorPosition,
-        knownNamesLowerRef.current,
-      );
-      if (!detected) {
-        setChannelQuery(null);
-        return;
-      }
-
-      // Re-detect inside the timer rather than reusing `detected`: the channel
-      // list can finish loading between this keystroke and the timer firing,
-      // and `knownNamesLowerRef` is kept in sync precisely so the delayed
-      // callback resolves multi-word names against the fresh set.
-      debounceTimerRef.current = setTimeout(() => {
-        debounceTimerRef.current = null;
-        const channel = detectPrefixQuery(
-          "#",
-          latestValueRef.current,
-          latestCursorRef.current,
-          knownNamesLowerRef.current,
-        );
-        if (channel) {
+      updateDebouncedAutocompleteQuery({
+        debounceTimerRef,
+        delayMs: CHANNEL_QUERY_DEBOUNCE_MS,
+        detect: () =>
+          detectPrefixQuery(
+            "#",
+            latestValueRef.current,
+            latestCursorRef.current,
+            knownNamesLowerRef.current,
+          ),
+        onClose: () => {
+          setChannelQuery(null);
+        },
+        onOpen: (channel) => {
           setChannelQuery(channel.query);
           setChannelStartIndex(channel.startIndex);
           setChannelSelectedIndex(0);
-        } else {
-          setChannelQuery(null);
-        }
-      }, CHANNEL_QUERY_DEBOUNCE_MS);
+        },
+      });
     },
     [],
   );

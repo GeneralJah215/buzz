@@ -35,6 +35,7 @@ import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { detectPrefixQuery } from "@/shared/lib/detectPrefixQuery";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { trimMapToSize } from "@/shared/lib/trimMapToSize";
+import { updateDebouncedAutocompleteQuery } from "./debouncedAutocompleteQuery";
 import { flushMentionDebounce } from "./flushMentionDebounce";
 import { hasMention } from "./hasMention";
 import { useDraftMentionRouting } from "./useDraftMentionRouting";
@@ -764,29 +765,28 @@ export function useMentions(
       const generation = ++autocompleteGenerationRef.current;
       latestValueRef.current = value;
       latestCursorRef.current = cursorPosition;
-
-      if (debounceTimerRef.current !== null) {
-        clearTimeout(debounceTimerRef.current);
-      }
-
-      debounceTimerRef.current = setTimeout(() => {
-        debounceTimerRef.current = null;
-        if (generation !== autocompleteGenerationRef.current) return;
-
-        const mention = detectPrefixQuery(
-          "@",
-          latestValueRef.current,
-          latestCursorRef.current,
-          searchableNamesLowerRef.current,
-        );
-        if (mention) {
+      // CLOSING IS NEVER DEBOUNCED (BUG-048). Invariant and rationale live in
+      // `debouncedAutocompleteQuery.ts`; `flushMentionDebounce` misses this.
+      updateDebouncedAutocompleteQuery({
+        debounceTimerRef,
+        delayMs: MENTION_DEBOUNCE_MS,
+        detect: () =>
+          detectPrefixQuery(
+            "@",
+            latestValueRef.current,
+            latestCursorRef.current,
+            searchableNamesLowerRef.current,
+          ),
+        // No generation guard: a bump always cancels the timer, and closing
+        // is the safe direction regardless.
+        onClose: () => setMentionQuery(null),
+        onOpen: (mention) => {
+          if (generation !== autocompleteGenerationRef.current) return;
           setMentionQuery(mention.query);
           setMentionStartIndex(mention.startIndex);
           setMentionSelectedIndex(0);
-        } else {
-          setMentionQuery(null);
-        }
-      }, MENTION_DEBOUNCE_MS);
+        },
+      });
     },
     [],
   );

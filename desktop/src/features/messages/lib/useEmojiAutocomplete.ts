@@ -10,6 +10,7 @@ import {
   rankShortcodeMatchesFirst,
 } from "@/shared/lib/emojiSearch";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { updateDebouncedAutocompleteQuery } from "./debouncedAutocompleteQuery";
 import type { AutocompleteEdit } from "./useRichTextEditor";
 
 export type EmojiSuggestion = {
@@ -183,23 +184,27 @@ export function useEmojiAutocomplete(customEmoji: CustomEmoji[] = []) {
       latestValueRef.current = value;
       latestCursorRef.current = cursorPosition;
 
-      if (debounceTimerRef.current !== null) {
-        clearTimeout(debounceTimerRef.current);
-      }
-
-      debounceTimerRef.current = setTimeout(() => {
-        debounceTimerRef.current = null;
-        const result = detectEmojiQuery(
-          latestValueRef.current,
-          latestCursorRef.current,
-        );
-        if (result) {
+      // CLOSING IS NEVER DEBOUNCED (BUG-048). The invariant lives in
+      // `debouncedAutocompleteQuery.ts`; this hook must not re-implement it.
+      //
+      // Unlike the `#channel` and `@mention` hooks, `detectEmojiQuery` is a
+      // pure scan of the text before the cursor with no asynchronously-loaded
+      // name list behind it, so the timer's re-detection cannot resolve
+      // anything the synchronous call could not. The custom-emoji list DOES
+      // arrive late, but it feeds the *suggestion* effect below, not detection.
+      updateDebouncedAutocompleteQuery({
+        debounceTimerRef,
+        delayMs: EMOJI_DEBOUNCE_MS,
+        detect: () =>
+          detectEmojiQuery(latestValueRef.current, latestCursorRef.current),
+        onClose: () => {
+          setEmojiQuery(null);
+        },
+        onOpen: (result) => {
           setEmojiQuery(result.query);
           setEmojiStartIndex(result.startIndex);
-        } else {
-          setEmojiQuery(null);
-        }
-      }, EMOJI_DEBOUNCE_MS);
+        },
+      });
     },
     [],
   );
