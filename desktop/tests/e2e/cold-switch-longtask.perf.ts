@@ -42,6 +42,28 @@ import { installMockBridge } from "../helpers/bridge";
 const RUNS = 5;
 const THROTTLE_RATE = 4;
 
+/**
+ * How long a step inside the throttled loop may take before we call it broken.
+ *
+ * BUG-037. Playwright's default `expect` timeout is 5 s, but every wait in the
+ * measurement loop runs while this file is deliberately holding the main thread
+ * hostage at `THROTTLE_RATE`x CPU throttle — that throttle is the whole point of
+ * the instrument (see the header). The test's own output says how long that is:
+ * on a Windows dev box the five cold switches measured a MEDIAN longest single
+ * longtask of 1245 ms and a MEDIAN total blocked time of 3230 ms per switch,
+ * with a worst run at 4184 ms total. A 5 s budget therefore sits *inside* the
+ * measurement's own noise band, so the first deep-history row can legitimately
+ * still be unmounted when the assertion gives up. That is the app being slow on
+ * purpose, not the app being wrong, and it made this instrument fail 2 of 3
+ * isolated runs.
+ *
+ * 20 s is roughly five times the measured worst case and is NOT a way to hide a
+ * hang: `test.setTimeout(120_000)` below still caps the whole run, and five
+ * runs × two waits cannot all sit near this ceiling without blowing that cap.
+ * A channel switch that genuinely never renders still fails, just at 120 s.
+ */
+const THROTTLED_STEP_TIMEOUT_MS = 20_000;
+
 type RunResult = { longest: number; total: number; count: number };
 
 function median(values: number[]): number {
@@ -93,8 +115,12 @@ test("MEASURE: cold-switch longtask cost into deep-history at the 300 ceiling", 
     // Warm `general` so the deep-history switch that follows is a cold first
     // entry, not a warm re-render of cached state.
     await page.getByTestId("channel-general").click();
-    await expect(page.getByTestId("chat-title")).toHaveText("general");
-    await expect(timeline.locator("[data-message-id]").first()).toBeVisible();
+    await expect(page.getByTestId("chat-title")).toHaveText("general", {
+      timeout: THROTTLED_STEP_TIMEOUT_MS,
+    });
+    await expect(timeline.locator("[data-message-id]").first()).toBeVisible({
+      timeout: THROTTLED_STEP_TIMEOUT_MS,
+    });
 
     // Clear the buffer immediately before the cold switch so only the switch's
     // longtasks are attributed to this run.
@@ -105,10 +131,12 @@ test("MEASURE: cold-switch longtask cost into deep-history at the 300 ceiling", 
     // The cold switch: first entry into the 600-message channel. The cold load
     // windows to the newest 300 and mounts them.
     await page.getByTestId("channel-deep-history").click();
-    await expect(page.getByTestId("chat-title")).toHaveText("deep-history");
+    await expect(page.getByTestId("chat-title")).toHaveText("deep-history", {
+      timeout: THROTTLED_STEP_TIMEOUT_MS,
+    });
     await expect(
       page.locator('[data-message-id^="mock-deep-history-"]').first(),
-    ).toBeVisible();
+    ).toBeVisible({ timeout: THROTTLED_STEP_TIMEOUT_MS });
     // Let any post-mount longtasks (anchor settle, sticky handoff) flush before
     // reading — they are part of the switch cost.
     await page.waitForTimeout(300);
