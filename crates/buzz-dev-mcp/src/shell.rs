@@ -38,8 +38,12 @@ pub struct SharedState {
 
 impl SharedState {
     pub fn new(cwd: PathBuf, shim: Shim) -> std::io::Result<Self> {
+        // The PID in the name is what lets the startup sweep tell a dead
+        // owner's leftovers from a live one's working directory. Built by
+        // `shim::session_dir_prefix` so the naming and the attribution rule
+        // that parses it stay in one file. See BUG-036.
         let session_dir = tempfile::Builder::new()
-            .prefix("buzz-dev-mcp-session-")
+            .prefix(&crate::shim::session_dir_prefix())
             .tempdir()?;
         // Resolve the shell ONCE using the same PATH the spawn will use.
         // Both the bootstrap dialect hint and every run() call read this result,

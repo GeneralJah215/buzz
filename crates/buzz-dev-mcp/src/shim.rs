@@ -1,20 +1,28 @@
 use nostr::ToBech32;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use zeroize::Zeroize;
 
 /// Session-scoped shim directory providing tools and git config to shell children.
 ///
 /// On install:
-/// 1. Creates a 0700 tempdir with symlinks back to our binary (multicall)
-/// 2. If `NOSTR_PRIVATE_KEY` is set: writes a 0600 keyfile, derives the pubkey,
+/// 1. Sweeps stale shim/session directories left by dead processes (see
+///    [`sweep_stale_dirs`]) — best effort, never fatal
+/// 2. Creates a 0700 tempdir with symlinks back to our binary (multicall)
+/// 3. If `NOSTR_PRIVATE_KEY` is set: writes a 0600 keyfile, derives the pubkey,
 ///    builds ephemeral `GIT_CONFIG_*` env vars, then removes the env var
-/// 3. Prepends the shim dir to PATH
+/// 4. Prepends the shim dir to PATH
 ///
 /// Shell children receive `path_env`, `git_env`, and `BUZZ_PRIVATE_KEY` (for
 /// the buzz CLI). `NOSTR_PRIVATE_KEY` is removed from the process env after
 /// the keyfile is written — git helpers read from the keyfile only.
-/// Cleaned up on drop (TempDir).
+///
+/// `TempDir`'s `Drop` removes the directory on a graceful exit, but the shipped
+/// reaping strategy for agent trees is a job object with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — a `TerminateProcess`, which runs no
+/// destructor. `Drop` is therefore the happy path only; the startup sweep is
+/// what actually bounds disk use. See BUG-036.
 pub struct Shim {
     _dir: TempDir,
     pub path_env: String,
@@ -23,21 +31,19 @@ pub struct Shim {
 
 impl Shim {
     pub fn install() -> std::io::Result<Self> {
-        let dir = tempfile::Builder::new().prefix("buzz-dev-mcp-").tempdir()?;
+        // Housekeeping runs BEFORE we allocate anything, and can never fail the
+        // install: a sweep problem is a disk-usage problem, not a startup
+        // problem. `sweep_stale_dirs` swallows nothing — every skipped or failed
+        // path is logged — but it returns a report instead of an error.
+        let _ = sweep_stale_dirs(&std::env::temp_dir());
+
+        let dir = tempfile::Builder::new()
+            .prefix(&shim_dir_prefix())
+            .tempdir()?;
         set_owner_only(dir.path())?;
 
         let self_exe = std::env::current_exe()?;
-
-        // Multicall symlinks — all resolve back to this binary.
-        for name in [
-            "rg",
-            "tree",
-            "buzz",
-            "git-credential-nostr",
-            "git-sign-nostr",
-        ] {
-            symlink(&self_exe, &dir.path().join(name))?;
-        }
+        install_tools(&self_exe, dir.path())?;
 
         let original = std::env::var_os("PATH").unwrap_or_default();
         let mut entries = vec![PathBuf::from(dir.path())];
@@ -339,23 +345,755 @@ fn set_owner_only(_: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(src, dst)
+// ---------------------------------------------------------------------------
+// Multicall tool materialization
+// ---------------------------------------------------------------------------
+
+/// Names the multicall binary answers to. The first entry is the one that gets
+/// the real bytes on Windows; the rest are hard links to it.
+const TOOL_NAMES: [&str; 5] = [
+    "buzz",
+    "rg",
+    "tree",
+    "git-credential-nostr",
+    "git-sign-nostr",
+];
+
+/// How a shim entry ended up on disk. Returned so the caller (and the tests)
+/// can tell a 19 MB link from a 19 MB copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) enum LinkKind {
+    HardLink,
+    Copy,
 }
 
+/// PATH lookup on Windows goes through PATHEXT, which only treats a `.exe` as
+/// runnable. None of [`TOOL_NAMES`] contains a `.`, so this only ever appends.
+#[cfg_attr(unix, allow(dead_code))]
+fn exe_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(name).with_extension("exe")
+}
+
+#[cfg(unix)]
+fn install_tools(self_exe: &Path, dir: &Path) -> std::io::Result<()> {
+    // Symlinks cost one inode each here; there is nothing to optimise.
+    for name in TOOL_NAMES {
+        std::os::unix::fs::symlink(self_exe, dir.join(name))?;
+    }
+    Ok(())
+}
+
+/// Windows has no symlink without elevation, so every multicall name has to be
+/// a real directory entry. This used to be five `std::fs::copy` calls, which
+/// made each shim directory 5 x 19.3 MB = 96.5 MB (BUG-036: 25.6 GB leaked).
+///
+/// Copy the binary **once**, then hard-link the other four to that copy. The
+/// link source is a file we just created in the *same directory*, so the
+/// same-volume precondition holds by construction, and we are not linking a
+/// running image (which can fail with a sharing violation). Result: 96.5 MB
+/// becomes 19.3 MB, and `remove_dir_all` still reclaims all of it because the
+/// last link in the directory is removed with the directory.
 #[cfg(not(unix))]
-fn symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
-    // No symlinks without elevation on Windows; copy instead. The target needs
-    // a .exe extension or PATH lookup (via PATHEXT) won't treat it as runnable.
-    let dst = dst.with_extension("exe");
-    std::fs::copy(src, dst).map(|_| ())
+fn install_tools(self_exe: &Path, dir: &Path) -> std::io::Result<()> {
+    let (primary, rest) = TOOL_NAMES
+        .split_first()
+        .expect("TOOL_NAMES is a non-empty const array");
+    let primary_path = exe_path(dir, primary);
+    std::fs::copy(self_exe, &primary_path)?;
+    for name in rest {
+        link_or_copy(&primary_path, &exe_path(dir, name))?;
+    }
+    Ok(())
+}
+
+/// Hard-link `src` to `dst`, falling back to a full copy if the filesystem
+/// cannot.
+#[cfg_attr(unix, allow(dead_code))]
+fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<LinkKind> {
+    link_or_copy_with(src, dst, |s, d| std::fs::hard_link(s, d))
+}
+
+/// The body of [`link_or_copy`] with the linker injected, so the fallback can
+/// be tested without needing a second volume or a FAT partition.
+///
+/// A hard link fails when `src` and `dst` are on different volumes, when the
+/// filesystem has no hard-link support (FAT/exFAT, some network redirectors),
+/// or when `src` has hit its per-file link limit (1023 on NTFS). None of those
+/// is fatal — a copy is exactly what this code did before — but a silent
+/// fallback would hide an 80% regression in disk use, so it is logged.
+#[cfg_attr(unix, allow(dead_code))]
+fn link_or_copy_with(
+    src: &Path,
+    dst: &Path,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<LinkKind> {
+    match link(src, dst) {
+        Ok(()) => Ok(LinkKind::HardLink),
+        Err(e) => {
+            tracing::warn!(
+                target: "shim",
+                "hard link {} -> {} failed ({e}); falling back to a full copy \
+                 (this shim directory will use ~5x the disk)",
+                src.display(),
+                dst.display(),
+            );
+            std::fs::copy(src, dst).map(|_| LinkKind::Copy)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Temp directory naming — the attribution rule for the startup sweep
+// ---------------------------------------------------------------------------
+
+/// Prefix on every temp directory this crate creates.
+const TEMP_PREFIX: &str = "buzz-dev-mcp-";
+/// Extra segment on the shell's per-session workspace (see `shell::SharedState`).
+const SESSION_INFIX: &str = "session-";
+/// Introduces the owning PID. Directories created before BUG-036 have no such
+/// segment, which is exactly how the sweep tells them apart.
+const PID_MARKER: &str = "pid";
+
+/// `buzz-dev-mcp-pid<PID>-` — `tempfile` appends its own random suffix.
+pub(crate) fn shim_dir_prefix() -> String {
+    format!("{TEMP_PREFIX}{PID_MARKER}{}-", std::process::id())
+}
+
+/// `buzz-dev-mcp-session-pid<PID>-` — same rule, for the shell workspace.
+pub(crate) fn session_dir_prefix() -> String {
+    format!(
+        "{TEMP_PREFIX}{SESSION_INFIX}{PID_MARKER}{}-",
+        std::process::id()
+    )
+}
+
+/// The whole attribution rule, in one function: which process owns the
+/// directory called `dir_name`, or `None` if we cannot say.
+///
+/// `None` is not a licence to delete. A directory we cannot attribute is left
+/// alone — that covers every directory created before BUG-036 (`buzz-dev-mcp-`
+/// plus six random alphanumerics and nothing else) as well as anything else
+/// that happens to share our prefix.
+///
+/// The old and new schemes cannot be confused: `tempfile`'s random suffix is
+/// alphanumeric with no `-`, so a pre-BUG-036 name has exactly one segment
+/// after the prefix and can never satisfy the `pid<digits>-<rest>` shape here,
+/// even in the pathological case where the random suffix starts with `pid`.
+fn owning_pid(dir_name: &str) -> Option<u32> {
+    let rest = dir_name.strip_prefix(TEMP_PREFIX)?;
+    let rest = rest.strip_prefix(SESSION_INFIX).unwrap_or(rest);
+    let digits = rest.strip_prefix(PID_MARKER)?;
+    // The PID must be terminated by the separator before tempfile's random
+    // suffix. A name that simply *ends* after the digits was not built here.
+    let end = digits.find('-')?;
+    let num = &digits[..end];
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    num.parse().ok()
+}
+
+// ---------------------------------------------------------------------------
+// Process liveness — "unknown is not dead"
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    Alive,
+    Dead,
+    /// The process may or may not exist and we are not permitted to find out.
+    /// Treated exactly like `Alive` by the sweep.
+    Unknown,
+}
+
+/// `kill(pid, 0)` is a pure permission probe — no signal is delivered.
+/// `EPERM` means the process exists and belongs to somebody else, which is
+/// alive, not dead.
+#[cfg(unix)]
+fn process_liveness(pid: u32) -> Liveness {
+    use nix::errno::Errno;
+    use nix::unistd::Pid;
+    match nix::sys::signal::kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => Liveness::Alive,
+        Err(Errno::ESRCH) => Liveness::Dead,
+        Err(Errno::EPERM) => Liveness::Alive,
+        Err(_) => Liveness::Unknown,
+    }
+}
+
+/// Windows equivalent, mirroring `managed_agents::runtime::process` but with a
+/// third state: that probe folds "not permitted to ask" into `false`, which is
+/// safe when the answer decides whether to send a kill and unsafe when it
+/// decides whether to delete a directory.
+///
+/// `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE` is the minimum that lets
+/// us poll the process object — enough to ask, not enough to modify.
+/// `ERROR_INVALID_PARAMETER` from `OpenProcess` is Windows for "no such PID";
+/// every other failure (notably `ERROR_ACCESS_DENIED` on a protected process)
+/// is `Unknown`.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn process_liveness(pid: u32) -> Liveness {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // `windows-sys` only exposes SYNCHRONIZE as a FILE_ACCESS_RIGHTS constant,
+    // which will not combine with PROCESS_ACCESS_RIGHTS. Same standard access
+    // right for every object type.
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return if GetLastError() == ERROR_INVALID_PARAMETER {
+                Liveness::Dead
+            } else {
+                Liveness::Unknown
+            };
+        }
+        // Zero timeout makes this a poll. Still signalled = still running.
+        let alive = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+        CloseHandle(handle);
+        if alive {
+            Liveness::Alive
+        } else {
+            Liveness::Dead
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_liveness(_pid: u32) -> Liveness {
+    // No probe available, so nothing is ever provably dead and nothing is ever
+    // swept. Under-reclaiming is the safe failure.
+    Liveness::Unknown
+}
+
+// ---------------------------------------------------------------------------
+// Startup sweep
+// ---------------------------------------------------------------------------
+
+/// Wall-clock ceiling on the whole sweep. This is the bound that actually
+/// matters: whatever the filesystem does, startup is delayed by at most this.
+const SWEEP_TIME_BUDGET: Duration = Duration::from_secs(2);
+/// Ceiling on directory entries *looked at* in the temp root. `%TEMP%` is
+/// shared with every other program on the machine and can hold six figures of
+/// unrelated entries.
+const SWEEP_VISIT_LIMIT: usize = 10_000;
+/// Ceiling on directories *removed* per startup. Each removal is a recursive
+/// delete, so this is the expensive counter. A backlog is drained over
+/// successive starts rather than in one stall.
+const SWEEP_REMOVE_LIMIT: usize = 64;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SweepReport {
+    /// Entries in the root that carried our prefix.
+    pub matched: usize,
+    /// Directories removed.
+    pub removed: usize,
+    /// Skipped because the owning PID is alive, or its liveness is unknown.
+    pub kept_owned: usize,
+    /// Skipped because no PID could be read out of the name.
+    pub unattributable: usize,
+    /// Read or remove errors. Logged, never propagated.
+    pub failed: usize,
+    /// One of the three bounds cut the sweep short.
+    pub hit_limit: bool,
+}
+
+/// Remove shim and session directories whose owning process is gone.
+///
+/// Never returns an error: a housekeeping failure must not stop the app
+/// starting. Nothing is swallowed — every skip and every failure is logged, and
+/// the counts come back in the report.
+pub(crate) fn sweep_stale_dirs(root: &Path) -> SweepReport {
+    sweep_stale_dirs_with(root, process_liveness)
+}
+
+fn sweep_stale_dirs_with(root: &Path, liveness: impl Fn(u32) -> Liveness) -> SweepReport {
+    let started = Instant::now();
+    let mut report = SweepReport::default();
+
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                target: "shim::sweep",
+                "[GUARDRAIL] shim sweep could not read temp root {}: {e}; \
+                 continuing without reclaiming disk",
+                root.display(),
+            );
+            report.failed += 1;
+            return report;
+        }
+    };
+
+    let mut visited = 0usize;
+    for entry in entries {
+        visited += 1;
+        if visited > SWEEP_VISIT_LIMIT
+            || report.removed >= SWEEP_REMOVE_LIMIT
+            || started.elapsed() >= SWEEP_TIME_BUDGET
+        {
+            report.hit_limit = true;
+            break;
+        }
+
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!(
+                    target: "shim::sweep",
+                    "[GUARDRAIL] shim sweep could not read an entry in {}: {e}",
+                    root.display(),
+                );
+                continue;
+            }
+        };
+
+        // Our names are ASCII by construction, so a non-UTF-8 name is not ours.
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(TEMP_PREFIX) {
+            continue;
+        }
+        report.matched += 1;
+
+        // A plain file or a symlink wearing our prefix is not a shim directory.
+        // `file_type` does not follow symlinks, which is what we want: we must
+        // never recurse out of the temp root.
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {}
+            Ok(_) => {
+                report.unattributable += 1;
+                tracing::debug!(
+                    target: "shim::sweep",
+                    "leaving non-directory {name} alone",
+                );
+                continue;
+            }
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!(
+                    target: "shim::sweep",
+                    "[GUARDRAIL] shim sweep could not stat {name}: {e}; leaving it alone",
+                );
+                continue;
+            }
+        }
+
+        let Some(pid) = owning_pid(name) else {
+            report.unattributable += 1;
+            tracing::debug!(
+                target: "shim::sweep",
+                "leaving {name} alone: no owning PID in the name",
+            );
+            continue;
+        };
+
+        match liveness(pid) {
+            Liveness::Dead => {}
+            Liveness::Alive => {
+                report.kept_owned += 1;
+                continue;
+            }
+            Liveness::Unknown => {
+                report.kept_owned += 1;
+                tracing::debug!(
+                    target: "shim::sweep",
+                    "leaving {name} alone: liveness of pid {pid} is unknown",
+                );
+                continue;
+            }
+        }
+
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => report.removed += 1,
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!(
+                    target: "shim::sweep",
+                    "[GUARDRAIL] shim sweep failed to remove {} (owner pid {pid} is gone): {e}",
+                    entry.path().display(),
+                );
+            }
+        }
+    }
+
+    if report.failed > 0 || report.unattributable > 0 || report.hit_limit {
+        tracing::warn!(
+            target: "shim::sweep",
+            "[GUARDRAIL] shim sweep incomplete: matched={} removed={} kept_owned={} \
+             unattributable={} failed={} hit_limit={}",
+            report.matched,
+            report.removed,
+            report.kept_owned,
+            report.unattributable,
+            report.failed,
+            report.hit_limit,
+        );
+    } else if report.matched > 0 {
+        tracing::info!(
+            target: "shim::sweep",
+            "shim sweep: matched={} removed={} kept_owned={}",
+            report.matched,
+            report.removed,
+            report.kept_owned,
+        );
+    }
+
+    report
 }
 
 pub fn artifact_dir(session_root: &Path) -> PathBuf {
     let p = session_root.join("artifacts");
     let _ = std::fs::create_dir_all(&p);
     p
+}
+
+/// Tests for the BUG-036 disk fixes: one file behind five names, and a startup
+/// sweep that reclaims only what it can prove is garbage.
+///
+/// Nothing here calls [`Shim::install`], so nothing here touches the real
+/// `%TEMP%`. Every test builds its own root.
+#[cfg(test)]
+mod disk_tests {
+    use super::{
+        link_or_copy, link_or_copy_with, owning_pid, process_liveness, session_dir_prefix,
+        shim_dir_prefix, sweep_stale_dirs_with, LinkKind, Liveness, SweepReport,
+        SWEEP_REMOVE_LIMIT,
+    };
+    use std::path::Path;
+
+    /// Do these two paths name the same bytes on disk, or two copies of them?
+    ///
+    /// Asked behaviourally — write through `a`, look through `b`, put `a` back
+    /// — rather than by comparing inode numbers, because Windows only exposes
+    /// its file index behind the unstable `windows_by_handle` feature. This is
+    /// also the more direct statement of the property under test: the point of
+    /// the hard link is that there is only one copy of the bytes.
+    fn shares_storage(a: &Path, b: &Path) -> bool {
+        let original = std::fs::read(a).expect("read a");
+        assert!(!original.is_empty(), "probe needs a non-empty file");
+        let mut probe = original.clone();
+        probe[0] ^= 0xFF;
+        std::fs::write(a, &probe).expect("write a");
+        let seen = std::fs::read(b).expect("read b");
+        std::fs::write(a, &original).expect("restore a");
+        seen == probe
+    }
+
+    fn always(state: Liveness) -> impl Fn(u32) -> Liveness {
+        move |_| state
+    }
+
+    // -- naming / attribution -------------------------------------------------
+
+    #[test]
+    fn test_owning_pid_reads_the_pid_out_of_both_directory_shapes() {
+        assert_eq!(owning_pid("buzz-dev-mcp-pid4242-AbC123"), Some(4242));
+        assert_eq!(
+            owning_pid("buzz-dev-mcp-session-pid4242-AbC123"),
+            Some(4242)
+        );
+    }
+
+    #[test]
+    fn test_owning_pid_round_trips_the_prefixes_we_actually_create() {
+        // The builders and the parser must agree, or the sweep silently never
+        // reclaims anything.
+        let me = std::process::id();
+        for prefix in [shim_dir_prefix(), session_dir_prefix()] {
+            let name = format!("{prefix}0BNI9I");
+            assert_eq!(
+                owning_pid(&name),
+                Some(me),
+                "{name} must attribute back to this process"
+            );
+        }
+    }
+
+    #[test]
+    fn test_owning_pid_rejects_the_pre_bug_036_naming_scheme() {
+        // These are the 281 directories already on the operator's disk. They
+        // carry no owner, so they must never be attributed — and therefore
+        // never swept.
+        for name in [
+            "buzz-dev-mcp-0BNI9I",
+            "buzz-dev-mcp-session-0BNI9I",
+            "buzz-dev-mcp-",
+            "buzz-dev-mcp-session-",
+        ] {
+            assert_eq!(owning_pid(name), None, "{name} must be unattributable");
+        }
+    }
+
+    #[test]
+    fn test_owning_pid_rejects_names_that_only_look_like_ours() {
+        for name in [
+            // Not our prefix at all.
+            "buzz-dev-mcpX-pid1-a",
+            "some-other-tool-pid1-a",
+            // `pid` present but no digits, or digits that are not digits.
+            "buzz-dev-mcp-pid-a",
+            "buzz-dev-mcp-pid12x4-a",
+            "buzz-dev-mcp-pid 12-a",
+            // Digits not terminated by the random-suffix separator. A six-char
+            // tempfile suffix could theoretically be "pid123", and this is what
+            // stops that being read as an owner.
+            "buzz-dev-mcp-pid123",
+        ] {
+            assert_eq!(owning_pid(name), None, "{name} must be unattributable");
+        }
+    }
+
+    // -- liveness -------------------------------------------------------------
+
+    #[test]
+    fn test_process_liveness_knows_itself_alive_and_an_impossible_pid_dead() {
+        assert_eq!(process_liveness(std::process::id()), Liveness::Alive);
+        // Above every platform's pid_max, and not a multiple of 4 so it can
+        // never be a Windows PID either. Positive, so the Unix probe cannot be
+        // mistaken for a process-group signal.
+        assert_eq!(process_liveness(i32::MAX as u32), Liveness::Dead);
+    }
+
+    // -- hard linking ---------------------------------------------------------
+
+    #[test]
+    fn test_link_or_copy_hard_links_when_the_filesystem_allows_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src.bin");
+        std::fs::write(&src, b"multicall").expect("write");
+        let dst = dir.path().join("dst.bin");
+
+        assert_eq!(link_or_copy(&src, &dst).expect("link"), LinkKind::HardLink);
+        assert_eq!(std::fs::read(&dst).expect("read"), b"multicall");
+        assert!(
+            shares_storage(&src, &dst),
+            "a hard link must be the same file on disk, not a second copy"
+        );
+    }
+
+    #[test]
+    fn test_link_or_copy_falls_back_to_a_full_copy_when_hard_link_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src.bin");
+        std::fs::write(&src, b"multicall").expect("write");
+        let dst = dir.path().join("dst.bin");
+
+        // Stands in for a different volume, a FAT partition, or NTFS's
+        // 1023-link ceiling. The install must still produce a working tool.
+        let refuse = |_: &Path, _: &Path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no hard links here",
+            ))
+        };
+        assert_eq!(
+            link_or_copy_with(&src, &dst, refuse).expect("fallback"),
+            LinkKind::Copy
+        );
+        assert_eq!(std::fs::read(&dst).expect("read"), b"multicall");
+        assert!(
+            !shares_storage(&src, &dst),
+            "the fallback must produce a real, independent copy"
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn test_shim_tools_are_five_names_over_one_file_on_disk() {
+        // The BUG-036 amplifier: this directory used to be 5 x 19.3 MB.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("multicall.exe");
+        std::fs::write(&src, vec![0xAAu8; 4096]).expect("write");
+
+        let out = tempfile::tempdir().expect("tempdir");
+        super::install_tools(&src, out.path()).expect("install tools");
+
+        let paths: Vec<_> = super::TOOL_NAMES
+            .iter()
+            .map(|name| super::exe_path(out.path(), name))
+            .collect();
+        for p in &paths {
+            assert!(p.is_file(), "{} must exist", p.display());
+            assert_eq!(std::fs::metadata(p).expect("stat").len(), 4096);
+        }
+        // Every name must resolve to the same bytes on disk as the first, so
+        // the directory costs one binary rather than five.
+        for p in &paths[1..] {
+            assert!(
+                shares_storage(&paths[0], p),
+                "{} must share storage with {}, not be a second copy",
+                p.display(),
+                paths[0].display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_hard_linked_executable_actually_runs() {
+        // Tested, not assumed. Windows opens a running image with
+        // FILE_SHARE_READ | FILE_SHARE_DELETE and it is not obvious from the
+        // docs that a hard link to a PE image is loadable. The source is a copy
+        // of this test binary — a real executable on both platforms.
+        let self_exe = std::env::current_exe().expect("current exe");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("multicall.exe");
+        std::fs::copy(&self_exe, &src).expect("copy self");
+        let linked = dir.path().join("linked.exe");
+
+        // A `Copy` here would make the execution below prove nothing, so the
+        // kind is asserted before the process is spawned.
+        assert_eq!(
+            link_or_copy(&src, &linked).expect("link"),
+            LinkKind::HardLink,
+            "this test only means something if the entry is a hard link"
+        );
+
+        // `--list` makes libtest enumerate and exit 0 without running anything.
+        let run = std::process::Command::new(&linked)
+            .arg("--list")
+            .output()
+            .unwrap_or_else(|e| panic!("spawning hard-linked {} failed: {e}", linked.display()));
+        assert!(
+            run.status.success(),
+            "hard-linked executable exited with {:?}\nstderr: {}",
+            run.status,
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    // -- sweep ----------------------------------------------------------------
+
+    /// Create `name/` under `root` with one file in it, so a removal has to do
+    /// real recursive work.
+    fn seed(root: &Path, name: &str) -> std::path::PathBuf {
+        let d = root.join(name);
+        std::fs::create_dir_all(&d).expect("create dir");
+        std::fs::write(d.join("buzz.exe"), b"x").expect("write");
+        d
+    }
+
+    #[test]
+    fn test_sweep_removes_a_directory_whose_owner_is_dead() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let shim = seed(root.path(), "buzz-dev-mcp-pid700-AAAAAA");
+        let session = seed(root.path(), "buzz-dev-mcp-session-pid700-BBBBBB");
+
+        let report = sweep_stale_dirs_with(root.path(), always(Liveness::Dead));
+
+        assert!(!shim.exists(), "dead owner's shim dir must be reclaimed");
+        assert!(!session.exists(), "dead owner's session dir must be reclaimed");
+        assert_eq!(
+            report,
+            SweepReport {
+                matched: 2,
+                removed: 2,
+                ..SweepReport::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_sweep_never_removes_a_live_owners_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let live = seed(root.path(), "buzz-dev-mcp-pid700-AAAAAA");
+
+        let report = sweep_stale_dirs_with(root.path(), always(Liveness::Alive));
+
+        assert!(live.exists(), "a live owner's directory must survive");
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.kept_owned, 1);
+    }
+
+    #[test]
+    fn test_sweep_treats_unknown_liveness_as_not_dead() {
+        // The whole project's discipline: we delete on proof of death, never on
+        // absence of proof of life.
+        let root = tempfile::tempdir().expect("tempdir");
+        let d = seed(root.path(), "buzz-dev-mcp-pid700-AAAAAA");
+
+        let report = sweep_stale_dirs_with(root.path(), always(Liveness::Unknown));
+
+        assert!(d.exists(), "unknown liveness must not authorise a delete");
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.kept_owned, 1);
+    }
+
+    #[test]
+    fn test_sweep_leaves_unattributable_directories_alone() {
+        // Every one of the 281 directories already on the operator's disk looks
+        // like this. The liveness probe says "dead" for everything here, so the
+        // ONLY thing standing between these and deletion is the attribution
+        // rule.
+        let root = tempfile::tempdir().expect("tempdir");
+        let old_shim = seed(root.path(), "buzz-dev-mcp-0BNI9I");
+        let old_session = seed(root.path(), "buzz-dev-mcp-session-0BNI9I");
+
+        let report = sweep_stale_dirs_with(root.path(), always(Liveness::Dead));
+
+        assert!(old_shim.exists(), "pre-BUG-036 shim dir must be left alone");
+        assert!(
+            old_session.exists(),
+            "pre-BUG-036 session dir must be left alone"
+        );
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.matched, 2);
+        assert_eq!(report.unattributable, 2);
+    }
+
+    #[test]
+    fn test_sweep_ignores_anything_not_carrying_our_prefix() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let foreign = seed(root.path(), "some-other-tool-pid700-AAAAAA");
+        let nearly = seed(root.path(), "buzz-dev-mcpX-pid700-AAAAAA");
+
+        let report = sweep_stale_dirs_with(root.path(), always(Liveness::Dead));
+
+        assert!(foreign.exists());
+        assert!(nearly.exists());
+        assert_eq!(report.matched, 0);
+        assert_eq!(report.removed, 0);
+    }
+
+    #[test]
+    fn test_sweep_stops_at_the_removal_bound_and_says_so() {
+        // A backlog must not stall the launch: it is drained across starts.
+        let root = tempfile::tempdir().expect("tempdir");
+        let seeded = SWEEP_REMOVE_LIMIT + 20;
+        for i in 0..seeded {
+            seed(root.path(), &format!("buzz-dev-mcp-pid{}-AAAAAA", 1000 + i));
+        }
+
+        let report = sweep_stale_dirs_with(root.path(), always(Liveness::Dead));
+
+        assert_eq!(
+            report.removed, SWEEP_REMOVE_LIMIT,
+            "the sweep must remove no more than its bound in one startup"
+        );
+        assert!(report.hit_limit, "hitting the bound must be reported");
+        let left = std::fs::read_dir(root.path()).expect("read").count();
+        assert_eq!(left, seeded - SWEEP_REMOVE_LIMIT, "the rest waits for the next start");
+    }
+
+    #[test]
+    fn test_sweep_reports_a_failure_instead_of_propagating_it() {
+        // An unreadable temp root must not be able to stop the app starting.
+        let root = tempfile::tempdir().expect("tempdir");
+        let missing = root.path().join("definitely-not-here");
+
+        let report = sweep_stale_dirs_with(&missing, always(Liveness::Dead));
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.removed, 0);
+    }
 }
 
 #[cfg(test)]
