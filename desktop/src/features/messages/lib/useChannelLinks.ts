@@ -102,8 +102,40 @@ export function useChannelLinks() {
 
       if (debounceTimerRef.current !== null) {
         clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
       }
 
+      // CLOSING IS NEVER DEBOUNCED (BUG-042).
+      //
+      // The debounce exists to avoid re-querying and re-rendering the
+      // suggestion list on every keystroke while the user is still typing a
+      // `#name`. There is no such cost to closing: it only ever removes a
+      // list. Delaying the close left `isChannelOpen` true for up to
+      // CHANNEL_QUERY_DEBOUNCE_MS after the `#` trigger text was already gone
+      // from the editor, and `MessageComposer` feeds that straight into the
+      // editor's `isAutocompleteOpen` ref — so a plain Enter in that window
+      // was handed to the stale suggestion list (inserting a channel chip)
+      // instead of submitting the message. Typing kept resetting the timer,
+      // so the stale list never closed at all.
+      //
+      // Detection is a bounded local string scan (`detectPrefixQuery` looks at
+      // most 80 chars back from the cursor), cheap enough to run per keystroke.
+      // Only the resulting *open* state update stays behind the timer.
+      const detected = detectPrefixQuery(
+        "#",
+        value,
+        cursorPosition,
+        knownNamesLowerRef.current,
+      );
+      if (!detected) {
+        setChannelQuery(null);
+        return;
+      }
+
+      // Re-detect inside the timer rather than reusing `detected`: the channel
+      // list can finish loading between this keystroke and the timer firing,
+      // and `knownNamesLowerRef` is kept in sync precisely so the delayed
+      // callback resolves multi-word names against the fresh set.
       debounceTimerRef.current = setTimeout(() => {
         debounceTimerRef.current = null;
         const channel = detectPrefixQuery(
