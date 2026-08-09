@@ -52,13 +52,44 @@ const releaseConfig = {
   },
 };
 
-// Tauri applies --config after platform-specific config using RFC 7396.
-// Any externalBin value here would therefore replace the platform sidecar list,
-// while null would silently delete it. This delta must never own that key.
-if (Object.hasOwn(releaseConfig.bundle, "externalBin")) {
-  throw new Error(
-    "Release config must not define bundle.externalBin; sidecars are platform-specific",
-  );
+// Tauri applies --config after the platform-specific config using RFC 7396, so
+// whatever this delta says wins over everything. Two keys must never appear in
+// it (BUG-046):
+//
+//   bundle.externalBin        — replaces the platform sidecar list (null deletes
+//                               it), so the bundler would ship a different list
+//                               than scripts/check-sidecar-binaries-core.mjs
+//                               verified, and the difference would go unchecked.
+//   build.beforeBundleCommand — "" or null disables the zero-length sidecar
+//                               guard entirely, in exactly the jobs that ship.
+//
+// The previous version of this check looked for `externalBin` on the object
+// literal declared directly above, where it can never appear, so it could not
+// fire. Walk the config that is actually written instead.
+const FORBIDDEN_KEY_PATHS = [
+  ["bundle", "externalBin"],
+  ["build", "beforeBundleCommand"],
+];
+
+function hasKeyPath(value, keyPath) {
+  let cursor = value;
+  for (const key of keyPath) {
+    if (typeof cursor !== "object" || cursor === null || !(key in cursor)) {
+      return false;
+    }
+    cursor = cursor[key];
+  }
+  return true;
+}
+
+for (const keyPath of FORBIDDEN_KEY_PATHS) {
+  if (hasKeyPath(releaseConfig, keyPath)) {
+    throw new Error(
+      `Release config must not define ${keyPath.join(".")}: a --config delta ` +
+        "overrides the base and platform configs, which would bypass the " +
+        "sidecar guard (BUG-046).",
+    );
+  }
 }
 
 console.log(`Updater enabled -> ${updaterEndpoint}`);

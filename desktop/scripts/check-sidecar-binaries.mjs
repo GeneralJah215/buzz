@@ -1,8 +1,11 @@
 // Entry point for the BUG-046 sidecar guard.
 //
 // Wired into `build.beforeBundleCommand` in tauri.conf.json, so the Tauri CLI
-// runs it itself immediately before bundling — no developer invocation of
-// `tauri build` can route around it. Also runnable by hand:
+// runs it itself immediately before bundling. Both commands that can emit an
+// installer — `tauri build` and the standalone `tauri bundle` — run it; see
+// scripts/check-sidecar-binaries-core.mjs for the exact boundary of what does
+// not (`--no-bundle`, which ships nothing, and `--config` deltas, which the
+// wiring contract test forbids from touching the key). Also runnable by hand:
 //
 //     node desktop/scripts/check-sidecar-binaries.mjs [target-triple]
 //

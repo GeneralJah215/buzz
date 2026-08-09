@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { after, describe, it } from "node:test";
 
 import {
@@ -19,8 +20,14 @@ import {
   expectedSidecarFiles,
   formatFailureReport,
   mergeTauriConfig,
+  platformForTriple,
   runSidecarBinaryCheck,
 } from "./check-sidecar-binaries-core.mjs";
+
+const REPO_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
 
 const WINDOWS_TRIPLE = "x86_64-pc-windows-msvc";
 const LINUX_TRIPLE = "x86_64-unknown-linux-gnu";
@@ -426,6 +433,255 @@ describe("runSidecarBinaryCheck exit codes", () => {
       env: { TAURI_ENV_TARGET_TRIPLE: LINUX_TRIPLE },
       log: silence,
       logError: silence,
+    });
+    assert.equal(code, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wiring contract.
+//
+// The tests above prove the CHECK is correct. These prove it is still
+// INSTALLED. Without them, deleting build.beforeBundleCommand from
+// tauri.conf.json, or dropping the call out of bundle-sidecars.sh, leaves every
+// gate in this repo green while the guard silently stops running — which is the
+// same failure shape as BUG-046 itself: everything exits 0 and nothing objects.
+// ---------------------------------------------------------------------------
+
+function readRepoFile(relativePath) {
+  return fs.readFileSync(path.join(REPO_ROOT, relativePath), "utf8");
+}
+
+const CHECKER_ENTRY = "desktop/scripts/check-sidecar-binaries.mjs";
+
+describe("wiring contract: the guard is installed", () => {
+  it("tauri.conf.json runs the checker as beforeBundleCommand", () => {
+    const config = JSON.parse(
+      readRepoFile("desktop/src-tauri/tauri.conf.json"),
+    );
+    const hook = config.build?.beforeBundleCommand;
+    assert.ok(
+      hook,
+      "build.beforeBundleCommand is missing — the bundle-time guard is not installed",
+    );
+    const script = typeof hook === "string" ? hook : hook.script;
+    assert.match(
+      script,
+      /check-sidecar-binaries\.mjs/,
+      "beforeBundleCommand no longer invokes the sidecar checker",
+    );
+    // Hooks run with cwd = the src-tauri directory, so ".." is what puts the
+    // relative `./scripts/...` path inside desktop/.
+    if (typeof hook !== "string" && script.startsWith("./scripts/")) {
+      assert.equal(
+        hook.cwd,
+        "..",
+        "a './scripts/...' hook script needs cwd '..' or it resolves inside src-tauri",
+      );
+    }
+  });
+
+  it("the checker entry point turns a failed check into a non-zero exit", () => {
+    // runSidecarBinaryCheck only RETURNS a code. If this file stops feeding it
+    // to process.exit, the hook always succeeds and the guard is decorative.
+    const source = readRepoFile(CHECKER_ENTRY);
+    assert.match(
+      source,
+      /process\.exit\(/,
+      "entry point must call process.exit",
+    );
+    assert.match(
+      source,
+      /process\.exit\(\s*\n?\s*runSidecarBinaryCheck\(/,
+      "process.exit must receive runSidecarBinaryCheck's result directly",
+    );
+  });
+
+  it("bundle-sidecars.sh verifies what it just staged", () => {
+    const script = readRepoFile("scripts/bundle-sidecars.sh");
+    assert.match(
+      script,
+      /check-sidecar-binaries\.mjs/,
+      "bundle-sidecars.sh no longer verifies the binaries it stages",
+    );
+    assert.match(
+      script,
+      /-s "\$src"|! -s "\$src"/,
+      "bundle-sidecars.sh no longer rejects a zero-length source binary",
+    );
+  });
+
+  it("no --config delta or workflow overrides beforeBundleCommand", () => {
+    // Tauri applies --config LAST, as RFC 7396, over base + platform config.
+    // Every workflow that bundles passes --config, so a delta setting this key
+    // to "" or null would disable the guard in exactly the jobs that ship.
+    const workflowDir = path.join(REPO_ROOT, ".github", "workflows");
+    const suspects = fs
+      .readdirSync(workflowDir)
+      .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
+      .map((name) => path.join(".github", "workflows", name));
+
+    for (const relativePath of suspects) {
+      const source = readRepoFile(relativePath);
+      // Strip comment lines so this file's own explanatory prose does not trip it.
+      const code = source
+        .split("\n")
+        .filter((line) => !/^\s*(#|\/\/)/.test(line))
+        .join("\n");
+      assert.ok(
+        !code.includes("beforeBundleCommand"),
+        `${relativePath} sets build.beforeBundleCommand in a config delta; that disables the BUG-046 guard for every build it runs`,
+      );
+      assert.ok(
+        !code.includes("externalBin"),
+        `${relativePath} sets bundle.externalBin in a config delta; the checker reads only tauri.conf.json + the platform config, so it would validate a different list than the one bundled`,
+      );
+    }
+  });
+
+  it("the generated release config delta refuses both bypass keys", () => {
+    // build-release-config.mjs writes the --config delta used by every release
+    // build, so it is the one place a bypass could be introduced legitimately.
+    // Grepping it for the key names is useless (its own guard names them), so
+    // assert the guard exists and covers both.
+    const source = readRepoFile("desktop/scripts/build-release-config.mjs");
+    assert.match(
+      source,
+      /FORBIDDEN_KEY_PATHS/,
+      "build-release-config.mjs no longer guards its output against bypass keys",
+    );
+    assert.match(source, /\["bundle",\s*"externalBin"\]/);
+    assert.match(source, /\["build",\s*"beforeBundleCommand"\]/);
+  });
+});
+
+describe("wiring contract: the sidecar lists agree", () => {
+  const baseConfig = JSON.parse(
+    readRepoFile("desktop/src-tauri/tauri.conf.json"),
+  );
+  const windowsConfig = JSON.parse(
+    readRepoFile("desktop/src-tauri/tauri.windows.conf.json"),
+  );
+
+  it("the Windows externalBin list is a subset of the base list", () => {
+    // The Windows override REPLACES the base array. A name present only in the
+    // override would be bundled on Windows and never checked anywhere else.
+    const base = new Set(baseConfig.bundle.externalBin);
+    for (const entry of windowsConfig.bundle.externalBin) {
+      assert.ok(
+        base.has(entry),
+        `${entry} is in tauri.windows.conf.json but not in tauri.conf.json`,
+      );
+    }
+  });
+
+  it("bundle-sidecars.sh stages every sidecar that externalBin bundles", () => {
+    // Drift between the staging list and the bundling list is how a sidecar
+    // ends up unstaged (missing) or unchecked (bundled but never verified).
+    const script = readRepoFile("scripts/bundle-sidecars.sh");
+    const match = script.match(/^SIDECARS=\(([^)]*)\)/m);
+    assert.ok(match, "could not find the SIDECARS array in bundle-sidecars.sh");
+    const staged = new Set(match[1].trim().split(/\s+/));
+    // buzz-backend-kubernetes is appended conditionally for non-Windows targets.
+    const conditional = new Set(["buzz-backend-kubernetes"]);
+
+    for (const entry of baseConfig.bundle.externalBin) {
+      const name = path.posix.basename(entry);
+      assert.ok(
+        staged.has(name) || conditional.has(name),
+        `externalBin bundles '${name}' but bundle-sidecars.sh never stages it`,
+      );
+    }
+  });
+});
+
+describe("platformForTriple", () => {
+  // The production hook passes no platform, so this function alone decides
+  // which platform config is read. Every filesystem test above passes an
+  // explicit platform, so without these the real code path is untested.
+  it("maps each triple family to its Tauri platform config", () => {
+    assert.equal(platformForTriple(WINDOWS_TRIPLE), "win32");
+    assert.equal(platformForTriple(MACOS_TRIPLE), "darwin");
+    assert.equal(platformForTriple("x86_64-apple-darwin"), "darwin");
+    assert.equal(platformForTriple(LINUX_TRIPLE), "linux");
+    assert.equal(platformForTriple("aarch64-unknown-linux-musl"), "linux");
+    assert.equal(platformForTriple("universal-apple-darwin"), "darwin");
+  });
+});
+
+describe("non-Windows targets (no platform override file)", () => {
+  // Every macOS and Linux build takes this branch: no tauri.<plat>.conf.json
+  // exists, so the base six-entry list applies, including the sidecar the
+  // Windows override drops.
+  function stageLinuxFixture(contents) {
+    const srcTauriDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(srcTauriDir, "tauri.conf.json"),
+      JSON.stringify({
+        bundle: {
+          externalBin: [
+            "binaries/buzz-acp",
+            "binaries/buzz-backend-kubernetes",
+          ],
+        },
+      }),
+    );
+    const binariesDir = path.join(srcTauriDir, "binaries");
+    fs.mkdirSync(binariesDir);
+    for (const [name, body] of Object.entries(contents)) {
+      fs.writeFileSync(path.join(binariesDir, `${name}-${LINUX_TRIPLE}`), body);
+    }
+    return srcTauriDir;
+  }
+
+  const REAL_ELF = Buffer.concat([ELF_HEADER, Buffer.alloc(4096)]);
+
+  it("checks the full base list, with no .exe suffix, using the derived platform", () => {
+    const srcTauriDir = stageLinuxFixture({
+      "buzz-acp": REAL_ELF,
+      "buzz-backend-kubernetes": REAL_ELF,
+    });
+    // Note: no `platform` argument — exercises platformForTriple, as the hook does.
+    const code = runSidecarBinaryCheck({
+      srcTauriDir,
+      explicitTriple: LINUX_TRIPLE,
+      env: {},
+      log: () => {},
+      logError: () => {},
+    });
+    assert.equal(code, 0);
+  });
+
+  it("FAILS on a 0-byte Linux sidecar", () => {
+    const srcTauriDir = stageLinuxFixture({
+      "buzz-acp": REAL_ELF,
+      "buzz-backend-kubernetes": Buffer.alloc(0),
+    });
+    const errors = [];
+    const code = runSidecarBinaryCheck({
+      srcTauriDir,
+      explicitTriple: LINUX_TRIPLE,
+      env: {},
+      log: () => {},
+      logError: (line) => errors.push(line),
+    });
+    assert.equal(code, 1);
+    assert.match(errors.join("\n"), /buzz-backend-kubernetes/);
+  });
+});
+
+describe("resolveTriple honours the Tauri hook environment", () => {
+  it("uses TAURI_ENV_TARGET_TRIPLE when no explicit triple is given", () => {
+    // This is the real hook path for a cross-compile: Tauri exports the target
+    // triple, and the checker must prefer it over the rustc host.
+    const srcTauriDir = stageFixture({
+      contents: { "buzz-acp": REAL_ENOUGH, buzz: REAL_ENOUGH },
+    });
+    const code = runSidecarBinaryCheck({
+      srcTauriDir,
+      env: { TAURI_ENV_TARGET_TRIPLE: WINDOWS_TRIPLE },
+      log: () => {},
+      logError: () => {},
     });
     assert.equal(code, 0);
   });

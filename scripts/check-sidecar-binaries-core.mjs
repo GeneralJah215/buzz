@@ -11,8 +11,19 @@
 // The defect was never the stub files — it was that nothing between staging and
 // shipping ever asserted the payload was a real executable. This module is that
 // assertion. It is wired into `build.beforeBundleCommand` in tauri.conf.json,
-// which the Tauri CLI runs itself immediately before the bundling phase, so it
-// cannot be skipped by anyone invoking `tauri build` however they like.
+// which BOTH commands that can produce an installer — `tauri build` and the
+// standalone `tauri bundle` — run themselves immediately before the bundling
+// phase. There is no way to generate a bundle without it running.
+//
+// Precisely what does NOT run it, so nobody mistakes the boundary:
+//   - `tauri build --no-bundle` and `--bundles none` skip it, because they
+//     produce no installer at all. Nothing shippable comes out, so that is
+//     safe; ci.yml's desktop-build-macos job relies on it deliberately.
+//   - A `--config` delta that sets `build.beforeBundleCommand` to "" or null
+//     WOULD disable it, and every bundling workflow passes `--config`. That
+//     hole is closed by the wiring contract in
+//     check-sidecar-binaries-core.test.mjs, which fails if any config delta or
+//     workflow touches that key.
 //
 // Everything here resolves paths from the module's own location, never from
 // `process.cwd()`, because the CLI's hook working directory is not guaranteed.
@@ -384,15 +395,18 @@ export function runSidecarBinaryCheck({
   logError = console.error,
 }) {
   const triple = resolveTriple({ explicitTriple, env });
+  // Resolve once and reuse. Interpolating the raw `platform` parameter here
+  // printed "platform 'undefined'" on the hook path, which passes no platform.
+  const resolvedPlatform = platform ?? platformForTriple(triple);
   const outcome = checkSidecarBinaries({
     srcTauriDir,
     triple,
-    platform: platform ?? platformForTriple(triple),
+    platform: resolvedPlatform,
   });
 
   if (outcome.empty) {
     logError(
-      `[check-sidecars] No bundle.externalBin entries found for platform '${platform}'. Nothing was verified — this is almost certainly a config mistake.`,
+      `[check-sidecars] No bundle.externalBin entries found for platform '${resolvedPlatform}' (triple ${triple}). Nothing was verified — this is almost certainly a config mistake.`,
     );
     return 1;
   }
