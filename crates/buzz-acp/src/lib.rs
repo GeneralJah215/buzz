@@ -6,6 +6,7 @@ mod edge;
 mod engram_fetch;
 mod filter;
 mod observer;
+mod observer_gap;
 mod pool;
 mod pool_lifecycle;
 mod queue;
@@ -424,7 +425,12 @@ fn spawn_relay_observer_publisher(
         // high-water `seq` (monotonic, assigned at emit).
         let rx = observer.subscribe();
         let snapshot = observer.snapshot();
+        // Weak on purpose: a strong handle here also holds a broadcast sender,
+        // so `rx` would never see `Closed` and this task would outlive the bus.
+        let bus = observer.downgrade();
+        drop(observer);
         run_relay_observer_publisher(
+            bus,
             snapshot,
             rx,
             publisher,
@@ -437,7 +443,155 @@ fn spawn_relay_observer_publisher(
     })
 }
 
+/// Everything one relay observer frame needs to reach the relay.
+///
+/// Bundled because the publisher now has four call sites (snapshot drain, live
+/// stream, coalescer flush, gap recovery) and an eight-argument call repeated
+/// four times is how a `paced` flag gets passed wrong.
+struct ObserverPublishTarget {
+    publisher: RelayEventPublisher,
+    keys: nostr::Keys,
+    agent_pubkey_hex: String,
+    owner_pubkey_hex: String,
+    owner_pubkey: PublicKey,
+}
+
+impl ObserverPublishTarget {
+    /// Publish one frame. Returns whether it actually reached the relay.
+    ///
+    /// `paced` is false only for gap recovery: the 90/min pacer exists to
+    /// sample chatty *content* frames, and a control-plane frame replayed
+    /// through it would arrive up to 43 seconds late — which is the very
+    /// failure the replay is fixing. The recovery burst is hard-bounded by
+    /// `observer_gap::MAX_GAP_REPLAY_FRAMES`.
+    async fn publish(
+        &self,
+        pacer: &mut ObserverPublishPacer,
+        paced: bool,
+        event: observer::ObserverEvent,
+    ) -> bool {
+        publish_relay_observer_event(
+            &self.publisher,
+            &self.keys,
+            &self.agent_pubkey_hex,
+            &self.owner_pubkey_hex,
+            &self.owner_pubkey,
+            pacer,
+            paced,
+            event,
+        )
+        .await
+    }
+
+    async fn flush_coalescer(
+        &self,
+        coalescer: &mut ObserverChunkCoalescer,
+        pacer: &mut ObserverPublishPacer,
+    ) {
+        for event in coalescer.flush() {
+            self.publish(pacer, true, event).await;
+        }
+    }
+}
+
+/// Reconcile one detected `seq` discontinuity, and announce what it could not
+/// reconcile.
+///
+/// Order matters: recovered frames go out first, then the `observer_gap` frame
+/// carrying the *delivered* count. Publishing the announcement first would mean
+/// reporting a recovery that had not happened yet — and a replay frame the
+/// relay refuses is exactly as lost as one the ring evicted.
+async fn reconcile_observer_gap(
+    bus: &observer::ObserverWeak,
+    target: &ObserverPublishTarget,
+    coalescer: &mut ObserverChunkCoalescer,
+    pacer: &mut ObserverPublishPacer,
+    last_seq: u64,
+    next_seq: Option<u64>,
+    dropped: u64,
+) {
+    // Coalesced chunks still in flight belong before the hole.
+    target.flush_coalescer(coalescer, pacer).await;
+
+    let Some(observer) = bus.upgrade() else {
+        // The harness dropped the bus; there is nothing left to reconcile
+        // from and nothing further will be emitted. Still refuse to let the
+        // drop pass unrecorded.
+        tracing::error!(
+            target: "observer",
+            dropped,
+            from_seq = last_seq,
+            "[GUARDRAIL] observer bus gap detected after the bus was dropped — not reconcilable"
+        );
+        return;
+    };
+
+    let mut recovery = observer_gap::plan_gap_recovery(
+        last_seq,
+        next_seq,
+        dropped,
+        observer.replay_since(last_seq),
+    );
+    let mut delivered = 0usize;
+    for event in std::mem::take(&mut recovery.replay) {
+        let kind = event.kind.clone();
+        let seq = event.seq;
+        if target.publish(pacer, false, event).await {
+            delivered += 1;
+        } else {
+            tracing::warn!(
+                target: "observer",
+                kind = %kind,
+                seq,
+                "[GUARDRAIL] observer gap replay frame failed to publish"
+            );
+        }
+    }
+
+    let receipt = recovery.receipt(delivered);
+    if recovery.is_complete(delivered) {
+        tracing::warn!(
+            target: "observer",
+            dropped,
+            from_seq = last_seq,
+            to_seq = ?next_seq,
+            recovered = delivered,
+            lost_content = recovery.lost_content,
+            "[GUARDRAIL] observer bus gap reconciled from the control replay ring"
+        );
+    } else {
+        // The loud, named state. Downstream control state (agent lifecycle,
+        // RPC completions, session config) may now be wrong, and nothing in
+        // this process can correct it — so say so, here and on the wire.
+        tracing::error!(
+            target: "observer",
+            dropped,
+            from_seq = last_seq,
+            to_seq = ?next_seq,
+            planned = recovery.planned,
+            recovered = delivered,
+            unrecoverable = recovery.unrecoverable,
+            lost_content = recovery.lost_content,
+            "[GUARDRAIL] observer bus gap is UNRECONCILABLE — downstream control state may be stale"
+        );
+    }
+    let gap = observer.mint_gap_event(receipt);
+    if !target.publish(pacer, false, gap).await {
+        // Nothing further to try: the relay is the only channel to the
+        // consumers, and a retry loop here would be a flood. Losing this frame
+        // downgrades a known hole to an unknown one, which is why it is an
+        // error and not a debug line.
+        tracing::error!(
+            target: "observer",
+            from_seq = last_seq,
+            "[GUARDRAIL] observer gap announcement failed to publish — the hole is now silent downstream"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_relay_observer_publisher(
+    bus: observer::ObserverWeak,
     snapshot: Vec<observer::ObserverEvent>,
     mut rx: tokio::sync::broadcast::Receiver<observer::ObserverEvent>,
     publisher: RelayEventPublisher,
@@ -446,23 +600,28 @@ async fn run_relay_observer_publisher(
     owner_pubkey_hex: String,
     owner_pubkey: PublicKey,
 ) {
+    let target = ObserverPublishTarget {
+        publisher,
+        keys,
+        agent_pubkey_hex,
+        owner_pubkey_hex,
+        owner_pubkey,
+    };
     let mut coalescer = ObserverChunkCoalescer::default();
     let mut pacer = ObserverPublishPacer::new();
     let max_snapshot_seq = snapshot.iter().map(|event| event.seq).max().unwrap_or(0);
     for event in snapshot {
         for event in coalescer.ingest(event) {
-            publish_relay_observer_event(
-                &publisher,
-                &keys,
-                &agent_pubkey_hex,
-                &owner_pubkey_hex,
-                &owner_pubkey,
-                &mut pacer,
-                event,
-            )
-            .await;
+            target.publish(&mut pacer, true, event).await;
         }
     }
+
+    // Highest `seq` this consumer has taken responsibility for. The gap between
+    // it and the next frame delivered after a lag is the hole, exactly.
+    let mut last_seq = max_snapshot_seq;
+    // Frames the broadcast reported as skipped but whose hole has no upper
+    // bound yet. Resolved on the next live frame, or on an idle tick.
+    let mut pending_dropped: Option<u64> = None;
 
     let mut flush_interval = tokio::time::interval(std::time::Duration::from_millis(500));
     flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -476,41 +635,56 @@ async fn run_relay_observer_publisher(
                         if event.seq <= max_snapshot_seq {
                             continue;
                         }
-                        for event in coalescer.ingest(event) {
-                            publish_relay_observer_event(
-                                &publisher, &keys, &agent_pubkey_hex,
-                                &owner_pubkey_hex, &owner_pubkey, &mut pacer, event,
+                        if let Some(dropped) = pending_dropped.take() {
+                            // This frame is the first one after the hole, so it
+                            // closes the range exactly.
+                            reconcile_observer_gap(
+                                &bus, &target, &mut coalescer, &mut pacer,
+                                last_seq, Some(event.seq), dropped,
                             ).await;
+                        }
+                        last_seq = last_seq.max(event.seq);
+                        for event in coalescer.ingest(event) {
+                            target.publish(&mut pacer, true, event).await;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                        for event in coalescer.flush() {
-                            publish_relay_observer_event(
-                                &publisher, &keys, &agent_pubkey_hex,
-                                &owner_pubkey_hex, &owner_pubkey, &mut pacer, event,
-                            ).await;
-                        }
-                        tracing::warn!(dropped = count, "relay observer publisher lagged");
+                        // Do not reconcile yet: the hole's upper bound is the
+                        // seq of the next delivered frame, and replaying past
+                        // it would republish frames still queued for live
+                        // delivery — which for `control_result` means
+                        // completing an RPC twice.
+                        pending_dropped =
+                            Some(pending_dropped.unwrap_or(0).saturating_add(count));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        for event in coalescer.flush() {
-                            publish_relay_observer_event(
-                                &publisher, &keys, &agent_pubkey_hex,
-                                &owner_pubkey_hex, &owner_pubkey, &mut pacer, event,
+                        if let Some(dropped) = pending_dropped.take() {
+                            reconcile_observer_gap(
+                                &bus, &target, &mut coalescer, &mut pacer,
+                                last_seq, None, dropped,
                             ).await;
                         }
+                        target.flush_coalescer(&mut coalescer, &mut pacer).await;
                         break;
                     }
                 }
             }
             _ = flush_interval.tick() => {
-                // Periodic flush ensures live streaming even during continuous chunk delivery.
-                for event in coalescer.flush() {
-                    publish_relay_observer_event(
-                        &publisher, &keys, &agent_pubkey_hex,
-                        &owner_pubkey_hex, &owner_pubkey, &mut pacer, event,
+                // An agent that falls silent right after a lag storm is exactly
+                // when a stuck `waking` badge would otherwise persist
+                // unchallenged, so an idle channel must not hold the
+                // announcement. `is_empty` is exact: nothing is queued, so
+                // nothing above `last_seq` can still arrive live, so replaying
+                // it cannot duplicate.
+                if let Some(dropped) = pending_dropped.filter(|_| rx.is_empty()) {
+                    pending_dropped = None;
+                    reconcile_observer_gap(
+                        &bus, &target, &mut coalescer, &mut pacer,
+                        last_seq, None, dropped,
                     ).await;
                 }
+                // Periodic flush ensures live streaming even during continuous chunk delivery.
+                target.flush_coalescer(&mut coalescer, &mut pacer).await;
             }
         }
     }
@@ -788,6 +962,12 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
+/// Put one observer frame on the relay.
+///
+/// Returns `false` when the frame did not reach the relay. Every early return
+/// here used to be a silent drop indistinguishable from a success, which is
+/// what let a failed gap replay be reported as a reconciled gap.
+#[allow(clippy::too_many_arguments)]
 async fn publish_relay_observer_event(
     publisher: &RelayEventPublisher,
     keys: &nostr::Keys,
@@ -795,9 +975,12 @@ async fn publish_relay_observer_event(
     owner_pubkey_hex: &str,
     owner_pubkey: &PublicKey,
     pacer: &mut ObserverPublishPacer,
+    paced: bool,
     mut event: observer::ObserverEvent,
-) {
-    pacer.wait().await;
+) -> bool {
+    if paced {
+        pacer.wait().await;
+    }
     // Trim oversized frames to fit the plaintext cap rather than letting
     // encrypt_observer_payload reject and drop them whole (silent telemetry loss).
     fit_observer_event_to_budget(&mut event);
@@ -805,7 +988,7 @@ async fn publish_relay_observer_event(
         Ok(encrypted) => encrypted,
         Err(error) => {
             tracing::warn!("failed to encrypt relay observer event: {error}");
-            return;
+            return false;
         }
     };
     let builder = match buzz_sdk::build_agent_observer_frame(
@@ -817,19 +1000,21 @@ async fn publish_relay_observer_event(
         Ok(builder) => builder,
         Err(error) => {
             tracing::warn!("failed to build relay observer event: {error}");
-            return;
+            return false;
         }
     };
     let signed = match builder.sign_with_keys(keys) {
         Ok(event) => event,
         Err(error) => {
             tracing::warn!("failed to sign relay observer event: {error}");
-            return;
+            return false;
         }
     };
     if let Err(error) = publisher.publish_event(signed).await {
         tracing::warn!("relay observer event dropped: {error}");
+        return false;
     }
+    true
 }
 
 /// Maximum age (seconds) for an observer control frame to be considered fresh.
@@ -4937,10 +5122,13 @@ mod observer_snapshot_race_tests {
         assert_eq!(snapshot.len(), 2, "overlap event must be in the snapshot");
         // After the snapshot: live receiver only.
         emit_marker(&observer, "after");
-        // Close the broadcast channel so the run loop drains and exits.
+        // Close the broadcast channel so the run loop drains and exits. The
+        // publisher's own reference is weak, so it does not keep it open.
+        let bus = observer.downgrade();
         drop(observer);
 
         run_relay_observer_publisher(
+            bus,
             snapshot,
             rx,
             publisher,
@@ -4965,6 +5153,156 @@ mod observer_snapshot_race_tests {
             ["before", "overlap", "after"],
             "each event must be published exactly once, in order"
         );
+    }
+}
+
+#[cfg(test)]
+mod observer_gap_recovery_tests {
+    use super::*;
+    use nostr::Keys;
+
+    const RELAY: &str = "wss://relay.example";
+
+    fn emit_content(observer: &observer::ObserverHandle, count: usize) {
+        for index in 0..count {
+            observer.emit(
+                "acp_read",
+                None,
+                &observer::context_for(None, None, None),
+                serde_json::json!({ "index": index }),
+            );
+        }
+    }
+
+    /// Drive the publisher against a REAL broadcast overrun and collect frames
+    /// until `stop_kind` shows up. Returns the decrypted frames in order.
+    async fn publish_until(
+        observer: &observer::ObserverHandle,
+        rx: tokio::sync::broadcast::Receiver<observer::ObserverEvent>,
+        stop_kind: &str,
+    ) -> Vec<serde_json::Value> {
+        let agent_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let (publisher, mut published_rx) = RelayEventPublisher::test_pair();
+        let task = tokio::spawn(run_relay_observer_publisher(
+            observer.downgrade(),
+            Vec::new(),
+            rx,
+            publisher,
+            agent_keys.clone(),
+            agent_keys.public_key().to_hex(),
+            owner_keys.public_key().to_hex(),
+            owner_keys.public_key(),
+        ));
+
+        // Bounded so a regression that stops announcing gaps fails by name
+        // instead of hanging the suite. The clock is paused, so this is virtual
+        // time: it costs nothing, and it is far longer than the unpaced
+        // recovery burst needs.
+        let mut frames = Vec::new();
+        let collected = tokio::time::timeout(std::time::Duration::from_secs(3_600), async {
+            while let Some(event) = published_rx.recv().await {
+                let frame: serde_json::Value =
+                    decrypt_observer_payload(&owner_keys, &event).expect("decrypt published frame");
+                let kind = frame["kind"].as_str().unwrap_or_default().to_string();
+                frames.push(frame);
+                if kind == stop_kind {
+                    return;
+                }
+            }
+        })
+        .await;
+        task.abort();
+        collected.unwrap_or_else(|_| {
+            panic!("publisher never emitted a `{stop_kind}` frame — the discontinuity was absorbed")
+        });
+        frames
+    }
+
+    /// The bug, end to end: a `ready` lifecycle frame destroyed by a real
+    /// 1000-slot broadcast overrun must still reach the relay, because the
+    /// observer bus is the ONLY transport for managed-agent lifecycle and a
+    /// dropped `ready` strands the desktop on `waking` with no reconciliation
+    /// path.
+    #[tokio::test(start_paused = true)]
+    async fn a_lifecycle_frame_destroyed_by_a_real_bus_overrun_is_republished() {
+        let observer = observer::ObserverHandle::in_process();
+        let rx = observer.subscribe();
+
+        emit_runtime_lifecycle(
+            Some(&observer),
+            "test-generation",
+            "agent-pubkey",
+            RELAY,
+            "ready",
+            None,
+        );
+        // Nothing is draining `rx`, so this overruns the channel outright and
+        // the lifecycle frame above is one of the casualties.
+        emit_content(&observer, 1_500);
+
+        let frames = publish_until(&observer, rx, observer::OBSERVER_GAP_KIND).await;
+
+        let lifecycle = frames
+            .iter()
+            .find(|frame| frame["kind"] == "managed_agent_runtime_lifecycle")
+            .expect("the dropped lifecycle frame must be recovered and republished");
+        assert_eq!(lifecycle["payload"]["lifecycle"], "ready");
+        assert_eq!(lifecycle["payload"]["startNonce"], "test-generation");
+
+        let gap = frames
+            .iter()
+            .find(|frame| frame["kind"] == observer::OBSERVER_GAP_KIND)
+            .expect("the discontinuity must be announced, not absorbed");
+        assert_eq!(
+            gap["payload"]["controlComplete"],
+            serde_json::json!(true),
+            "the control plane was fully recovered, so the gap must say so"
+        );
+        assert_eq!(gap["payload"]["recovered"], serde_json::json!(1));
+        assert!(
+            gap["payload"]["lostContent"].as_u64().unwrap_or(0) > 0,
+            "content frames were destroyed and the transcript must be told"
+        );
+        assert!(
+            gap["payload"]["dropped"].as_u64().unwrap_or(0) > 0,
+            "the gap must carry the broadcast's own drop count"
+        );
+    }
+
+    /// The loud, named state. When even the control replay ring has been
+    /// overrun, the publisher must publish an `observer_gap` frame saying so
+    /// rather than continuing as if nothing happened.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreconcilable_gap_is_announced_as_incomplete() {
+        let observer = observer::ObserverHandle::in_process();
+        let rx = observer.subscribe();
+
+        // Overrun the control ring itself: far more lifecycle frames than it
+        // holds, with nothing draining the bus.
+        for index in 0..1_500 {
+            emit_runtime_lifecycle(
+                Some(&observer),
+                "test-generation",
+                "agent-pubkey",
+                RELAY,
+                if index % 2 == 0 { "waking" } else { "ready" },
+                None,
+            );
+        }
+
+        let frames = publish_until(&observer, rx, observer::OBSERVER_GAP_KIND).await;
+        let gap = frames
+            .iter()
+            .find(|frame| frame["kind"] == observer::OBSERVER_GAP_KIND)
+            .expect("an unreconcilable gap must still be announced");
+        assert_eq!(
+            gap["payload"]["controlComplete"],
+            serde_json::json!(false),
+            "control frames were destroyed outright — reporting success here \
+             would be the failure mode this fix exists to prevent"
+        );
+        assert!(gap["payload"]["unrecoverable"].as_u64().unwrap_or(0) > 0);
     }
 }
 

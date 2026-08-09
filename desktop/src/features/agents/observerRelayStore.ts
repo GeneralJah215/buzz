@@ -21,10 +21,17 @@ import type {
 } from "./ui/agentSessionTypes";
 import {
   type TranscriptState,
-  buildTranscriptState,
   createEmptyTranscriptState,
-  processTranscriptEvent,
 } from "./ui/agentSessionTranscript";
+import {
+  CONTROL_RESULT_GAP_STATUS,
+  type ObserverGap,
+  buildTranscriptStateWithGaps,
+  detectRelaySeqGap,
+  parseObserverGapFrame,
+  processTranscriptEventWithGaps,
+  syntheticGapEvent,
+} from "./observerGapDetection";
 
 const MAX_OBSERVER_EVENTS = 3000;
 const MAX_PENDING_UNKNOWN_AGENT_FRAMES = 100;
@@ -75,6 +82,97 @@ const archiveEventsByChannel = new Map<string, ObserverEvent[]>();
 // tie — so a higher-seq frame at equal timestamp still advances the entry.
 type LatestLiveEntry = { sessionId: string; timestamp: string; seq: number };
 const latestLiveSessionByAgentChannel = new Map<string, LatestLiveEntry>();
+
+// Highest observer `seq` ingested per agent, and every discontinuity seen.
+//
+// Observer frames are lossy in two independent places — a 1000-slot broadcast
+// inside the harness and the relay hop — and four consumers here used to treat
+// them as reliable. `seq` is monotonic, so a hole is detectable; these two maps
+// are what turns a detected hole into a fact the rest of the app can read
+// instead of a silence it cannot.
+const lastSeqByAgent = new Map<string, number>();
+const gapsByAgent = new Map<string, ObserverGap[]>();
+const EMPTY_GAPS: ObserverGap[] = [];
+
+/**
+ * Every observer discontinuity recorded for an agent, oldest first.
+ *
+ * A caller that needs to know whether this agent's *state* — runtime lifecycle,
+ * model switch outcome, session config — can still be trusted should look for
+ * any entry with `controlComplete: false`. That is the loud, named state: the
+ * harness could not refill the hole, and nothing on this side can either.
+ */
+export function getAgentObserverGaps(
+  agentPubkey: string | null | undefined,
+): readonly ObserverGap[] {
+  if (!agentPubkey) return EMPTY_GAPS;
+  return gapsByAgent.get(normalizePubkey(agentPubkey)) ?? EMPTY_GAPS;
+}
+
+/** True when frames were lost that nothing could recover for this agent. */
+export function isAgentObserverStateStale(
+  agentPubkey: string | null | undefined,
+): boolean {
+  return getAgentObserverGaps(agentPubkey).some((gap) => !gap.controlComplete);
+}
+
+function recordObserverGap(agentPubkey: string, gap: ObserverGap) {
+  const key = normalizePubkey(agentPubkey);
+  gapsByAgent.set(key, [...(gapsByAgent.get(key) ?? []), gap]);
+  if (gap.controlComplete) {
+    // The harness refilled the control plane from its own replay ring. Content
+    // is still missing — the transcript marker says so — but no waiting caller
+    // has been stranded, so do not fabricate a failure for one.
+    return;
+  }
+  console.warn(
+    `[GUARDRAIL] observer frames lost for agent ${key} (${gap.source}): ` +
+      `fromSeq=${gap.fromSeq} toSeq=${gap.toSeq} unrecoverable=${gap.unrecoverable}`,
+  );
+  // A `control_result` destroyed in the hole is never re-sent, so a caller
+  // awaiting one waits forever. Tell the waiters the reply is gone rather than
+  // leaving them hanging on a frame that will not arrive.
+  dispatchControlResult(agentPubkey, {
+    type: "switch_model",
+    status: CONTROL_RESULT_GAP_STATUS,
+  });
+}
+
+/**
+ * Reconcile one arriving frame against the `seq` stream, before it is ingested.
+ *
+ * Two independent losses are possible and they need different verdicts:
+ *
+ * - A `seq` jump with no announcement means frames vanished *after* the harness
+ *   published them. Nothing on this side of the relay can refill it, so it is
+ *   recorded as unrecoverable and injected into the journal as a real
+ *   `observer_gap` event — which is what makes the marker survive the store's
+ *   full-rebuild path instead of being a transient decoration.
+ * - An `observer_gap` frame is the harness's own receipt. It may report the
+ *   hole as already refilled from its control replay ring, in which case the
+ *   agent's lifecycle, RPC completions and session config are current again.
+ *
+ * Runs before ingest so the marker sorts ahead of the frame that revealed it.
+ * Exported for tests: this is the seam where a dropped frame stops being
+ * invisible, and it must be provable without a live relay.
+ */
+export function trackObserverContinuity(
+  agentPubkey: string,
+  parsed: ObserverEvent,
+) {
+  const key = normalizePubkey(agentPubkey);
+  const relayGap = detectRelaySeqGap(lastSeqByAgent.get(key), parsed);
+  if (relayGap) {
+    recordObserverGap(agentPubkey, relayGap);
+    appendAgentEvent(agentPubkey, syntheticGapEvent(relayGap, parsed));
+  }
+  lastSeqByAgent.set(key, Math.max(lastSeqByAgent.get(key) ?? 0, parsed.seq));
+
+  const harnessGap = parseObserverGapFrame(parsed);
+  if (harnessGap) {
+    recordObserverGap(agentPubkey, harnessGap);
+  }
+}
 
 function liveSessionKey(agentPubkey: string, channelId: string | null): string {
   return `${normalizePubkey(agentPubkey)}:${channelId ?? ""}`;
@@ -221,11 +319,14 @@ function appendAgentEvent(agentPubkey: string, event: ObserverEvent) {
     // Fast path: incremental update
     const transcriptState =
       transcriptByAgent.get(key) ?? createEmptyTranscriptState();
-    const updatedTranscript = processTranscriptEvent(transcriptState, event);
+    const updatedTranscript = processTranscriptEventWithGaps(
+      transcriptState,
+      event,
+    );
     transcriptByAgent.set(key, updatedTranscript);
   } else {
     // Slow path: full rebuild (out-of-order insertion or trim fired)
-    transcriptByAgent.set(key, buildTranscriptState(final));
+    transcriptByAgent.set(key, buildTranscriptStateWithGaps(final));
   }
 
   invalidateSnapshot(key);
@@ -391,6 +492,7 @@ async function handleRelayObserverEvent(
         });
       }
     }
+    trackObserverContinuity(agentPubkey, parsed);
     appendAgentEvent(agentPubkey, parsed);
     const managementRequest = parseAgentManagementRequest(parsed.payload);
     if (managementRequest) {
@@ -749,6 +851,8 @@ export function resetAgentObserverStore() {
   knownAgentsBySubscription.clear();
   pendingUnknownAgentFrames.length = 0;
   latestLiveSessionByAgentChannel.clear();
+  lastSeqByAgent.clear();
+  gapsByAgent.clear();
   agentManagementListeners.clear();
   onSessionConfigCaptured = null;
   connectionState = "idle";
