@@ -9,15 +9,14 @@ import {
 } from "lucide-react";
 
 import type { Channel } from "@/shared/api/types";
+import { canonicalChannelName } from "@/features/channels/lib/canonicalChannelName";
 import {
-  canonicalChannelName,
-  channelNamesMatch,
-} from "@/features/channels/lib/canonicalChannelName";
-import { scoreChannelMatch } from "@/features/channels/lib/channelSearchScore";
-import {
-  type ChannelSortMode,
-  sortChannelsForSidebar,
-} from "@/features/sidebar/lib/channelSortPreference";
+  type ChannelBrowserSort,
+  type ChannelBrowserTab,
+  resolveChannelBrowserEnterAction,
+  selectOrderedChannels,
+  shouldShowCreateRow,
+} from "@/features/channels/lib/channelBrowserEnterAction";
 import { ListSortDescending } from "@/shared/ui/icons";
 import {
   Dialog,
@@ -52,8 +51,8 @@ import {
   CreateChannelFormFooter,
 } from "@/features/sidebar/ui/CreateChannelFormFields";
 
-type BrowserTab = "all" | "joined" | "archived";
-type ChannelSort = ChannelSortMode | "members";
+type BrowserTab = ChannelBrowserTab;
+type ChannelSort = ChannelBrowserSort;
 
 const CHANNEL_SORT_OPTIONS: { label: string; value: ChannelSort }[] = [
   { label: "Alphabetical", value: "alpha" },
@@ -132,12 +131,16 @@ export function ChannelBrowserDialog({
     width: 0,
   });
   const canonicalQuery = canonicalChannelName(query);
-  const deferredQuery = React.useDeferredValue(canonicalQuery.toLowerCase());
   const trimmedQuery = canonicalQuery;
-  // Immediate (non-deferred) lowercased query. The create row's visibility
-  // (via hasExactMatch) and its label both read from the live query so they
-  // can never disagree for a frame while the fuzzy filter catches up.
+  // Immediate (non-deferred) lowercased query. This is the AUTHORITATIVE
+  // query: the create row's visibility and label read it, and so does every
+  // branch of the Enter decision.
   const normalizedQuery = trimmedQuery.toLowerCase();
+  // Deferred copy, used ONLY to build the rendered list — fuzzy-scoring every
+  // channel is the expensive part of typing, so the list is allowed to trail
+  // by a keystroke. Nothing that decides what a key press *does* may read it;
+  // see `resolveChannelBrowserEnterAction` (BUG-043).
+  const deferredQuery = React.useDeferredValue(normalizedQuery);
 
   const isForumMode = channelTypeFilter === "forum";
   const canCreate = Boolean(onCreateChannel);
@@ -162,100 +165,26 @@ export function ChannelBrowserDialog({
     onCreated: () => onOpenChange(false),
   });
 
-  // Fuzzy match score per channel id for the current query, so both filtering
-  // and relevance-ordering share one source of truth. Empty when no query.
-  const matchScoreById = React.useMemo(() => {
-    const scores = new Map<string, number>();
-    if (deferredQuery.length === 0) return scores;
-    for (const channel of channels) {
-      const score = scoreChannelMatch(channel, deferredQuery);
-      if (score !== null) scores.set(channel.id, score);
-    }
-    return scores;
-  }, [channels, deferredQuery]);
-
-  const matchingChannels = React.useMemo(() => {
-    const filtered = channels.filter(
-      (channel) =>
-        channel.channelType !== "dm" &&
-        (channel.archivedAt
-          ? channel.isMember
-          : channel.visibility === "open" || channel.isMember) &&
-        (channelTypeFilter ? channel.channelType === channelTypeFilter : true),
-    );
-
-    if (deferredQuery.length === 0) {
-      return filtered;
-    }
-
-    return filtered.filter((channel) => matchScoreById.has(channel.id));
-  }, [channels, channelTypeFilter, deferredQuery, matchScoreById]);
-
-  const currentChannels = React.useMemo(
-    () => matchingChannels.filter((channel) => channel.archivedAt === null),
-    [matchingChannels],
+  // The rendered list. Built from the deferred query, so it may describe the
+  // previous keystroke for a frame — which is exactly why the Enter handler
+  // below does not read it directly.
+  const orderedVisibleChannels = React.useMemo(
+    () =>
+      selectOrderedChannels({
+        activeTab,
+        channelTypeFilter,
+        channels,
+        query: deferredQuery,
+        sort,
+      }),
+    [activeTab, channelTypeFilter, channels, deferredQuery, sort],
   );
-
-  const joinedChannels = React.useMemo(
-    () => currentChannels.filter((channel) => channel.isMember),
-    [currentChannels],
-  );
-
-  const archivedChannels = React.useMemo(
-    () => matchingChannels.filter((channel) => channel.archivedAt !== null),
-    [matchingChannels],
-  );
-
-  const visibleChannels =
-    activeTab === "archived"
-      ? archivedChannels
-      : activeTab === "joined"
-        ? joinedChannels
-        : matchingChannels;
-
-  const isSearching = deferredQuery.length > 0;
-
-  const orderedVisibleChannels = React.useMemo(() => {
-    const sorted =
-      sort === "members"
-        ? [...visibleChannels].sort(
-            (a, b) =>
-              b.memberCount - a.memberCount ||
-              a.name.localeCompare(b.name, undefined, {
-                sensitivity: "base",
-              }),
-          )
-        : sortChannelsForSidebar(visibleChannels, sort);
-
-    if (!isSearching) return sorted;
-
-    return sorted.sort(
-      (a, b) =>
-        (matchScoreById.get(a.id) ?? Number.POSITIVE_INFINITY) -
-        (matchScoreById.get(b.id) ?? Number.POSITIVE_INFINITY),
-    );
-  }, [isSearching, matchScoreById, sort, visibleChannels]);
 
   const selectedSortLabel =
     CHANNEL_SORT_OPTIONS.find((option) => option.value === sort)?.label ??
     "Alphabetical";
 
   const allTabLabel = isForumMode ? "All forums" : "All channels";
-
-  // Whether an exact name match already exists — if so we don't offer to
-  // create a duplicate, mirroring how you'd never make two "#general"s.
-  const hasExactMatch = React.useMemo(
-    () =>
-      channels.some(
-        (channel) =>
-          channel.channelType !== "dm" &&
-          channelNamesMatch(channel.name, normalizedQuery) &&
-          (channelTypeFilter
-            ? channel.channelType === channelTypeFilter
-            : true),
-      ),
-    [channels, channelTypeFilter, normalizedQuery],
-  );
 
   // The pinned create row (Are.na style) appears for any non-empty query that
   // isn't already an exact channel name — covering both partial-match and
@@ -264,7 +193,19 @@ export function ChannelBrowserDialog({
   // you can browse *or* create), then specializes to "Create «query»" as you
   // type. It only hides when the query is an exact match for an existing name
   // — creating a duplicate "#general" makes no sense.
-  const showCreateRow = canCreate && !hasExactMatch;
+  //
+  // Reads the IMMEDIATE query, never the deferred one: this row is O(1), so
+  // there is nothing to gain by lagging it and a wrong prefilled name to lose.
+  const showCreateRow = React.useMemo(
+    () =>
+      shouldShowCreateRow({
+        canCreate,
+        channelTypeFilter,
+        channels,
+        query: normalizedQuery,
+      }),
+    [canCreate, channels, channelTypeFilter, normalizedQuery],
+  );
 
   // The create row participates in keyboard navigation as a virtual item so
   // arrow keys reach it and Enter activates it — not just Tab. It's rendered
@@ -386,12 +327,6 @@ export function ChannelBrowserDialog({
     });
   }
 
-  // Map the flat nav index back to a channel, accounting for the create row
-  // occupying index 0 when present.
-  const selectedItem =
-    selectedIndex !== null && !isCreateRowSelected
-      ? orderedVisibleChannels[selectedIndex - channelNavOffset]
-      : undefined;
   const emptyTitle =
     deferredQuery.length > 0
       ? `No ${entityLabel}s match your search`
@@ -487,24 +422,37 @@ export function ChannelBrowserDialog({
                         event.key === "Enter" &&
                         !event.nativeEvent.isComposing
                       ) {
-                        // If the create row is highlighted — or it's the only
-                        // actionable item (no channel matches) — Enter creates.
-                        if (
-                          showCreateRow &&
-                          (isCreateRowSelected ||
-                            orderedVisibleChannels.length === 0)
-                        ) {
-                          event.preventDefault();
-                          enterCreateMode(trimmedQuery);
+                        // One consistent query decides everything here. The
+                        // rendered list is deferred and may still describe the
+                        // previous keystroke; the resolver recomputes it for
+                        // the live query rather than letting a stale list
+                        // answer for a name you just finished typing —
+                        // otherwise Enter navigates into an unrelated channel
+                        // instead of creating yours (BUG-043).
+                        const action = resolveChannelBrowserEnterAction({
+                          activeTab,
+                          canCreate,
+                          channelTypeFilter,
+                          channels,
+                          query: trimmedQuery,
+                          renderedChannels: orderedVisibleChannels,
+                          renderedQuery: deferredQuery,
+                          selectedIndex,
+                          sort,
+                        });
+
+                        if (action.kind === "none") {
                           return;
                         }
 
-                        if (orderedVisibleChannels.length > 0) {
-                          event.preventDefault();
-                          handleSelect(
-                            selectedItem ?? orderedVisibleChannels[0],
-                          );
+                        event.preventDefault();
+
+                        if (action.kind === "create") {
+                          enterCreateMode(action.name);
+                          return;
                         }
+
+                        handleSelect(action.channel);
                       }
                     }}
                     placeholder={searchPlaceholder}
