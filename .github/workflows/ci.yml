@@ -86,6 +86,11 @@ jobs:
         run: scripts/test-mobile-worktree-overrides.sh
       - name: File size ratchet unit tests
         run: node --test scripts/check-file-sizes-core.test.mjs
+      # BUG-046. The guard itself runs inside `tauri build`; these are its unit
+      # tests. They live in this always-run job on purpose — a path filter would
+      # let a change that weakens the guard land without ever exercising it.
+      - name: Sidecar binary guard unit tests
+        run: node --test scripts/check-sidecar-binaries-core.test.mjs
 
   rust-lint:
     name: Rust Lint
@@ -1098,8 +1103,15 @@ jobs:
         with:
           path: ${{ github.workspace }}/.cache/mesh-llama
           key: mesh-llama-${{ runner.os }}-metal-${{ steps.mesh_rev.outputs.rev }}
+      # --no-bundle is deliberate (BUG-046). This job stages 0-byte sidecar
+      # placeholders above, which is fine for proving the app COMPILES and is
+      # all this job exists to prove. Without --no-bundle it also produced a
+      # .app/.dmg whose sidecars were empty files — the exact artifact that
+      # replaced a working install with `%1 is not a valid Win32 application`.
+      # Bundling is covered by release.yml and the canary workflows, which run
+      # scripts/bundle-sidecars.sh with real binaries first.
       - name: Build Tauri app
-        run: cd desktop && pnpm tauri build
+        run: cd desktop && pnpm tauri build --no-bundle
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           MACOSX_DEPLOYMENT_TARGET: "10.15"

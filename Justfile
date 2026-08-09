@@ -149,7 +149,14 @@ fmt-all: fmt desktop-tauri-fmt mobile-fmt
 fix-all: fmt desktop-tauri-fmt desktop-fix web-fix mobile-fix
 
 # Ensure sidecar placeholder binaries exist (Tauri validates externalBin at compile time)
-# Sidecar binary list must stay in sync with desktop-release-build below.
+#
+# BUG-046: these are 0-byte files and they are ONLY safe for recipes that
+# compile, check, lint or run dev — never for one that bundles. Bundling them
+# produces an installer that overwrites a working install with empty
+# executables. Depend on this recipe only from compile-only targets; anything
+# that runs `tauri build` must build the crates and stage them through
+# scripts/bundle-sidecars.sh instead (see desktop-release-build). The
+# beforeBundleCommand guard in tauri.conf.json enforces this at bundle time.
 _ensure-sidecar-stubs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -236,25 +243,25 @@ desktop-tauri-test-compiled-flags: _ensure-sidecar-stubs
     echo "Both compiled states verified."
 
 # Build the full desktop Tauri app locally (unsigned, for testing)
-# Sidecar binary list must stay in sync with _ensure-sidecar-stubs above.
 # pnpm install is unconditional here: release builds must start from a clean dep tree.
 desktop-release-build target="aarch64-apple-darwin":
     #!/usr/bin/env bash
     set -euo pipefail
     TARGET={{target}}
-    mkdir -p desktop/src-tauri/binaries
-    # Same `.exe` rule as _ensure-sidecar-stubs; see the comment there.
-    EXE=""
-    if [[ "$TARGET" == *windows* ]]; then
-        EXE=".exe"
-    else
-        touch "desktop/src-tauri/binaries/buzz-backend-kubernetes-$TARGET"
+    # BUG-046: this recipe used to `touch` 0-byte placeholders and then bundle
+    # them, so every installer it produced shipped empty sidecars — an install
+    # from it left every agent failing with
+    # "%1 is not a valid Win32 application (os error 193)". A recipe that
+    # BUNDLES must build the sidecars for real; only the compile-only recipes
+    # (_ensure-sidecar-stubs) may use placeholders. Staging goes through
+    # scripts/bundle-sidecars.sh, the one place that knows Tauri's
+    # <name>-<triple><exe> naming, so this list cannot drift from it.
+    PACKAGES=(-p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli)
+    if [[ "$TARGET" != *windows* ]]; then
+        PACKAGES+=(-p buzz-backend-kubernetes)
     fi
-    touch "desktop/src-tauri/binaries/buzz-acp-$TARGET$EXE"
-    touch "desktop/src-tauri/binaries/buzz-agent-$TARGET$EXE"
-    touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET$EXE"
-    touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET$EXE"
-    touch "desktop/src-tauri/binaries/buzz-$TARGET$EXE"
+    cargo build --release --target "$TARGET" "${PACKAGES[@]}"
+    ./scripts/bundle-sidecars.sh "$TARGET"
     pnpm install
     cd {{desktop_dir}} && pnpm tauri build --features mesh-llm --target {{target}}
 

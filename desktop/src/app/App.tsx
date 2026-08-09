@@ -44,6 +44,7 @@ import { ResetFailedScreen } from "@/features/onboarding/ui/ResetFailedScreen";
 import { useCommunityInit } from "@/features/communities/useCommunityInit";
 import { useNestNotifications } from "@/features/communities/useNestNotifications";
 import { useCommunities } from "@/features/communities/useCommunities";
+import { admitCommunityDestinationRoute } from "@/features/communities/communityDestinationAdmission";
 import {
   loadCommunityDestination,
   markPendingCommunityRestore,
@@ -359,17 +360,21 @@ function CommunityApp({
         );
         await router.navigate({ to: "/", replace: true });
         markPendingCommunityRestore(targetCommunityId);
-        const destination = loadCommunityDestination(targetCommunityId);
-        if (destination?.kind === "channel") {
-          replaceCommunityDestinationRoute(
-            destination.channelId,
-            router.history,
-          );
+        // BUG-052: same admission rule as the community-rail switch. Only a
+        // positively observed channel in the target community admits the
+        // pre-navigation; anything unobserved or failed stays on Home.
+        const admittedChannelId = admitCommunityDestinationRoute(
+          loadCommunityDestination(targetCommunityId),
+          communities.find((community) => community.id === targetCommunityId)
+            ?.relayUrl,
+        );
+        if (admittedChannelId !== null) {
+          replaceCommunityDestinationRoute(admittedChannelId, router.history);
         }
       }
       switchCommunity(targetCommunityId);
     },
-    [activeCommunity?.id, switchCommunity],
+    [activeCommunity?.id, communities, switchCommunity],
   );
 
   const handleCommunityOnboardingConnect = useCallback(async () => {

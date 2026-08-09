@@ -33,6 +33,7 @@ import {
   useRelayConnection,
 } from "@/shared/api/useRelayConnection";
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
+import { createHoverMenuController } from "@/features/communities/lib/hoverMenuController";
 import { useActiveCommunityIcon } from "@/features/communities/useCommunityIcons";
 import { EditCommunityDialog } from "./EditCommunityDialog";
 
@@ -102,8 +103,15 @@ export function CommunitySwitcher({
 }: CommunitySwitcherProps) {
   const [editingCommunity, setEditingCommunity] =
     React.useState<Community | null>(null);
-  const [dropdownOpen, setDropdownOpen] = React.useState(false);
-  const profileMenuHoverTimer = React.useRef<number | null>(null);
+  // BUG-051: never call `setDropdownOpenState` directly. Every open/close goes
+  // through `menu.setOpen`, which owns (and cancels) the hover timer. A bare
+  // state write leaves an armed hover timer alive, and it re-opens the menu the
+  // user just dismissed. `communitySwitcherTimerOwnership.test.mjs` enforces it.
+  const [dropdownOpen, setDropdownOpenState] = React.useState(false);
+  const menu = React.useMemo(
+    () => createHoverMenuController({ setOpen: setDropdownOpenState }),
+    [],
+  );
   const connectionState = useRelayConnection();
   const degraded = isRelayConnectionDegraded(connectionState);
   const connectionLabel = CONNECTION_STATE_LABEL[connectionState];
@@ -111,41 +119,12 @@ export function CommunitySwitcher({
   const activeIcon = activeIconQuery.data ?? null;
   const isProfileVariant = variant === "profile";
 
-  function clearProfileMenuHoverTimer() {
-    if (profileMenuHoverTimer.current !== null) {
-      window.clearTimeout(profileMenuHoverTimer.current);
-      profileMenuHoverTimer.current = null;
-    }
-  }
-
   function scheduleProfileMenu(nextOpen: boolean) {
     if (variant !== "profile-menu") return;
-    clearProfileMenuHoverTimer();
-    profileMenuHoverTimer.current = window.setTimeout(
-      () => setDropdownOpen(nextOpen),
-      nextOpen ? 80 : 160,
-    );
+    menu.schedule(nextOpen);
   }
 
-  function handleProfileMenuOpenChange(nextOpen: boolean) {
-    if (variant !== "profile-menu") {
-      setDropdownOpen(nextOpen);
-      return;
-    }
-    if (!nextOpen) {
-      clearProfileMenuHoverTimer();
-    }
-    setDropdownOpen(nextOpen);
-  }
-
-  React.useEffect(
-    () => () => {
-      if (profileMenuHoverTimer.current !== null) {
-        window.clearTimeout(profileMenuHoverTimer.current);
-      }
-    },
-    [],
-  );
+  React.useEffect(() => menu.dispose, [menu]);
 
   const triggerContent = (
     <>
@@ -204,7 +183,7 @@ export function CommunitySwitcher({
 
   const profileMenuPopover =
     variant === "profile-menu" ? (
-      <Popover open={dropdownOpen} onOpenChange={handleProfileMenuOpenChange}>
+      <Popover open={dropdownOpen} onOpenChange={menu.setOpen}>
         <PopoverTrigger asChild>
           <button
             aria-expanded={dropdownOpen}
@@ -243,7 +222,7 @@ export function CommunitySwitcher({
                 <button
                   className="flex min-h-9 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm outline-hidden transition-colors hover:bg-muted/50 focus:bg-muted/50 focus:outline-none focus-visible:bg-muted/50 focus-visible:outline-none"
                   onClick={() => {
-                    setDropdownOpen(false);
+                    menu.setOpen(false);
                     void writeTextToClipboard(activeCommunity.relayUrl);
                   }}
                   role="menuitem"
@@ -256,7 +235,7 @@ export function CommunitySwitcher({
                   <button
                     className="flex min-h-9 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm outline-hidden transition-colors hover:bg-muted/50 focus:bg-muted/50 focus:outline-none focus-visible:bg-muted/50 focus-visible:outline-none"
                     onClick={() => {
-                      setDropdownOpen(false);
+                      menu.setOpen(false);
                       onInvite();
                     }}
                     role="menuitem"
@@ -269,7 +248,7 @@ export function CommunitySwitcher({
                 <button
                   className="flex min-h-9 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm outline-hidden transition-colors hover:bg-muted/50 focus:bg-muted/50 focus:outline-none focus-visible:bg-muted/50 focus-visible:outline-none"
                   onClick={() => {
-                    setDropdownOpen(false);
+                    menu.setOpen(false);
                     setEditingCommunity(activeCommunity);
                   }}
                   role="menuitem"
@@ -284,7 +263,7 @@ export function CommunitySwitcher({
             <button
               className="flex min-h-9 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm outline-hidden transition-colors hover:bg-muted/50 focus:bg-muted/50 focus:outline-none focus-visible:bg-muted/50 focus-visible:outline-none"
               onClick={() => {
-                setDropdownOpen(false);
+                menu.setOpen(false);
                 onAddCommunity();
               }}
               role="menuitem"
@@ -299,11 +278,7 @@ export function CommunitySwitcher({
     ) : null;
 
   const switcherDropdown = (
-    <DropdownMenu
-      modal={false}
-      open={dropdownOpen}
-      onOpenChange={setDropdownOpen}
-    >
+    <DropdownMenu modal={false} open={dropdownOpen} onOpenChange={menu.setOpen}>
       <DropdownMenuTrigger asChild>
         {variant === "profile" ? (
           <button
@@ -360,7 +335,7 @@ export function CommunitySwitcher({
               onClick={(e) => {
                 e.stopPropagation();
                 e.preventDefault();
-                setDropdownOpen(false);
+                menu.setOpen(false);
                 setEditingCommunity(community);
               }}
               type="button"

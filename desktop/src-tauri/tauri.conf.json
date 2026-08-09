@@ -11,6 +11,10 @@
     },
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "pnpm build",
+    "beforeBundleCommand": {
+      "script": "node ./scripts/check-sidecar-binaries.mjs",
+      "cwd": ".."
+    },
     "frontendDist": "../dist"
   },
   "app": {

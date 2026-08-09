@@ -29,13 +29,27 @@ else
     EXE=""
 fi
 
+# BUG-046: an existence test is not enough. `[[ -f ]]` is true for a 0-byte
+# file, so a stub in target/release was copied over the real sidecar and
+# bundled. Reject anything empty at the source, before it is staged, and name
+# it — a build that stages a broken binary has already lost.
 missing=()
+empty=()
 for bin in "${SIDECARS[@]}"; do
-    [[ -f "$SRC_DIR/${bin}${EXE}" ]] || missing+=("${bin}${EXE}")
+    src="$SRC_DIR/${bin}${EXE}"
+    if [[ ! -f "$src" ]]; then
+        missing+=("${bin}${EXE}")
+    elif [[ ! -s "$src" ]]; then
+        empty+=("${bin}${EXE}")
+    fi
 done
-if [[ ${#missing[@]} -gt 0 ]]; then
-    echo "Error: missing release binaries in $SRC_DIR: ${missing[*]}" >&2
+if [[ ${#missing[@]} -gt 0 || ${#empty[@]} -gt 0 ]]; then
+    [[ ${#missing[@]} -gt 0 ]] && \
+        echo "Error: missing release binaries in $SRC_DIR: ${missing[*]}" >&2
+    [[ ${#empty[@]} -gt 0 ]] && \
+        echo "Error: ZERO-LENGTH release binaries in $SRC_DIR: ${empty[*]}" >&2
     echo "Run '$BUILD_HINT' first." >&2
+    echo "Do not create placeholder files to satisfy this check (BUG-046)." >&2
     exit 1
 fi
 
@@ -51,4 +65,10 @@ for bin in "${SIDECARS[@]}"; do
         chmod 755 "$destination"
     fi
 done
+
+# BUG-046: verify what was actually staged, against the same externalBin list
+# Tauri will read at bundle time. One implementation of the rule, shared with
+# the beforeBundleCommand hook, so the two can never drift apart.
+node desktop/scripts/check-sidecar-binaries.mjs "$TARGET"
+
 echo "Sidecars bundled for $TARGET"

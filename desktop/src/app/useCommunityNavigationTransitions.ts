@@ -7,6 +7,7 @@ import {
   replaceCommunityDestinationRoute,
   runCommunityViewTransition,
 } from "@/app/communityViewTransition";
+import { admitCommunityDestinationRoute } from "@/features/communities/communityDestinationAdmission";
 import {
   loadCommunityDestination,
   markPendingCommunityRestore,
@@ -52,16 +53,24 @@ export function useCommunityNavigationTransitions({
         return;
       }
 
+      const target = communities.communities.find(
+        (community) => community.id === id,
+      );
+
       await runCommunityViewTransition(async () => {
         saveActiveDestination();
         await goHome({ replace: true });
         markPendingCommunityRestore(id);
-        const destination = loadCommunityDestination(id);
-        if (destination?.kind === "channel") {
-          replaceCommunityDestinationRoute(
-            destination.channelId,
-            router.history,
-          );
+        // BUG-052: only a positive, observed record of the channel in the
+        // TARGET community admits this pre-navigation. Unobserved, in-flight
+        // and failed reads all stay on the Home barrier, where AppShell's
+        // restore effect picks the route up after a live read succeeds.
+        const admittedChannelId = admitCommunityDestinationRoute(
+          loadCommunityDestination(id),
+          target?.relayUrl,
+        );
+        if (admittedChannelId !== null) {
+          replaceCommunityDestinationRoute(admittedChannelId, router.history);
         }
         communities.switchCommunity(id);
       });
@@ -84,12 +93,13 @@ export function useCommunityNavigationTransitions({
         saveActiveDestination();
         await goHome({ replace: true });
         markPendingCommunityRestore(fallback.id);
-        const destination = loadCommunityDestination(fallback.id);
-        if (destination?.kind === "channel") {
-          replaceCommunityDestinationRoute(
-            destination.channelId,
-            router.history,
-          );
+        // Same admission rule as switchCommunity (BUG-052).
+        const admittedChannelId = admitCommunityDestinationRoute(
+          loadCommunityDestination(fallback.id),
+          fallback.relayUrl,
+        );
+        if (admittedChannelId !== null) {
+          replaceCommunityDestinationRoute(admittedChannelId, router.history);
         }
         communities.removeCommunity(id);
       });

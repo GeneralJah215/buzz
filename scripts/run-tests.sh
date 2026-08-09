@@ -78,6 +78,15 @@ ensure_infra() {
 run_unit_tests() {
   section "Unit Tests (no infra required)"
 
+  # BUG-046 guard. The check itself runs inside `tauri build`
+  # (build.beforeBundleCommand), where it needs real staged binaries; these are
+  # its unit tests, which need nothing but node. They pin the properties the
+  # bug turned on: a 0-byte file must be rejected, the platform externalBin
+  # override must REPLACE rather than extend the base list, and the failure
+  # must be a non-zero exit rather than a warning.
+  run_test_step "sidecar binary guard unit tests" \
+    node --test scripts/check-sidecar-binaries-core.test.mjs
+
   run_test_step "buzz-core tests" \
     cargo test -p buzz-core --lib -- --nocapture
 
