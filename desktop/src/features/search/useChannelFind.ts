@@ -8,6 +8,9 @@ import { hasPrimaryShortcutModifier } from "@/shared/lib/platform";
 const MIN_QUERY_LENGTH = 2;
 const DEBOUNCE_MS = 300;
 
+/** Stable identity so the merge memo does not thrash while the relay is behind. */
+const NO_RELAY_HITS: SearchHit[] = [];
+
 type UseChannelFindOptions = {
   channelId: string | null;
   messages: TimelineMessage[];
@@ -46,6 +49,13 @@ export function useChannelFind({
     return () => window.clearTimeout(timeout);
   }, [query]);
 
+  // Typing a new term is a new search: start over at its first match rather
+  // than keeping the cursor from the previous term's result list.
+  const setQueryAndRestartNavigation = React.useCallback((next: string) => {
+    setQuery(next);
+    setActiveIndex(0);
+  }, []);
+
   // Client-side search: instant matches against loaded messages.
   const clientMatchIds = React.useMemo<string[]>(() => {
     const trimmed = query.trim().toLowerCase();
@@ -70,6 +80,17 @@ export function useChannelFind({
     limit: 100,
   });
 
+  // The client pass reads `query` (every keystroke); the relay pass reads
+  // `debouncedQuery`, which trails it by DEBOUNCE_MS. Merging the two
+  // generations makes the find bar count, highlight and navigate to messages
+  // that do not contain what is in the input — a fast typist gets results for
+  // a prefix they have already typed past. Only merge relay hits once the
+  // relay is answering the query the reader can actually see.
+  const relayHits =
+    debouncedQuery.length >= MIN_QUERY_LENGTH && debouncedQuery === query.trim()
+      ? (relaySearch.data?.hits ?? NO_RELAY_HITS)
+      : NO_RELAY_HITS;
+
   // Merge: start with client-side matches, then supplement with relay hits.
   // Relay hits may refer to older messages outside the initial cold window;
   // keep them in the match list and ask the route-target splice path to load
@@ -78,17 +99,15 @@ export function useChannelFind({
     const merged = [...clientMatchIds];
     const seen = new Set(merged);
 
-    if (relaySearch.data?.hits) {
-      for (const hit of relaySearch.data.hits) {
-        if (!seen.has(hit.eventId)) {
-          merged.push(hit.eventId);
-          seen.add(hit.eventId);
-        }
+    for (const hit of relayHits) {
+      if (!seen.has(hit.eventId)) {
+        merged.push(hit.eventId);
+        seen.add(hit.eventId);
       }
     }
 
     return merged;
-  }, [clientMatchIds, relaySearch.data?.hits]);
+  }, [clientMatchIds, relayHits]);
 
   // Clamp active index when results change.
   React.useEffect(() => {
@@ -103,11 +122,11 @@ export function useChannelFind({
 
   const relayHitById = React.useMemo(() => {
     const hits = new Map<string, SearchHit>();
-    for (const hit of relaySearch.data?.hits ?? []) {
+    for (const hit of relayHits) {
       hits.set(hit.eventId, hit);
     }
     return hits;
-  }, [relaySearch.data?.hits]);
+  }, [relayHits]);
 
   React.useEffect(() => {
     if (!activeMatch) return;
@@ -173,7 +192,7 @@ export function useChannelFind({
       matchCount: matchedIds.length,
       matchingMessageIds,
       query,
-      setQuery,
+      setQuery: setQueryAndRestartNavigation,
     }),
     [
       activeIndex,
@@ -185,6 +204,7 @@ export function useChannelFind({
       matchedIds.length,
       matchingMessageIds,
       query,
+      setQueryAndRestartNavigation,
     ],
   );
 }
