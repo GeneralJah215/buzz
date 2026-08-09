@@ -6,6 +6,7 @@ import {
   markCommunityOnboardingComplete,
   useCommunityOnboarding,
 } from "@/features/onboarding/communityOnboarding";
+import { decideAvatarSave } from "@/features/onboarding/avatarSaveDecision";
 import { initializeStarterChannels } from "@/features/onboarding/hooks";
 import { useClaimInvite } from "@/features/onboarding/useClaimInvite";
 import { CommunityChangeOverlay } from "@/features/communities/ui/CommunityChangeOverlay";
@@ -154,6 +155,17 @@ export function CommunityOnboardingFlow({
   const [displayName, setDisplayName] = React.useState("");
   const [avatarUrl, setAvatarUrl] = React.useState("");
   const avatarPresentation = useAvatarPresentation(avatarUrl);
+  // The presentation store evicts a "ready" entry 30 s after it settles, which
+  // would turn an avatar this session watched load back into an unknown one.
+  // Remember the observation so BUG-053's strict "ready" guard stays honest for
+  // a user who uploads first and finishes the form later.
+  const observedReadyAvatarUrlsRef = React.useRef<Set<string>>(new Set());
+  const observedReadyUrl =
+    avatarPresentation?.state === "ready" ? avatarUrl.trim() : null;
+  React.useEffect(() => {
+    if (observedReadyUrl)
+      observedReadyAvatarUrlsRef.current.add(observedReadyUrl);
+  }, [observedReadyUrl]);
   const [isUploadingAvatar, setIsUploadingAvatar] = React.useState(false);
   const [isAvatarEditorOpen, setIsAvatarEditorOpen] = React.useState(false);
   const [starterPersonas, setStarterPersonas] = React.useState<AgentPersona[]>(
@@ -400,24 +412,27 @@ export function CommunityOnboardingFlow({
     setIsPending(true);
     try {
       const candidateAvatarUrl = avatarUrl.trim();
-      const presentationState = avatarPresentation?.state;
-      const shouldSaveCandidate =
-        candidateAvatarUrl.length > 0 &&
-        presentationState !== "failed" &&
-        presentationState !== "pending";
+      // BUG-053: `useAvatarPresentation` returns null for a URL the store has
+      // never tracked, so "not failed and not pending" also admitted *unknown*.
+      // Publishing now requires a positive, observed "ready".
+      const { deferUntilReady, saveCandidateUrl } = decideAvatarSave({
+        candidateAvatarUrl,
+        hasObservedReady:
+          observedReadyAvatarUrlsRef.current.has(candidateAvatarUrl),
+        presentationState: avatarPresentation?.state,
+      });
 
-      const deferredAvatar =
-        candidateAvatarUrl && presentationState && presentationState !== "ready"
-          ? registerAvatarWhenReady({
-              avatarUrl: candidateAvatarUrl,
-              relayUrl: transaction.relayUrl,
-            })
-          : null;
+      const deferredAvatar = deferUntilReady
+        ? registerAvatarWhenReady({
+            avatarUrl: candidateAvatarUrl,
+            relayUrl: transaction.relayUrl,
+          })
+        : null;
 
       try {
         const profile = await updateProfile({
           displayName: displayName.trim(),
-          avatarUrl: shouldSaveCandidate ? candidateAvatarUrl : undefined,
+          avatarUrl: saveCandidateUrl ? candidateAvatarUrl : undefined,
         });
         deferredAvatar?.release({
           expectedPubkey: profile.pubkey,

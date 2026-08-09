@@ -18,6 +18,11 @@ import { Toaster } from "@/shared/ui/sonner";
 import { TooltipProvider } from "@/shared/ui/tooltip";
 import { recoverLocalStorageQuotaOnStartup } from "@/shared/lib/localStorageQuota";
 import { installDesktopErrorLogging } from "@/shared/lib/desktopErrorLogging";
+import {
+  handleVitePreloadError,
+  renderBootstrapFailure,
+  runOptionalBootstrapStep,
+} from "@/mainBootstrap";
 
 type E2eWindow = Window & {
   __BUZZ_E2E__?: unknown;
@@ -116,10 +121,21 @@ async function bootstrap() {
   resetDevWebviewStateFromUrl();
   configureDevE2eBridgeFromUrl();
   recoverLocalStorageQuotaOnStartup();
-  await installE2eBridgeIfConfigured();
+  // BUG-054: the e2e bridge is test-only scaffolding behind an un-preloaded
+  // ~160 KB dynamic import. Awaiting it inline meant a failed chunk fetch also
+  // skipped renderApp() and the user got a blank window. The app must render
+  // whether or not the optional import lands, so its failure is reported and
+  // stepped past instead of propagating.
+  await runOptionalBootstrapStep("e2e bridge", installE2eBridgeIfConfigured);
   await migrateLegacyCommunityStorageBeforeRender();
   renderApp();
 }
 
 installDesktopErrorLogging();
-void bootstrap();
+// Only `vite:preloadError` names the chunk that failed to fetch; the rejection
+// that follows from it usually does not. Registered before bootstrap so a
+// preload failure during the very first import is still recorded.
+window.addEventListener("vite:preloadError", handleVitePreloadError);
+void bootstrap().catch((error: unknown) => {
+  renderBootstrapFailure(error);
+});
