@@ -125,6 +125,16 @@ async function setupRoleplayChannel(page: import("@playwright/test").Page) {
   });
   await page.goto("/");
   await page.getByTestId("channel-general").click();
+  // Clicking leaves the pointer parked on the sidebar row, and hovering a
+  // channel row opens the channel-activity popover (see
+  // channel-activity-popover.spec.ts). That popover floats OVER the message
+  // timeline and swallows the `message-thread-summary` click below, which
+  // Playwright reports as "<div data-testid=message-timeline …> intercepts
+  // pointer events" — an interception, not an unstable element. It only
+  // appears when the run is slow enough for the hover to mature before the
+  // click, so it reads as flake. `screenshotThreadPanel` already moves the
+  // pointer away for the same reason; do it once here instead.
+  await page.mouse.move(360, 24);
   await expect(page.getByTestId("chat-title")).toHaveText(CHANNEL);
   await waitForMockLiveSubscription(page, CHANNEL);
 }

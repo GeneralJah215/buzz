@@ -1992,6 +1992,19 @@ test("name-only community profile save preserves an existing avatar", async ({
           .map(({ payload }) => (payload as { avatarUrl?: string }).avatarUrl),
       ),
     )
+    // A save must not republish an avatar the app has never seen render.
+    //
+    // If this receives the seeded URL instead of `undefined`, the app is
+    // publishing an unverified avatar, and the cause is at
+    // `CommunityOnboardingFlow.tsx:403-407`: `shouldSaveCandidate` is written
+    // as `state !== "failed" && state !== "pending"`, but
+    // `useAvatarPresentation` returns `null` for a URL the presentation store
+    // has not started tracking, so an UNKNOWN state passes a guard that was
+    // meant to admit only "ready". Reproduce deterministically by throttling
+    // the renderer before `goto` — `newCDPSession(page)` then
+    // `Emulation.setCPUThrottlingRate { rate: 8 }` fails this 1/1; unthrottled
+    // it fails roughly 1 in 4, and only because the profile query usually has
+    // not resolved yet, which is the wrong reason to be green. See BUG-037.
     .toEqual([undefined]);
   const profile = await invokeMockCommand<{ avatar_url: string | null }>(
     page,

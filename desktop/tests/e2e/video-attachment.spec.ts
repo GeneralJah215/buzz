@@ -28,6 +28,11 @@ const VIDEO_REVIEW_ACCENT_FOREGROUND_RGB = "rgb(240, 115, 177)";
 const VIDEO_REVIEW_INDIGO_ACCENT = "#6366f1";
 const VIDEO_REVIEW_INDIGO_FOREGROUND_RGB = "rgb(141, 143, 245)";
 const VIDEO_REVIEW_NEUTRAL_DARK_RGB = "rgb(250, 250, 250)";
+// The mock bridge answers `get_media_proxy_port` with this port, so relay
+// media URLs are rewritten to `http://127.0.0.1:54321/media/…` before they
+// reach the <video> element. Mirrors MOCK_MEDIA_PROXY_PORT in the bridge and
+// in custom-emoji.spec.ts.
+const MOCK_MEDIA_PROXY_PORT = 54321;
 const POSTER_DATA_URL =
   "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNjAgODAiPjxyZWN0IHdpZHRoPSIxNjAiIGhlaWdodD0iODAiIGZpbGw9IiMyNjQ2NTMiLz48Y2lyY2xlIGN4PSI1NCIgY3k9IjQwIiByPSIyMiIgZmlsbD0iI2YyYzE0ZSIvPjxwYXRoIGQ9Ik05MiAyNGg0NHYzMkg5MnoiIGZpbGw9IiNmNzgxNTQiLz48L3N2Zz4=";
 
@@ -89,7 +94,7 @@ async function installVideoReviewHarness(
   }: { accentColor?: string; themeName?: string } = {},
 ) {
   await page.addInitScript(
-    ({ accentColor, themeName }) => {
+    ({ accentColor, mediaProxyPort, themeName }) => {
       if (themeName) {
         window.localStorage.setItem("buzz-theme", themeName);
       }
@@ -153,8 +158,48 @@ async function installVideoReviewHarness(
           return 12.5;
         },
       });
+
+      // This harness fakes the media element (load/play/pause/currentTime/
+      // duration), but the browser still runs its real resource-selection
+      // algorithm against the fixture URLs, and nothing in e2e serves video
+      // bytes — relay URLs are rewritten to the loopback media proxy
+      // (127.0.0.1:54321) that only the desktop shell runs.
+      //
+      // Chromium reports that failure ASYNCHRONOUSLY: measured at ~1.8 s after
+      // `loadstart` on this Windows box, i.e. AFTER the test has pressed play,
+      // so `started` is already true and `VideoPlayer`'s `onError` fires.
+      // The player then correctly swaps its ENTIRE inline control bar for the
+      // "Failed to load — tap to retry" affordance, and every later assertion
+      // about inline controls — speed, mute, pause — becomes unreachable.
+      // That is the absence of a media server, not app behaviour. Whether it
+      // lands before or after the play click is pure environment timing, which
+      // is why this file passes on CI and fails here.
+      //
+      // Scoped deliberately: only "the browser found no usable source at all"
+      // (`MEDIA_ERR_SRC_NOT_SUPPORTED` + `NETWORK_NO_SOURCE`) on one of this
+      // suite's own fixture URLs is swallowed. Any other media error, and any
+      // src this suite did not publish, still reaches the app.
+      //
+      // Capture phase on `document` runs before React's own per-element media
+      // listener, so `stopImmediatePropagation()` keeps the app from seeing it.
+      const FIXTURE_MEDIA = new RegExp(
+        `^(?:http://localhost:3000|https://cdn\\.example\\.com|http://127\\.0\\.0\\.1:${mediaProxyPort})/media/[0-9a-f]{64}\\.mp4$`,
+      );
+      document.addEventListener(
+        "error",
+        (event) => {
+          const media = event.target as HTMLVideoElement | null;
+          if (media?.tagName !== "VIDEO") return;
+          // MEDIA_ERR_SRC_NOT_SUPPORTED / NETWORK_NO_SOURCE.
+          if (media.error?.code !== 4) return;
+          if (media.networkState !== 3) return;
+          if (!FIXTURE_MEDIA.test(media.getAttribute("src") ?? "")) return;
+          event.stopImmediatePropagation();
+        },
+        true,
+      );
     },
-    { accentColor, themeName },
+    { accentColor, mediaProxyPort: MOCK_MEDIA_PROXY_PORT, themeName },
   );
 
   await installMockBridge(page, {
@@ -726,6 +771,13 @@ test("video upload previews use poster frames and inline videos open review mode
     .getByRole("button", { name: "Close video review" })
     .click();
   await expect(page.getByTestId("video-review-dialog")).toHaveCount(0);
+  // Guardrail: the inline control bar only exists while the player is not in
+  // its error state. Naming that here means a future harness regression is
+  // reported as "the media load failed" rather than as a phantom regression in
+  // the speed control below.
+  await expect(
+    restoredInlinePlayer.getByText("Failed to load — tap to retry"),
+  ).toHaveCount(0);
   await expect(
     restoredInlinePlayer.getByTestId("video-inline-speed"),
   ).toHaveText("0.25x");

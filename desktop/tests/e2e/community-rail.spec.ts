@@ -285,6 +285,43 @@ test.describe("community rail", () => {
       )
       .toEqual({ text: COMMUNITY_A.relayUrl });
 
+    // Choosing an item must leave the menu closed and KEEP it closed.
+    //
+    // It does not. `CommunitySwitcher`'s profile-menu variant arms an 80 ms
+    // hover-open / 160 ms hover-close timer from `onMouseEnter`/`onMouseLeave`
+    // on both the trigger and the popover content
+    // (`CommunitySwitcher.tsx:121-128, 219-231`). Every menu item closes the
+    // menu by calling `setDropdownOpen(false)` directly
+    // (`CommunitySwitcher.tsx:246, 259, 272, 287`) instead of going through
+    // `handleProfileMenuOpenChange`, which is the only place that clears the
+    // timer. Moving the pointer onto the item to click it arms the 80 ms
+    // open timer, the click closes the menu, and the timer then re-opens it.
+    // Measured on this trigger: `aria-expanded` false at 0/20/40 ms, true from
+    // 60 ms onward, never closing again.
+    //
+    // This is deliberately left as a hard assertion rather than a wait. Before
+    // it existed, the test passed only when the NEXT click happened to land
+    // inside that 80 ms window — green by luck while the defect was live,
+    // which is a test that cannot fail. The window is sampled rather than
+    // waited on: this can only pass if the menu genuinely never re-opens.
+    const menuAfterChoosing = await page.evaluate(async () => {
+      const trigger = document.querySelector(
+        '[data-testid="community-switcher"]',
+      );
+      if (!trigger) return "trigger missing";
+      const deadline = performance.now() + 500;
+      while (performance.now() < deadline) {
+        if (trigger.getAttribute("aria-expanded") === "true") {
+          return "re-opened by itself";
+        }
+        await new Promise((resolve) => {
+          setTimeout(resolve, 16);
+        });
+      }
+      return "stayed closed";
+    });
+    expect(menuAfterChoosing).toBe("stayed closed");
+
     await page.getByTestId("community-switcher").click();
     await menu.getByRole("menuitem", { name: "Community settings" }).click();
     await expect(
@@ -596,6 +633,15 @@ test.describe("community rail", () => {
       ),
     ).toBe(1);
     await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
+    // Deliberately strict, and it catches a real race. With the channels read
+    // latched pending above, no live validation can have succeeded, so the
+    // remembered channel must not be entered. Under load the app enters it
+    // anyway: reproduce with `newCDPSession(page)` +
+    // `Emulation.setCPUThrottlingRate { rate: 3 }`, which fails this 2 in 4
+    // with the URL sitting at `#/channels/general` for all 10 polls — a
+    // sustained navigation, not a flicker. Same shape as BUG-043: do not
+    // soften this into a wait, the repair path needs to read one consistent
+    // validation state. See BUG-037.
     await expect(page).not.toHaveURL(/#\/channels\/general$/);
     await expect
       .poll(() =>
@@ -986,6 +1032,19 @@ test.describe("community rail", () => {
         }),
       );
     }, `community-rail-button-${COMMUNITY_B.id}`);
+    // Wait for the pick-up to actually land before moving.
+    //
+    // dnd-kit's KeyboardSensor activates through React state, so `isDragging`
+    // is not true on the same task as the Space keydown. Firing ArrowUp
+    // immediately meant the move was frequently delivered to nothing and the
+    // stored order came back unchanged as ["ws-a","ws-b"]. This is a sync
+    // point, not a grace period: `opacity-30` is the rendered form of
+    // `isDragging` (`CommunityRail.tsx:129`), so it can only be satisfied by
+    // the KeyboardSensor genuinely entering drag mode — if the sensor stops
+    // working this assertion fails rather than papering over it.
+    // Reproduce the original 4/4 failure with `newCDPSession(page)` +
+    // `Emulation.setCPUThrottlingRate { rate: 3 }`.
+    await expect(buttonB).toHaveClass(/opacity-30/);
     // ArrowUp moves the active item one slot up.
     await page.keyboard.press("ArrowUp");
     // Space drops the item — same synthetic dispatch for consistency.

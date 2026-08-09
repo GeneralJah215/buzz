@@ -173,7 +173,21 @@ test("failed initial relay dial retries automatically", async ({ page }) => {
               __BUZZ_E2E_GET_RELAY_CONNECTION_STATE__?: () => string;
             }
           ).__BUZZ_E2E_GET_RELAY_CONNECTION_STATE__;
-          if (!getState) throw new Error("Relay state seam is not installed.");
+          // "Not installed yet" is a not-ready signal, not a failure.
+          // `main.tsx:110` reaches the bridge through a dynamic
+          // `import("@/testing/e2eBridge")`, and that ~160 KB chunk carries no
+          // `<link rel=modulepreload>`, so it is routinely still in flight when
+          // `goto()` resolves. Every other test in this file happens to absorb
+          // that by awaiting a locator first; this one reads the seam directly.
+          //
+          // Throwing here made it worse than a timeout: `expect.poll` does not
+          // swallow exceptions from its callback, so the throw aborted the poll
+          // on its FIRST tick and the 10 s budget bought nothing. Proved by
+          // delaying that one chunk by 1.5 s — the test died in 519 ms with
+          // "Relay state seam is not installed". Returning a sentinel lets the
+          // poll do its job, and a seam that never arrives still fails loudly
+          // at 10 s with that sentinel as the received value.
+          if (!getState) return "seam-not-installed";
           return getState();
         }),
       { timeout: 10_000 },
