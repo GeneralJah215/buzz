@@ -107,7 +107,7 @@ const { useChannelFind } = await import("./useChannelFind.ts");
 
 const CHANNEL_ID = "11111111-2222-3333-4444-555555555555";
 
-function message(id, body) {
+function message(id, body, overrides = {}) {
   return {
     id,
     renderKey: id,
@@ -128,7 +128,13 @@ function message(id, body) {
     accent: false,
     kind: 9,
     tags: [["h", CHANNEL_ID]],
+    ...overrides,
   };
+}
+
+/** A thread reply — rendered only inside a thread panel, never on the timeline. */
+function reply(id, body, parentId, rootId = parentId) {
+  return message(id, body, { parentId, rootId, depth: 1 });
 }
 
 function relayHit(eventId, content) {
@@ -145,7 +151,7 @@ function relayHit(eventId, content) {
 }
 
 /** Mount the real hook and expose its latest return value. */
-async function mountChannelFind(messages) {
+async function mountChannelFind(messages, { canRenderFindBar = true } = {}) {
   const container = dom.window.document.createElement("div");
   dom.window.document.body.appendChild(container);
 
@@ -164,7 +170,11 @@ async function mountChannelFind(messages) {
   function Probe() {
     const [, setTick] = React.useState(0);
     forceRender = () => setTick((tick) => tick + 1);
-    state.current = useChannelFind({ channelId: CHANNEL_ID, messages });
+    state.current = useChannelFind({
+      canRenderFindBar,
+      channelId: CHANNEL_ID,
+      messages,
+    });
     return null;
   }
 
@@ -184,15 +194,20 @@ async function mountChannelFind(messages) {
       return state.current;
     },
     async openWithShortcut() {
-      await act(async () => {
-        dom.window.dispatchEvent(
-          new dom.window.KeyboardEvent("keydown", {
-            bubbles: true,
-            ctrlKey: true,
-            key: "f",
-          }),
-        );
+      return this.pressFindShortcut();
+    },
+    /** Dispatch Ctrl+F and hand back the event so callers can inspect it. */
+    async pressFindShortcut() {
+      const event = new dom.window.KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        ctrlKey: true,
+        key: "f",
       });
+      await act(async () => {
+        dom.window.dispatchEvent(event);
+      });
+      return event;
     },
     async run(fn) {
       await act(async () => {
@@ -344,6 +359,148 @@ describe("useChannelFind", { concurrency: 1 }, () => {
       harness.find.matchCount,
       2,
       "the generation guard must not suppress relay hits for the current query",
+    );
+  });
+
+  // ── BUG-058: matches inside thread replies ────────────────────────────────
+  //
+  // The client pass matches replies, the main timeline renders none of them.
+  // The bar counted them and Enter went nowhere. The fix makes the jump work;
+  // dropping the matches to make the count "honest" would delete results.
+
+  test("a match inside a thread reply stays counted and resolves to its thread panel", async (t) => {
+    const harness = await mountChannelFind([
+      message("root", "kickoff notes"),
+      reply("r1", "deploy went out at noon", "root"),
+      reply("r2", "nested deploy follow-up", "r1", "root"),
+    ]);
+    t.after(() => harness.unmount());
+
+    await harness.openWithShortcut();
+    await harness.run((find) => find.setQuery("deploy"));
+
+    assert.equal(
+      harness.find.matchCount,
+      2,
+      "replies the reader can be shown must stay in the count — trimming them deletes results",
+    );
+
+    assert.equal(harness.find.activeMatch.messageId, "r1");
+    assert.equal(
+      harness.find.activeReveal.kind,
+      "thread-reply",
+      "a reply match must be revealed in a thread panel, not chased on the timeline",
+    );
+    assert.equal(
+      harness.find.activeReveal.threadHeadId,
+      "root",
+      "the thread panel opens on a root id",
+    );
+    assert.equal(
+      harness.find.mainTimelineActiveMatchId,
+      "root",
+      "the timeline is pointed at the thread root, never at a row it cannot mount",
+    );
+
+    await harness.run((find) => find.goToNext());
+    assert.equal(harness.find.activeMatch.messageId, "r2");
+    assert.equal(harness.find.activeReveal.threadHeadId, "root");
+    assert.deepEqual(
+      [...harness.find.activeReveal.expandedReplyIds],
+      ["r1"],
+      "the branch holding the nested match must be expanded for it to be visible",
+    );
+  });
+
+  test("navigation moves between timeline rows and thread rows without losing either", async (t) => {
+    const harness = await mountChannelFind([
+      message("root", "deploy plan"),
+      reply("r1", "deploy shipped", "root"),
+      message("later", "deploy retro"),
+    ]);
+    t.after(() => harness.unmount());
+
+    await harness.openWithShortcut();
+    await harness.run((find) => find.setQuery("deploy"));
+
+    assert.equal(harness.find.matchCount, 3);
+    assert.equal(harness.find.activeReveal.kind, "main-timeline");
+    assert.equal(harness.find.mainTimelineActiveMatchId, "root");
+
+    await harness.run((find) => find.goToNext());
+    assert.equal(harness.find.activeReveal.kind, "thread-reply");
+
+    await harness.run((find) => find.goToNext());
+    assert.equal(
+      harness.find.activeReveal.kind,
+      "main-timeline",
+      "leaving a reply match returns to the timeline; the results list is one chronological walk",
+    );
+    assert.equal(harness.find.mainTimelineActiveMatchId, "later");
+  });
+
+  test("a match that is not in the loaded window gives the timeline no target", async (t) => {
+    relayHitsByQuery.clear();
+    relayCalls.length = 0;
+    relayHitsByQuery.set("deploy", [relayHit("cold-1", "deploy from 2019")]);
+
+    const harness = await mountChannelFind([message("m1", "unrelated")]);
+    t.after(() => harness.unmount());
+
+    await harness.openWithShortcut();
+    await harness.run((find) => find.setQuery("deploy"));
+    await harness.settleRelay();
+
+    assert.equal(harness.find.activeMatch.messageId, "cold-1");
+    assert.equal(
+      harness.find.activeReveal.kind,
+      "unreachable",
+      "an event that has not been spliced into the window has no surface yet",
+    );
+    assert.equal(harness.find.activeReveal.unreachableReason, "not-loaded");
+    assert.equal(
+      harness.find.mainTimelineActiveMatchId,
+      null,
+      "handing the raw id to the timeline is what made it hold a target it could never mount",
+    );
+  });
+
+  // ── BUG-059: the shortcut in a layout with no find bar ────────────────────
+
+  test("Ctrl+F is left alone when the find bar has nowhere to render", async (t) => {
+    const harness = await mountChannelFind([message("m1", "alpha one")], {
+      canRenderFindBar: false,
+    });
+    t.after(() => harness.unmount());
+
+    const event = await harness.pressFindShortcut();
+
+    assert.equal(
+      harness.find.isOpen,
+      false,
+      "opening a bar that is not mounted leaves the reader with nothing",
+    );
+    assert.equal(
+      event.defaultPrevented,
+      false,
+      "swallowing the key suppresses the webview's own find too, so the press does nothing at all",
+    );
+  });
+
+  test("Ctrl+F while the bar is open requests a fresh focus and selection", async (t) => {
+    const harness = await mountChannelFind([message("m1", "alpha one")]);
+    t.after(() => harness.unmount());
+
+    await harness.openWithShortcut();
+    const afterOpen = harness.find.focusRequestId;
+
+    const event = await harness.pressFindShortcut();
+
+    assert.equal(harness.find.isOpen, true);
+    assert.equal(event.defaultPrevented, true);
+    assert.ok(
+      harness.find.focusRequestId > afterOpen,
+      "a second find press must re-focus and select the input, like every other find bar",
     );
   });
 });

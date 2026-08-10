@@ -1,41 +1,11 @@
 import * as React from "react";
 
+import type { MessageRevealTarget } from "@/features/messages/lib/messageRevealTarget";
+import { resolveMessageRevealTarget } from "@/features/messages/lib/messageRevealTarget";
 import type { TimelineMessage } from "@/features/messages/types";
 import { isBroadcastReply } from "@/features/messages/lib/threading";
 import type { Channel } from "@/shared/api/types";
 import type { PanelValueSetter } from "./useChannelPanelHistoryState";
-
-function getThreadRouteTarget(
-  targetMessage: TimelineMessage,
-  messageById: ReadonlyMap<string, TimelineMessage>,
-): { expandedReplyIds: Set<string>; threadHeadId: string } | null {
-  const threadHeadId = targetMessage.rootId ?? targetMessage.parentId ?? null;
-  if (!threadHeadId || !messageById.has(threadHeadId)) {
-    return null;
-  }
-
-  const expandedReplyIds = new Set<string>();
-  let ancestorId = targetMessage.parentId ?? null;
-  let guard = 0;
-  const maxHops = messageById.size + 1;
-
-  while (ancestorId && ancestorId !== threadHeadId && guard < maxHops) {
-    const ancestor = messageById.get(ancestorId);
-    if (!ancestor) {
-      return null;
-    }
-
-    expandedReplyIds.add(ancestor.id);
-    ancestorId = ancestor.parentId ?? null;
-    guard += 1;
-  }
-
-  if (ancestorId !== threadHeadId) {
-    return null;
-  }
-
-  return { expandedReplyIds, threadHeadId };
-}
 
 function getRouteMainTimelineTargetId(
   targetMessageId: string | null,
@@ -62,6 +32,7 @@ export function useChannelRouteTarget({
   setProfilePanelPubkey,
   setThreadReplyTargetId,
   setThreadScrollTargetId,
+  searchRevealTarget = null,
   targetMessageId,
   timelineMessages,
 }: {
@@ -74,6 +45,13 @@ export function useChannelRouteTarget({
   setProfilePanelPubkey: PanelValueSetter;
   setThreadReplyTargetId: React.Dispatch<React.SetStateAction<string | null>>;
   setThreadScrollTargetId: React.Dispatch<React.SetStateAction<string | null>>;
+  /**
+   * Where the active find-in-channel match can be revealed, already resolved
+   * by `useChannelFind`. Only `thread-reply` targets need anything from this
+   * hook: the main timeline handles its own rows, and an unreachable match has
+   * nowhere to go.
+   */
+  searchRevealTarget?: MessageRevealTarget | null;
   targetMessageId: string | null;
   timelineMessages: TimelineMessage[];
 }) {
@@ -134,11 +112,11 @@ export function useChannelRouteTarget({
       return;
     }
 
-    const routeTarget = getThreadRouteTarget(
-      targetMessage,
+    const routeTarget = resolveMessageRevealTarget(
+      targetMessageId,
       timelineMessageById,
     );
-    if (!routeTarget) {
+    if (routeTarget?.kind !== "thread-reply") {
       return;
     }
 
@@ -150,7 +128,7 @@ export function useChannelRouteTarget({
     setOpenThreadHeadId(routeTarget.threadHeadId, { replace: true });
     setThreadReplyTargetId(routeTarget.threadHeadId);
     setThreadScrollTargetId(targetMessageId);
-    setExpandedThreadReplyIds(routeTarget.expandedReplyIds);
+    setExpandedThreadReplyIds(new Set(routeTarget.expandedReplyIds));
     handledThreadRouteTargetRef.current = targetKey;
   }, [
     activeChannel,
@@ -164,6 +142,58 @@ export function useChannelRouteTarget({
     setThreadScrollTargetId,
     targetMessageId,
     timelineMessageById,
+  ]);
+
+  // Reveal a find-in-channel match that lives in a thread reply (BUG-058).
+  //
+  // The main timeline filters every reply out of its row set, so `Enter` on a
+  // reply match used to scroll to a row that does not exist. The reply DOES
+  // have a home — the thread panel, opened on its root — and that is the same
+  // composition a deep link to a reply already performs above. Reuse it.
+  //
+  // Deliberately narrow: only a `thread-reply` match touches panel state.
+  //
+  //   * A main-timeline match leaves the panel exactly as it is. Opening a
+  //     panel on every root match (which is what the deep-link branch does for
+  //     root links) would make Next/Previous flap panels open and shut down the
+  //     whole result list — worse than the bug being fixed.
+  //   * Moving from a reply match to a main-timeline match leaves the panel
+  //     open too, so the layout stays put while the reader walks results.
+  //   * Moving between replies in different threads re-targets the panel, which
+  //     is the only way to show the new match at all.
+  //
+  // Keyed on the match id so re-entering the same match (a re-render, a churn
+  // in `timelineMessages`) does not re-open or re-scroll anything.
+  const revealedSearchMatchRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (searchRevealTarget?.kind !== "thread-reply") {
+      revealedSearchMatchRef.current = null;
+      return;
+    }
+
+    const matchKey = `${activeChannelId ?? "none"}:${searchRevealTarget.messageId}`;
+    if (revealedSearchMatchRef.current === matchKey) {
+      return;
+    }
+    revealedSearchMatchRef.current = matchKey;
+
+    closeAgentSession();
+    setProfilePanelPubkey(null, { replace: true });
+    setEditTargetId(null);
+    setOpenThreadHeadId(searchRevealTarget.threadHeadId, { replace: true });
+    setThreadReplyTargetId(searchRevealTarget.threadHeadId);
+    setExpandedThreadReplyIds(new Set(searchRevealTarget.expandedReplyIds));
+    setThreadScrollTargetId(searchRevealTarget.messageId);
+  }, [
+    activeChannelId,
+    closeAgentSession,
+    searchRevealTarget,
+    setEditTargetId,
+    setExpandedThreadReplyIds,
+    setOpenThreadHeadId,
+    setProfilePanelPubkey,
+    setThreadReplyTargetId,
+    setThreadScrollTargetId,
   ]);
 
   return mainTimelineTargetMessageId;

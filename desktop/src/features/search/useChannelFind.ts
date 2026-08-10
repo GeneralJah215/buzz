@@ -1,6 +1,10 @@
 import * as React from "react";
 
 import { useSearchMessagesQuery } from "@/features/search/hooks";
+import {
+  resolveMessageRevealTarget,
+  type MessageRevealTarget,
+} from "@/features/messages/lib/messageRevealTarget";
 import type { TimelineMessage } from "@/features/messages/types";
 import type { SearchHit } from "@/shared/api/types";
 import { hasPrimaryShortcutModifier } from "@/shared/lib/platform";
@@ -13,11 +17,18 @@ const NO_RELAY_HITS: SearchHit[] = [];
 
 type UseChannelFindOptions = {
   channelId: string | null;
+  /**
+   * False when the layout has no place to paint the find bar (the single-panel
+   * viewport hides the whole main column). The shortcut must then stay out of
+   * the way entirely — see the keydown handler.
+   */
+  canRenderFindBar?: boolean;
   messages: TimelineMessage[];
   onSearchHit?: (hit: SearchHit) => void;
 };
 
 export function useChannelFind({
+  canRenderFindBar = true,
   channelId,
   messages,
   onSearchHit,
@@ -26,6 +37,10 @@ export function useChannelFind({
   const [query, setQuery] = React.useState("");
   const [debouncedQuery, setDebouncedQuery] = React.useState("");
   const [activeIndex, setActiveIndex] = React.useState(0);
+  // Bumped on every find shortcut press. The bar re-focuses and selects its
+  // input whenever this changes, so a second ⌘F/Ctrl+F while the bar is
+  // already open behaves like every other find bar instead of doing nothing.
+  const [focusRequestId, setFocusRequestId] = React.useState(0);
 
   const reset = React.useCallback(() => {
     setIsOpen(false);
@@ -120,6 +135,20 @@ export function useChannelFind({
   const activeMatch =
     matchedIds.length > 0 ? { messageId: matchedIds[activeIndex] } : null;
 
+  // A match may live in a thread reply, which the main timeline never renders
+  // (BUG-058). Resolve every active match to the surface that can actually
+  // show it, once, here — the timeline and the thread panel both read this
+  // answer instead of each guessing from the raw id.
+  const messageById = React.useMemo(
+    () => new Map(messages.map((message) => [message.id, message])),
+    [messages],
+  );
+  const activeReveal = React.useMemo<MessageRevealTarget | null>(
+    () =>
+      resolveMessageRevealTarget(activeMatch?.messageId ?? null, messageById),
+    [activeMatch?.messageId, messageById],
+  );
+
   const relayHitById = React.useMemo(() => {
     const hits = new Map<string, SearchHit>();
     for (const hit of relayHits) {
@@ -155,17 +184,32 @@ export function useChannelFind({
   }, [matchedIds.length]);
 
   // Register platform-standard find shortcut (⌘F on macOS, Ctrl+F elsewhere).
+  // Read through a ref so the listener is registered once and still sees the
+  // current layout.
+  const canRenderFindBarRef = React.useRef(canRenderFindBar);
+  canRenderFindBarRef.current = canRenderFindBar;
   React.useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       if (
-        hasPrimaryShortcutModifier(event) &&
-        !event.altKey &&
-        !event.shiftKey &&
-        event.key.toLowerCase() === "f"
+        !hasPrimaryShortcutModifier(event) ||
+        event.altKey ||
+        event.shiftKey ||
+        event.key.toLowerCase() !== "f"
       ) {
-        event.preventDefault();
-        setIsOpen(true);
+        return;
       }
+
+      // BUG-059: in the single-panel layout the main column — and with it the
+      // find bar — is not mounted. Claiming the key there suppressed BOTH the
+      // (invisible) find bar and the webview's own find, so the press did
+      // nothing at all. Leave the event alone when we have nowhere to render.
+      if (!canRenderFindBarRef.current) {
+        return;
+      }
+
+      event.preventDefault();
+      setIsOpen(true);
+      setFocusRequestId((current) => current + 1);
     }
 
     window.addEventListener("keydown", handleKeyDown);
@@ -185,10 +229,21 @@ export function useChannelFind({
     () => ({
       activeIndex,
       activeMatch,
+      activeReveal,
       close,
+      focusRequestId,
       goToNext,
       goToPrevious,
       isOpen,
+      /**
+       * What the MAIN timeline should scroll to for the active match: the
+       * match itself, or — when the match is a thread reply — its thread root,
+       * so the timeline points at the conversation while the panel shows the
+       * reply. Null while the match is unreachable (for example a relay hit
+       * whose event has not been spliced into the window yet), which keeps the
+       * timeline from holding a target it can never mount.
+       */
+      mainTimelineActiveMatchId: activeReveal?.mainTimelineMessageId ?? null,
       matchCount: matchedIds.length,
       matchingMessageIds,
       query,
@@ -197,7 +252,9 @@ export function useChannelFind({
     [
       activeIndex,
       activeMatch,
+      activeReveal,
       close,
+      focusRequestId,
       goToNext,
       goToPrevious,
       isOpen,

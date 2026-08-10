@@ -73,7 +73,7 @@ import { channelContentTopPaddingMeasurement } from "@/shared/layout/chromeLayou
 import { useMeasuredCssVariable } from "@/shared/layout/useMeasuredCssVariable";
 import { useElementWidth } from "@/shared/hooks/use-mobile";
 import { useThreadPanelWidth } from "@/shared/hooks/useThreadPanelWidth";
-import { AUXILIARY_PANEL_SINGLE_COLUMN_BREAKPOINT_PX } from "@/shared/layout/AuxiliaryPanel";
+import { selectChannelPanelLayout } from "@/features/channels/lib/threadPanelLayout";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { useChannelActivityTyping } from "./useChannelActivityTyping";
 import { useChannelAgentSessions } from "./useChannelAgentSessions";
@@ -428,7 +428,16 @@ export function ChannelScreen({
         : [...currentEvents, event],
     );
   }, []);
+  const { hasAuxiliaryPanel, isSinglePanelView } = selectChannelPanelLayout({
+    channelContentWidthPx,
+    channelManagementOpen,
+    channelType: activeChannel?.channelType ?? null,
+    openAgentSessionPubkey,
+    openThreadHeadId: effectiveOpenThreadHeadId,
+    profilePanelPubkey,
+  });
   const channelFind = useChannelFind({
+    canRenderFindBar: !isSinglePanelView,
     channelId: activeChannelId,
     messages: timelineMessages,
     onSearchHit: handleFindSearchHit,
@@ -669,6 +678,7 @@ export function ChannelScreen({
     setProfilePanelPubkey,
     setThreadReplyTargetId,
     setThreadScrollTargetId,
+    searchRevealTarget: channelFind.activeReveal,
     targetMessageId,
     timelineMessages,
   });
@@ -687,12 +697,6 @@ export function ChannelScreen({
     threadReplyTargetId,
     threadReplyTargetMessage,
   });
-  const hasAuxiliaryPanel = Boolean(
-    effectiveOpenThreadHeadId ||
-      openAgentSessionPubkey ||
-      profilePanelPubkey ||
-      channelManagementOpen,
-  );
   const displayedThreadHeadMessage = threadPanelData.threadHead;
   const displayedThreadAllMessages = threadPanelData.messages;
   const displayedThreadMessages = threadPanelData.visibleReplies;
@@ -703,13 +707,6 @@ export function ChannelScreen({
   const shouldShowThreadSkeleton = Boolean(
     effectiveOpenThreadHeadId && activeChannel && !displayedThreadHeadMessage,
   );
-  const isNarrowPanelViewport =
-    channelContentWidthPx > 0 &&
-    channelContentWidthPx < AUXILIARY_PANEL_SINGLE_COLUMN_BREAKPOINT_PX;
-  const isSinglePanelView =
-    isNarrowPanelViewport &&
-    activeChannel?.channelType !== "forum" &&
-    hasAuxiliaryPanel;
   const shouldCompactHeaderActions =
     hasAuxiliaryPanel &&
     channelContentWidthPx > 0 &&

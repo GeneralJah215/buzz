@@ -1,7 +1,7 @@
 import type { TimelineMessage } from "@/features/messages/types";
 import type { ChannelWindowThreadSummary } from "@/features/messages/lib/channelWindowStore";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
-import { isBroadcastReply } from "@/features/messages/lib/threading";
+import { isMainTimelineMessage } from "@/features/messages/lib/messageRevealTarget";
 import { KIND_HUDDLE_STARTED } from "@/shared/constants/kinds";
 
 type ThreadPanelData = {
@@ -439,29 +439,24 @@ export function buildMainTimelineEntries(
     unreadReplyIds,
   );
 
-  return messages
-    .filter(
-      (message) =>
-        message.parentId == null || isBroadcastReply(message.tags ?? []),
-    )
-    .map((message) => {
-      const relaySummary = relaySummaries.get(message.id);
-      return {
-        message,
-        summary:
-          message.kind === KIND_HUDDLE_STARTED
-            ? null
-            : mergeThreadSummaries(
-                buildSummaryForDirectReplies(
-                  message.id,
-                  descendantStatsByMessageId,
-                ),
-                relaySummary
-                  ? buildRelayThreadSummary(message.id, relaySummary, profiles)
-                  : null,
+  return messages.filter(isMainTimelineMessage).map((message) => {
+    const relaySummary = relaySummaries.get(message.id);
+    return {
+      message,
+      summary:
+        message.kind === KIND_HUDDLE_STARTED
+          ? null
+          : mergeThreadSummaries(
+              buildSummaryForDirectReplies(
+                message.id,
+                descendantStatsByMessageId,
               ),
-      };
-    });
+              relaySummary
+                ? buildRelayThreadSummary(message.id, relaySummary, profiles)
+                : null,
+            ),
+    };
+  });
 }
 
 /**

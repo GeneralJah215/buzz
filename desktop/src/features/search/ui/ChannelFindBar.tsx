@@ -1,10 +1,17 @@
 import { ChevronDown, ChevronUp, X } from "lucide-react";
 import * as React from "react";
 
+import type { useChannelFind } from "@/features/search/useChannelFind";
+import { channelChrome } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 
 type ChannelFindBarProps = {
+  /**
+   * Bumped by every find-shortcut press. Re-focusing on change is what makes a
+   * second ⌘F/Ctrl+F select the existing query instead of doing nothing.
+   */
+  focusRequestId?: number;
   matchCount: number;
   matchIndex: number;
   onClose: () => void;
@@ -15,6 +22,7 @@ type ChannelFindBarProps = {
 };
 
 export function ChannelFindBar({
+  focusRequestId = 0,
   matchCount,
   matchIndex,
   onClose,
@@ -25,10 +33,11 @@ export function ChannelFindBar({
 }: ChannelFindBarProps) {
   const inputRef = React.useRef<HTMLInputElement>(null);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: focusRequestId is the trigger, not an input — each press must re-focus and re-select.
   React.useEffect(() => {
     inputRef.current?.focus();
     inputRef.current?.select();
-  }, []);
+  }, [focusRequestId]);
 
   const handleKeyDown = (event: React.KeyboardEvent) => {
     if (event.key === "Escape") {
@@ -114,6 +123,37 @@ export function ChannelFindBar({
       >
         <X className="h-4 w-4" />
       </Button>
+    </div>
+  );
+}
+
+/**
+ * The find bar in its slot above the message column, wired to the find state.
+ *
+ * Owning the mount decision here keeps "is the bar on screen" in one place —
+ * the same place the shortcut's `canRenderFindBar` guard has to agree with.
+ */
+export function ChannelFindBarSlot({
+  find,
+}: {
+  find: ReturnType<typeof useChannelFind>;
+}) {
+  if (!find.isOpen) {
+    return null;
+  }
+
+  return (
+    <div className={cn("absolute inset-x-0 z-40", channelChrome.top)}>
+      <ChannelFindBar
+        focusRequestId={find.focusRequestId}
+        matchCount={find.matchCount}
+        matchIndex={find.activeIndex}
+        onClose={find.close}
+        onNext={find.goToNext}
+        onPrevious={find.goToPrevious}
+        onQueryChange={find.setQuery}
+        query={find.query}
+      />
     </div>
   );
 }

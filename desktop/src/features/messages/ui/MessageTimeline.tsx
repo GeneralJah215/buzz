@@ -29,6 +29,11 @@ import {
   type DirectMessageIntroParticipant,
 } from "./DirectMessageIntroAvatarStack";
 import { useSettleGatedPrependMessages } from "./useSettleGatedPrependMessages";
+import {
+  decidePendingSearchRetry,
+  describeAbandonedSearchTarget,
+  isRenderableInMainTimeline,
+} from "./pendingSearchRetry";
 
 export type MessageTimelineHandle = {
   scrollToBottomOnNextUpdate: () => void;
@@ -465,8 +470,16 @@ const MessageTimelineBase = React.forwardRef<
     [prepareForOwnMessage, scrollToBottom, timelineVirtualizerApi],
   );
 
-  // Jump-to-message is purely DOM-based now: all loaded rows are mounted, so
-  // `scrollToMessage` always finds the target row. No virtualizer convergence.
+  // Bind the renderability check to the LIVE message list (see the helper).
+  const isTargetRenderable = React.useCallback(
+    (messageId: string) => isRenderableInMainTimeline(messageId, messages),
+    [messages],
+  );
+
+  // Jump-to-message is DOM-based: a row that is part of the main timeline's
+  // data is either mounted or one render away. Thread replies are NOT part of
+  // that data — they are revealed in their thread panel instead, which is why
+  // this never has to converge on a reply id (BUG-058).
   const jumpToMessage = React.useCallback(
     (messageId: string, options?: { behavior?: ScrollBehavior }) => {
       return scrollToMessage(messageId, { highlight: true, ...options });
@@ -527,21 +540,43 @@ const MessageTimelineBase = React.forwardRef<
     }
     pendingSearchTargetRef.current = null;
     prevSearchActiveRef.current = searchActiveMessageId;
+    if (!isTargetRenderable(searchActiveMessageId)) {
+      // Say so and stop. Holding an unmountable id here is what made the find
+      // bar's Enter silently do nothing forever.
+      console.warn(describeAbandonedSearchTarget(searchActiveMessageId));
+      return;
+    }
     if (!jumpToMessage(searchActiveMessageId, { behavior: "smooth" })) {
       pendingSearchTargetRef.current = searchActiveMessageId;
     }
-  }, [jumpToMessage, searchActiveMessageId, showTimelineSkeleton]);
+  }, [
+    isTargetRenderable,
+    jumpToMessage,
+    searchActiveMessageId,
+    showTimelineSkeleton,
+  ]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: deferredMessages and virtualizerRenderVersion are intentional retry triggers — a search hit may be spliced into messages asynchronously, and in virtualized mode a phase-1 index jump only realizes the row; retry when the rendered range changes so the DOM-visible path can center and highlight it.
   React.useEffect(() => {
     const target = pendingSearchTargetRef.current;
     if (!target || showTimelineSkeleton) return;
-    if (
-      useTimelineVirtualizer &&
-      !activeScrollContainerRef.current?.querySelector(
-        `[data-message-id="${CSS.escape(target)}"]`,
-      )
-    ) {
+    const decision = decidePendingSearchRetry({
+      isRenderable: isTargetRenderable(target),
+      isRowInDom: Boolean(
+        activeScrollContainerRef.current?.querySelector(
+          `[data-message-id="${CSS.escape(target)}"]`,
+        ),
+      ),
+      isVirtualized: useTimelineVirtualizer,
+    });
+    if (decision === "abandon") {
+      // The window moved on (retention trim, channel churn) and the target no
+      // longer has a row to reach. Drop it instead of retrying forever.
+      pendingSearchTargetRef.current = null;
+      console.warn(describeAbandonedSearchTarget(target));
+      return;
+    }
+    if (decision === "realize-index") {
       // Phase 1: ask the virtualizer to realize the match's index. The retry effect
       // runs again on range change and the DOM-visible path does the actual
       // center + highlight once the row exists.
@@ -553,6 +588,7 @@ const MessageTimelineBase = React.forwardRef<
     }
   }, [
     deferredMessages,
+    isTargetRenderable,
     jumpToMessage,
     showTimelineSkeleton,
     virtualizerRenderVersion,
