@@ -121,6 +121,28 @@ fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
     AcpError::AgentError { code, message }
 }
 
+/// Whether an `initialize` result advertises the ACP `session/close` request.
+///
+/// The field is `agentCapabilities.sessionCapabilities.close`. Name and location
+/// confirmed against the two installed adapters rather than guessed:
+///
+/// - codex-acp `dist/index.js` — `zSessionCapabilities` declares `close` at
+///   `:18740`, `zAgentCapabilities` declares `sessionCapabilities` at `:18851`,
+///   and the live `initialize` response emits `sessionCapabilities: { …,
+///   close: {}, … }` at `:28649`.
+/// - claude-agent-acp `dist/acp-agent.js:638-644` — same shape.
+///
+/// **Presence test, not a boolean test.** ACP models this as an optional
+/// `SessionCloseCapabilities` *object*: a supporting agent sends `close: {}`,
+/// and `as_bool()` on `{}` yields `None`, which would read as unsupported. An
+/// explicit JSON `null` counts as absent, matching the adapters' own `nullish()`
+/// schema.
+fn parse_session_close_capability(init_result: &serde_json::Value) -> bool {
+    init_result
+        .pointer("/agentCapabilities/sessionCapabilities/close")
+        .is_some_and(|v| !v.is_null())
+}
+
 fn build_initialize_params() -> serde_json::Value {
     serde_json::json!({
         "protocolVersion": 2,
@@ -198,6 +220,22 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Whether the agent advertised
+    /// `agentCapabilities.sessionCapabilities.close` in its `initialize`
+    /// response, meaning it implements the ACP `session/close` request.
+    ///
+    /// Set once by [`initialize`](Self::initialize); `false` for agents that
+    /// omit the key. This is the **only** gate on writing a `session/close`
+    /// request — see [`session_close`](Self::session_close) for why probing by
+    /// error code is not an acceptable substitute.
+    ///
+    /// The capability is a *presence* flag, not a boolean: ACP declares it as
+    /// an optional `SessionCloseCapabilities` **object** (`{}` when supported,
+    /// absent otherwise), so the gate tests for a non-null member rather than
+    /// for `true`. Confirmed against the two installed adapters — codex-acp
+    /// `dist/index.js:18740` (`zSessionCapabilities.close`) advertised at
+    /// `:28649`, and claude-agent-acp `dist/acp-agent.js:638-644`.
+    session_close_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -548,6 +586,7 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            session_close_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
         })
@@ -595,6 +634,11 @@ impl AcpClient {
     /// [`steering_supported`](Self::steering_supported) so the read loop's steer
     /// arm can choose [`ACP_STEER_METHOD`] for adapters that implement it.
     /// Parsed here rather than at each call site so no caller can forget it.
+    ///
+    /// Also records `agentCapabilities.sessionCapabilities.close` into
+    /// [`session_close_supported`](Self::session_close_supported), the sole gate
+    /// on [`session_close`](Self::session_close). Same reasoning: parsed once,
+    /// here, so no call site can forget the gate.
     pub async fn initialize(&mut self) -> Result<serde_json::Value, AcpError> {
         // Requesting version 2 is an intentional temporary pin — we are squatting
         // on ACP v2 ahead of the upstream ACP RFD. Revisit when that RFD merges.
@@ -604,6 +648,7 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.session_close_supported = parse_session_close_capability(&result);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -687,6 +732,67 @@ impl AcpClient {
             .session_new_full(cwd, mcp_servers, system_prompt, session_title)
             .await?
             .session_id)
+    }
+
+    /// Budget for a single `session/close`. Deliberately far below
+    /// [`REQUEST_TIMEOUT`](Self::REQUEST_TIMEOUT): closing a session Buzz has
+    /// already abandoned is housekeeping, and it runs on the critical path of a
+    /// turn. A wedged agent must cost us seconds, not a minute and a half.
+    pub const SESSION_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// Whether the agent advertised `sessionCapabilities.close` at `initialize`
+    /// time, i.e. whether [`session_close`](Self::session_close) will do
+    /// anything.
+    pub fn session_close_supported(&self) -> bool {
+        self.session_close_supported
+    }
+
+    /// Send ACP `session/close`, releasing a session Buzz has abandoned.
+    ///
+    /// **This is the wire half of session teardown.** Dropping a session ID from
+    /// a local map tells the agent nothing: the agent keeps the session — and
+    /// every MCP server it spawned for that session — alive indefinitely. See
+    /// BUG-036, where the missing close leaked one `buzz-dev-mcp` + `python` +
+    /// `node_repl` triplet and ~96 MB of temp disk per session rotation.
+    ///
+    /// # Capability gate
+    ///
+    /// Returns `Ok(None)` without touching the wire when the agent did not
+    /// advertise `agentCapabilities.sessionCapabilities.close`. The advertised
+    /// capability is the **only** gate. Probing by error code is not acceptable
+    /// here for the same reason it is not acceptable for [`ACP_STEER_METHOD`]:
+    /// codex-acp answers unknown extension methods with a JSON-RPC *success*,
+    /// so a "did it work?" probe cannot distinguish support from silence.
+    ///
+    /// # Safety
+    ///
+    /// Only ever call this for a session the caller has already stopped using.
+    /// The agent's handler interrupts any in-flight turn on that session
+    /// (codex-acp `dist/index.js:28974`, `interruptSessionTurn(..., "Close")`),
+    /// so closing a live session would kill a running turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`AcpError`] on transport or agent failure. The
+    /// error is real and must not be discarded silently — callers doing
+    /// best-effort cleanup are expected to log it, not swallow it.
+    pub async fn session_close(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Option<serde_json::Value>, AcpError> {
+        if !self.session_close_supported {
+            tracing::debug!(
+                target: "acp::session",
+                "session/close not advertised by agent — skipping close for {session_id}"
+            );
+            return Ok(None);
+        }
+        let params = serde_json::json!({ "sessionId": session_id });
+        let result = self
+            .send_request_with_timeout("session/close", params, Self::SESSION_CLOSE_TIMEOUT)
+            .await?;
+        tracing::info!(target: "acp::session", "session closed: {session_id}");
+        Ok(Some(result))
     }
 
     /// Send Goose's custom system-prompt request after `session/new`.
@@ -1078,6 +1184,24 @@ impl AcpClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, AcpError> {
+        self.send_request_with_timeout(method, params, Self::REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// [`send_request`](Self::send_request) with an explicit per-phase budget.
+    ///
+    /// Exists for best-effort housekeeping RPCs (see
+    /// [`session_close`](Self::session_close)) that must not be able to stall a
+    /// turn for the full 90-second default worst case. Aborting on timeout is
+    /// safe: a late response arrives with a non-matching id and is skipped by
+    /// [`read_until_response`](Self::read_until_response), exactly as documented
+    /// on [`drain_stale_responses`](Self::drain_stale_responses).
+    async fn send_request_with_timeout(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, AcpError> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -1093,7 +1217,6 @@ impl AcpClient {
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
         // inside timeout(), so we sequence them with early-return on timeout.
-        let timeout = Self::REQUEST_TIMEOUT;
         match tokio::time::timeout(timeout, self.write_ndjson(&msg)).await {
             Ok(result) => result?,
             Err(_) => return Err(AcpError::Timeout(timeout)),
@@ -2256,6 +2379,13 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 mod tests {
     use super::*;
 
+    // Tests below that build a fake agent out of `bash -c '…'` (or the inert
+    // `cat` pipe) only mean anything on a host that can actually execute a
+    // POSIX toolchain. On a host that cannot, they skip by name with the
+    // probe's failure reason printed, instead of failing anonymously.
+    // See `crate::test_support` — BUG-049.
+    use crate::skip_without_posix_shell;
+
     #[test]
     fn stop_reason_parses_all_known_values() {
         assert_eq!(StopReason::from_str("end_turn"), Some(StopReason::EndTurn));
@@ -2390,6 +2520,111 @@ mod tests {
         );
         assert_eq!(msg["jsonrpc"].as_str(), Some("2.0"));
         assert_eq!(msg["method"].as_str(), Some("session/cancel"));
+    }
+
+    // ---- BUG-036: `session/close` capability gate ---------------------------
+    //
+    // These are deliberately process-free (no agent subprocess) so the gate
+    // stays verifiable on hosts where spawning an agent is broken.
+
+    /// The exact `agentCapabilities` block codex-acp emits at
+    /// `dist/index.js:28649`. claude-agent-acp's block
+    /// (`dist/acp-agent.js:638-644`) has the same shape.
+    fn codex_acp_initialize_result() -> serde_json::Value {
+        serde_json::json!({
+            "protocolVersion": 2,
+            "agentCapabilities": {
+                "loadSession": true,
+                "sessionCapabilities": {
+                    "resume": {},
+                    "list": {},
+                    "close": {},
+                    "delete": {},
+                    "additionalDirectories": {}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn session_close_capability_is_read_from_session_capabilities_close() {
+        assert!(
+            parse_session_close_capability(&codex_acp_initialize_result()),
+            "codex-acp advertises session/close and must be gated in"
+        );
+    }
+
+    #[test]
+    fn session_close_capability_is_a_presence_test_not_a_boolean_test() {
+        // The whole point: ACP sends an empty *object*, not `true`. Reading this
+        // with `as_bool()` would silently disable close against every agent that
+        // actually supports it.
+        let advertised = serde_json::json!({
+            "agentCapabilities": { "sessionCapabilities": { "close": {} } }
+        });
+        assert!(parse_session_close_capability(&advertised));
+        assert_eq!(
+            advertised
+                .pointer("/agentCapabilities/sessionCapabilities/close")
+                .and_then(|v| v.as_bool()),
+            None,
+            "guards the reasoning above: `{{}}` is not a bool"
+        );
+    }
+
+    #[test]
+    fn session_close_capability_absent_means_unsupported() {
+        // An agent that does not advertise close must never be sent one.
+        let no_session_caps = serde_json::json!({
+            "protocolVersion": 1,
+            "agentCapabilities": { "loadSession": false }
+        });
+        assert!(!parse_session_close_capability(&no_session_caps));
+
+        let other_session_caps = serde_json::json!({
+            "agentCapabilities": { "sessionCapabilities": { "list": {} } }
+        });
+        assert!(!parse_session_close_capability(&other_session_caps));
+
+        let empty = serde_json::json!({});
+        assert!(!parse_session_close_capability(&empty));
+
+        // Explicit null is absent, matching the adapters' `nullish()` schema.
+        let null_close = serde_json::json!({
+            "agentCapabilities": { "sessionCapabilities": { "close": null } }
+        });
+        assert!(!parse_session_close_capability(&null_close));
+    }
+
+    #[test]
+    fn session_close_capability_is_not_read_from_the_wrong_nesting() {
+        // A top-level `sessionCapabilities` (i.e. not under `agentCapabilities`)
+        // is not the advertised location and must not be honoured.
+        let misplaced = serde_json::json!({
+            "sessionCapabilities": { "close": {} }
+        });
+        assert!(!parse_session_close_capability(&misplaced));
+    }
+
+    #[test]
+    fn session_close_request_format() {
+        // Shape checked against codex-acp's `zCloseSessionRequest`
+        // (`dist/index.js:19580`): a single required `sessionId`.
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7u64,
+            "method": "session/close",
+            "params": { "sessionId": "sess-abc" },
+        });
+        assert_eq!(msg["method"].as_str(), Some("session/close"));
+        assert_eq!(msg["params"]["sessionId"].as_str(), Some("sess-abc"));
+    }
+
+    #[test]
+    fn session_close_timeout_is_well_under_the_default_rpc_budget() {
+        // Close is best-effort housekeeping on a turn's critical path; a wedged
+        // agent must cost seconds, not the default 60s read + 30s write.
+        assert!(AcpClient::SESSION_CLOSE_TIMEOUT < AcpClient::REQUEST_TIMEOUT);
     }
 
     #[test]
@@ -2959,6 +3194,9 @@ mod tests {
 
     #[tokio::test]
     async fn idle_timeout_fires_on_silent_process() {
+        if skip_without_posix_shell!("idle_timeout_fires_on_silent_process") {
+            return;
+        }
         let mut client = spawn_script("sleep 10").await;
         let max_dur = std::time::Duration::from_secs(30);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
@@ -2979,6 +3217,9 @@ mod tests {
 
     #[tokio::test]
     async fn hard_timeout_fires_when_deadline_is_immediate() {
+        if skip_without_posix_shell!("hard_timeout_fires_when_deadline_is_immediate") {
+            return;
+        }
         let mut client = spawn_script("while true; do echo 'noise'; sleep 0.01; done").await;
         let max_dur = std::time::Duration::from_millis(1);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
@@ -3005,6 +3246,11 @@ mod tests {
     /// must not dead-letter a drain that simply ran past its grace window.
     #[tokio::test]
     async fn cancel_with_cleanup_grace_maps_expiry_to_cancel_drain_timeout() {
+        if skip_without_posix_shell!(
+            "cancel_with_cleanup_grace_maps_expiry_to_cancel_drain_timeout"
+        ) {
+            return;
+        }
         // Agent ignores `session/cancel` on stdin and keeps producing noise
         // forever — never drains within the grace window.
         let mut client = spawn_script("while true; do echo 'noise'; sleep 0.01; done").await;
@@ -3021,6 +3267,9 @@ mod tests {
 
     #[tokio::test]
     async fn idle_resets_on_stdout_activity() {
+        if skip_without_posix_shell!("idle_resets_on_stdout_activity") {
+            return;
+        }
         // Send valid JSON (session/update notifications) to reset the idle timer.
         // Non-JSON lines no longer reset idle — only valid JSON notifications do.
         let mut client = spawn_script(
@@ -3048,6 +3297,9 @@ mod tests {
 
     #[tokio::test]
     async fn response_returned_when_matching_id_arrives() {
+        if skip_without_posix_shell!("response_returned_when_matching_id_arrives") {
+            return;
+        }
         let mut client =
             spawn_script(r#"echo '{"jsonrpc":"2.0","id":42,"result":{"stopReason":"end_turn"}}'"#)
                 .await;
@@ -3068,6 +3320,9 @@ mod tests {
 
     #[tokio::test]
     async fn agent_exit_detected_as_eof() {
+        if skip_without_posix_shell!("agent_exit_detected_as_eof") {
+            return;
+        }
         let mut client = spawn_script("exit 0").await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let max_dur = std::time::Duration::from_secs(5);
@@ -3089,6 +3344,9 @@ mod tests {
     /// id happens to match the expected value.
     #[tokio::test]
     async fn agent_request_with_matching_id_not_consumed_as_response() {
+        if skip_without_posix_shell!("agent_request_with_matching_id_not_consumed_as_response") {
+            return;
+        }
         // The script sends an agent-initiated request (has both id and method)
         // whose id matches what we're waiting for (0), then sends the real
         // response. The request should be dispatched (triggering -32601 since
@@ -3117,6 +3375,9 @@ mod tests {
 
     #[tokio::test]
     async fn idle_fires_before_hard_when_idle_is_shorter() {
+        if skip_without_posix_shell!("idle_fires_before_hard_when_idle_is_shorter") {
+            return;
+        }
         let mut client = spawn_script("sleep 10").await;
         let idle = std::time::Duration::from_millis(100);
         let max_dur = std::time::Duration::from_secs(10);
@@ -3151,6 +3412,9 @@ mod tests {
     /// returned error would never be `HardTimeout`.
     #[tokio::test]
     async fn hard_deadline_fires_under_continuous_valid_json_stream() {
+        if skip_without_posix_shell!("hard_deadline_fires_under_continuous_valid_json_stream") {
+            return;
+        }
         // Truly infinite, gapless stream of valid JSON. No `sleep` between
         // echoes — the reader arm is continuously ready, which is the
         // exact starvation scenario the pre-select check guards against.
@@ -3189,6 +3453,9 @@ mod tests {
     /// exercises the non-idle `read_until_response` path (via `send_request`).
     #[tokio::test]
     async fn agent_request_not_consumed_via_send_request() {
+        if skip_without_posix_shell!("agent_request_not_consumed_via_send_request") {
+            return;
+        }
         // Script: wait for the initialize request, reply, then send an
         // agent-initiated request with id=1 (matching the next send_request id),
         // wait for the -32601 error reply, then send the real response.
@@ -3218,6 +3485,9 @@ mod tests {
 
     #[tokio::test]
     async fn keepalive_resets_idle_past_deadline() {
+        if skip_without_posix_shell!("keepalive_resets_idle_past_deadline") {
+            return;
+        }
         // Keepalive session/update lines every 50ms against a 100ms idle deadline.
         // The turn should survive well past the 100ms deadline (proves the fix).
         let mut client = spawn_script(
@@ -3249,6 +3519,9 @@ mod tests {
 
     #[tokio::test]
     async fn tool_call_resets_idle_then_silence_times_out() {
+        if skip_without_posix_shell!("tool_call_resets_idle_then_silence_times_out") {
+            return;
+        }
         // A tool_call session/update resets the idle timer (belt-and-suspenders path),
         // then silence causes idle timeout. This proves the reset works for tool_call
         // specifically — not just via the general valid-JSON reset at line 839.
@@ -3289,6 +3562,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_full_includes_system_prompt_when_some() {
+        if skip_without_posix_shell!("session_new_full_includes_system_prompt_when_some") {
+            return;
+        }
         // Script: respond to initialize, then echo back the session/new request.
         let script = r#"
             read -t 2 _init
@@ -3324,6 +3600,9 @@ mod tests {
 
     #[tokio::test]
     async fn goose_system_prompt_request_uses_append_contract() {
+        if skip_without_posix_shell!("goose_system_prompt_request_uses_append_contract") {
+            return;
+        }
         let script = r#"
             read -t 2 REQ
             echo '{"jsonrpc":"2.0","id":0,"result":{"_receivedRequest":'"$REQ"'}}'
@@ -3347,6 +3626,10 @@ mod tests {
 
     #[tokio::test]
     async fn goose_system_prompt_preserves_method_not_found_for_fallback() {
+        if skip_without_posix_shell!("goose_system_prompt_preserves_method_not_found_for_fallback")
+        {
+            return;
+        }
         let script = r#"
             read -t 2 _REQ
             echo '{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}'
@@ -3363,6 +3646,9 @@ mod tests {
 
     #[tokio::test]
     async fn goose_system_prompt_preserves_invalid_params_as_error() {
+        if skip_without_posix_shell!("goose_system_prompt_preserves_invalid_params_as_error") {
+            return;
+        }
         let script = r#"
             read -t 2 _REQ
             echo '{"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"Invalid params"}}'
@@ -3379,6 +3665,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_full_omits_system_prompt_when_none() {
+        if skip_without_posix_shell!("session_new_full_omits_system_prompt_when_none") {
+            return;
+        }
         // When system_prompt is None, the field should not appear in params.
         let script = r#"
             read -t 2 _init
@@ -3408,6 +3697,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_full_sends_session_title_in_meta_when_some() {
+        if skip_without_posix_shell!("session_new_full_sends_session_title_in_meta_when_some") {
+            return;
+        }
         let script = r#"
             read -t 2 _init
             echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
@@ -3436,6 +3728,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_full_omits_meta_when_session_title_none() {
+        if skip_without_posix_shell!("session_new_full_omits_meta_when_session_title_none") {
+            return;
+        }
         let script = r#"
             read -t 2 _init
             echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
@@ -3465,6 +3760,11 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_full_sends_claude_meta_system_prompt_when_claude_meta_transport() {
+        if skip_without_posix_shell!(
+            "session_new_full_sends_claude_meta_system_prompt_when_claude_meta_transport"
+        ) {
+            return;
+        }
         // When ClaudeMeta transport is requested, the prompt must appear as
         // _meta.systemPrompt: {"append": text} — never as a bare systemPrompt field.
         let script = r#"
@@ -3504,6 +3804,11 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_full_merges_claude_meta_and_session_title_into_single_meta_object() {
+        if skip_without_posix_shell!(
+            "session_new_full_merges_claude_meta_and_session_title_into_single_meta_object"
+        ) {
+            return;
+        }
         // Both ClaudeMeta prompt and session_title must coexist under _meta —
         // the prompt must not clobber sessionTitle or vice versa.
         let script = r#"
@@ -3583,6 +3888,9 @@ mod tests {
 
     #[tokio::test]
     async fn active_run_id_sets_on_string() {
+        if skip_without_posix_shell!("active_run_id_sets_on_string") {
+            return;
+        }
         let mut client = spawn_inert_client().await;
         assert!(client.active_run_id().is_none(), "starts as None");
 
@@ -3594,6 +3902,9 @@ mod tests {
 
     #[tokio::test]
     async fn active_run_id_clears_on_null() {
+        if skip_without_posix_shell!("active_run_id_clears_on_null") {
+            return;
+        }
         let mut client = spawn_inert_client().await;
         // Set it first
         let set_msg = session_info_update_msg(Some(serde_json::json!("run-xyz")));
@@ -3611,6 +3922,9 @@ mod tests {
 
     #[tokio::test]
     async fn active_run_id_untouched_when_missing() {
+        if skip_without_posix_shell!("active_run_id_untouched_when_missing") {
+            return;
+        }
         // Field absent entirely — must NOT clear existing state (only an
         // explicit null clears; missing means "no new info this update").
         let mut client = spawn_inert_client().await;
@@ -3630,6 +3944,9 @@ mod tests {
 
     #[tokio::test]
     async fn active_run_id_untouched_on_wrong_type() {
+        if skip_without_posix_shell!("active_run_id_untouched_on_wrong_type") {
+            return;
+        }
         // A number or object in activeRunId is malformed — neither set nor clear.
         let mut client = spawn_inert_client().await;
         let set_msg = session_info_update_msg(Some(serde_json::json!("run-stable")));
@@ -3667,6 +3984,11 @@ mod tests {
     /// observe the ack).
     #[tokio::test]
     async fn native_steer_with_no_active_run_id_acks_expected_run_id_missing() {
+        if skip_without_posix_shell!(
+            "native_steer_with_no_active_run_id_acks_expected_run_id_missing"
+        ) {
+            return;
+        }
         // Quiet process: never emits anything, so the read loop has only
         // the steer arm and the idle timeout to consider.
         let mut client = spawn_script("sleep 10").await;
@@ -3728,6 +4050,9 @@ mod tests {
     /// id to its `pending_steer` entry.
     #[tokio::test]
     async fn native_steer_with_active_run_id_routes_response_to_ack() {
+        if skip_without_posix_shell!("native_steer_with_active_run_id_routes_response_to_ack") {
+            return;
+        }
         // Script: pause briefly so the test task can install the steer
         // and we can be sure the response doesn't race ahead of the
         // write — then emit the steer response (id=0 because next_id
@@ -3809,6 +4134,11 @@ mod tests {
     /// New code: deadline renewed at t≈0.5s → prompt response at t≈1.5s → `Ok`.
     #[tokio::test]
     async fn steer_success_renews_hard_deadline_and_survives_past_original() {
+        if skip_without_posix_shell!(
+            "steer_success_renews_hard_deadline_and_survives_past_original"
+        ) {
+            return;
+        }
         let script = "sleep 0.5; \
                       echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"stopReason\":\"end_turn\"}}'; \
                       sleep 1; \
@@ -3957,6 +4287,9 @@ mod tests {
     /// `src/CodexAcpServer.ts:247`) is recorded as steering-capable.
     #[tokio::test]
     async fn initialize_records_steering_supported_when_advertised() {
+        if skip_without_posix_shell!("initialize_records_steering_supported_when_advertised") {
+            return;
+        }
         let supported = steering_supported_after_initialize(
             r#"{"protocolVersion":2,"agentCapabilities":{},"_meta":{"steering":{"supported":true}}}"#,
         )
@@ -3967,11 +4300,60 @@ mod tests {
         );
     }
 
+    /// BUG-036: `initialize` must actually wire
+    /// [`parse_session_close_capability`] into `session_close_supported`. The
+    /// parser has its own process-free tests; this covers the field assignment.
+    #[tokio::test]
+    async fn initialize_records_session_close_supported_when_advertised() {
+        if skip_without_posix_shell!("initialize_records_session_close_supported_when_advertised") {
+            return;
+        }
+        let script = "read -r _init; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":2,\"agentCapabilities\":{\"sessionCapabilities\":{\"close\":{}}}}}'; sleep 5";
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        assert!(
+            client.session_close_supported(),
+            "sessionCapabilities.close must enable session/close"
+        );
+    }
+
+    /// BUG-036: the negative half. An agent that omits the capability must
+    /// never be sent a `session/close`.
+    #[tokio::test]
+    async fn initialize_leaves_session_close_unsupported_when_absent() {
+        if skip_without_posix_shell!("initialize_leaves_session_close_unsupported_when_absent") {
+            return;
+        }
+        let script = "read -r _init; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":2,\"agentCapabilities\":{}}}'; sleep 5";
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        assert!(!client.session_close_supported());
+
+        // And the gate must actually short-circuit the wire call.
+        let result = client
+            .session_close("sess-never-sent")
+            .await
+            .expect("gated close must not error");
+        assert!(
+            result.is_none(),
+            "an unadvertised session/close must return Ok(None) without touching the wire"
+        );
+    }
+
     /// Test 1b: no `_meta` at all (goose, buzz-agent, any older adapter) must
     /// leave the capability off — this is what keeps a steer off the wire for
     /// agents that never implemented it.
     #[tokio::test]
     async fn initialize_leaves_steering_unsupported_when_meta_absent() {
+        if skip_without_posix_shell!("initialize_leaves_steering_unsupported_when_meta_absent") {
+            return;
+        }
         let supported =
             steering_supported_after_initialize(r#"{"protocolVersion":2,"agentCapabilities":{}}"#)
                 .await;
@@ -3985,6 +4367,10 @@ mod tests {
     /// "the key exists so it must work".
     #[tokio::test]
     async fn initialize_leaves_steering_unsupported_when_explicitly_false() {
+        if skip_without_posix_shell!("initialize_leaves_steering_unsupported_when_explicitly_false")
+        {
+            return;
+        }
         let supported = steering_supported_after_initialize(
             r#"{"protocolVersion":2,"_meta":{"steering":{"supported":false}}}"#,
         )
@@ -4001,6 +4387,11 @@ mod tests {
     /// unknown required fields, and there is no run id to report anyway).
     #[tokio::test]
     async fn acp_steer_request_omits_expected_run_id_and_carries_session_and_prompt() {
+        if skip_without_posix_shell!(
+            "acp_steer_request_omits_expected_run_id_and_carries_session_and_prompt"
+        ) {
+            return;
+        }
         let capture = capture_path("acp_shape");
         let mut client = spawn_steer_capture_script(
             &capture,
@@ -4044,6 +4435,10 @@ mod tests {
     /// strictly more precise about which run is being steered.
     #[tokio::test]
     async fn goose_transport_wins_when_both_run_id_and_capability_present() {
+        if skip_without_posix_shell!("goose_transport_wins_when_both_run_id_and_capability_present")
+        {
+            return;
+        }
         let capture = capture_path("goose_priority");
         let mut client =
             spawn_steer_capture_script(&capture, r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
@@ -4076,6 +4471,9 @@ mod tests {
     /// JSON-RPC success — release the event and fall back.
     #[tokio::test]
     async fn acp_steer_failed_outcome_acks_outcome_rejected() {
+        if skip_without_posix_shell!("acp_steer_failed_outcome_acks_outcome_rejected") {
+            return;
+        }
         let capture = capture_path("outcome_failed");
         let mut client = spawn_steer_capture_script(
             &capture,
@@ -4106,6 +4504,11 @@ mod tests {
     /// rejection, which releases the event and fires cancel+merge.
     #[tokio::test]
     async fn acp_steer_missing_outcome_acks_outcome_rejected_and_never_drops_event() {
+        if skip_without_posix_shell!(
+            "acp_steer_missing_outcome_acks_outcome_rejected_and_never_drops_event"
+        ) {
+            return;
+        }
         let capture = capture_path("outcome_absent");
         let mut client =
             spawn_steer_capture_script(&capture, r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
@@ -4136,6 +4539,11 @@ mod tests {
     /// renews it to t≈3.5s; prompt response at t≈1.5s lands inside it.
     #[tokio::test]
     async fn acp_steer_injected_renews_hard_deadline_and_survives_past_original() {
+        if skip_without_posix_shell!(
+            "acp_steer_injected_renews_hard_deadline_and_survives_past_original"
+        ) {
+            return;
+        }
         let script = "sleep 0.5; \
                       echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":\"injected\"}}'; \
                       sleep 1; \
@@ -4189,6 +4597,11 @@ mod tests {
     /// deadline fires first and we get `HardTimeout`.
     #[tokio::test]
     async fn acp_steer_started_new_turn_acks_success_without_renewing_hard_deadline() {
+        if skip_without_posix_shell!(
+            "acp_steer_started_new_turn_acks_success_without_renewing_hard_deadline"
+        ) {
+            return;
+        }
         let script = "sleep 0.5; \
              echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":\"startedNewTurn\"}}'; \
              sleep 1; \
@@ -4240,6 +4653,9 @@ mod tests {
     /// that never implemented either method.
     #[tokio::test]
     async fn steer_writes_nothing_when_no_run_id_and_capability_absent() {
+        if skip_without_posix_shell!("steer_writes_nothing_when_no_run_id_and_capability_absent") {
+            return;
+        }
         let capture = capture_path("no_transport");
         let mut client =
             spawn_steer_capture_script(&capture, r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
@@ -4292,6 +4708,9 @@ mod tests {
 
     #[tokio::test]
     async fn goose_usage_notification_recorded_and_take_returns_usage() {
+        if skip_without_posix_shell!("goose_usage_notification_recorded_and_take_returns_usage") {
+            return;
+        }
         let mut client = spawn_inert_client().await;
         assert!(client.take_turn_usage().is_none(), "starts empty");
 
@@ -4319,6 +4738,9 @@ mod tests {
 
     #[tokio::test]
     async fn goose_usage_second_turn_delta_reliable() {
+        if skip_without_posix_shell!("goose_usage_second_turn_delta_reliable") {
+            return;
+        }
         let mut client = spawn_inert_client().await;
         // Turn 1.
         client.goose_usage.begin_turn("s2");
@@ -4335,6 +4757,9 @@ mod tests {
 
     #[tokio::test]
     async fn goose_usage_malformed_notification_does_not_panic() {
+        if skip_without_posix_shell!("goose_usage_malformed_notification_does_not_panic") {
+            return;
+        }
         let mut client = spawn_inert_client().await;
         // Missing params entirely.
         let bad = serde_json::json!({"jsonrpc":"2.0","method":"_goose/unstable/session/update"});

@@ -104,17 +104,61 @@ pub struct SessionState {
     /// fetch fails — all fail open. Cleared on session invalidation alongside
     /// `core_sections` so the next session picks up any canvas change.
     pub canvas_sections: HashMap<Uuid, String>,
+    /// Session IDs Buzz has abandoned locally but has not yet released on the
+    /// wire with `session/close`.
+    ///
+    /// **This queue is the fix for BUG-036.** Before it, invalidation was four
+    /// `HashMap::remove` calls and no wire message: Buzz forgot the session
+    /// while the agent kept it — and every MCP server it had spawned for that
+    /// session — alive forever. One leaked `buzz-dev-mcp` + `python` +
+    /// `node_repl` triplet and ~96 MB of temp disk per rotation, 25.6 GB in six
+    /// days.
+    ///
+    /// Deferred rather than sent inline for two reasons:
+    ///
+    /// 1. **Sync callers.** `invalidate_channel` is reachable from sync,
+    ///    pool-level paths (`AgentPool::invalidate_channel_sessions`,
+    ///    `AgentPool::switch_idle_agent_model`) that hold no `AcpClient` and no
+    ///    async context. Enqueueing there and flushing where the client *is*
+    ///    available means no path can drop the close.
+    /// 2. **Sick agents.** Several `invalidate` call sites are error paths where
+    ///    the agent may be mid-failure. Deferring the send to the next turn
+    ///    means we only ever write a close to an agent that has since proven it
+    ///    is still answering.
+    ///
+    /// Private: the only way to add an entry is to invalidate, and the only way
+    /// to drain one is [`take_pending_closes`](Self::take_pending_closes).
+    pending_closes: Vec<String>,
+    /// Number of sessions this agent has created since spawn. Guardrail input.
+    sessions_created: u64,
+    /// Number of sessions successfully closed on the wire since spawn.
+    /// Guardrail input.
+    sessions_closed: u64,
 }
+
+/// Leak threshold for GRD-036. Fires when the number of sessions an agent has
+/// created, minus those successfully closed, minus those currently live,
+/// exceeds this many — i.e. when sessions are being abandoned without being
+/// released despite the agent advertising `session/close`.
+///
+/// A plain rotation counter would have caught nothing here: rotation is correct
+/// behaviour. The gap between create and close is the thing that was wrong.
+pub(crate) const SESSION_CLOSE_LEAK_THRESHOLD: u64 = 3;
 
 impl SessionState {
     /// Invalidate the session (and turn counter) for a specific prompt source.
+    ///
+    /// Any session ID dropped here is queued for `session/close` — see
+    /// [`pending_closes`](Self::pending_closes).
     pub fn invalidate(&mut self, source: &PromptSource) {
         match source {
             PromptSource::Channel(cid) => {
                 self.invalidate_channel(cid);
             }
             PromptSource::Heartbeat => {
-                self.heartbeat_session = None;
+                if let Some(sid) = self.heartbeat_session.take() {
+                    self.pending_closes.push(sid);
+                }
                 self.heartbeat_turn_count = 0;
             }
         }
@@ -122,14 +166,35 @@ impl SessionState {
 
     /// Invalidate a single channel's session and turn counter.
     /// Returns `true` if the channel had an active session.
+    ///
+    /// Any session ID dropped here is queued for `session/close` — see
+    /// [`pending_closes`](Self::pending_closes).
     pub fn invalidate_channel(&mut self, channel_id: &Uuid) -> bool {
         self.turn_counts.remove(channel_id);
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
-        self.sessions.remove(channel_id).is_some()
+        match self.sessions.remove(channel_id) {
+            Some(sid) => {
+                self.pending_closes.push(sid);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
+    ///
+    /// **Deliberately does not queue closes, and discards any already queued.**
+    /// Every call site of this method is an `AcpError::AgentExited` or
+    /// `AcpError::HardTimeout` path — the agent process is dead or declared
+    /// unrecoverable and about to be respawned. There is nobody left to answer
+    /// a `session/close`, the sessions and their MCP children die with the
+    /// process (the desktop wraps the agent tree in a `KILL_ON_JOB_CLOSE` job
+    /// object), and writing to a wedged agent would only burn the close budget
+    /// while an error report waits behind it. Verified against all eight
+    /// `invalidate_all` call sites in this file when BUG-036 was fixed; a new
+    /// call site on a *healthy* agent must use `invalidate`/`invalidate_channel`
+    /// instead, or this comment stops being true.
     pub fn invalidate_all(&mut self) {
         self.sessions.clear();
         self.turn_counts.clear();
@@ -137,6 +202,50 @@ impl SessionState {
         self.heartbeat_turn_count = 0;
         self.core_sections.clear();
         self.canvas_sections.clear();
+        self.pending_closes.clear();
+    }
+
+    /// Record that a new session was created on this agent. Guardrail input
+    /// only — carries no behaviour.
+    pub fn note_session_created(&mut self) {
+        self.sessions_created = self.sessions_created.saturating_add(1);
+    }
+
+    /// Take the queued session IDs awaiting `session/close`, leaving the queue
+    /// empty.
+    ///
+    /// Returns an empty vec — no allocation — in the overwhelmingly common case
+    /// where nothing was abandoned.
+    pub fn take_pending_closes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_closes)
+    }
+
+    /// Record a session successfully released on the wire. Guardrail input.
+    pub fn note_session_closed(&mut self) {
+        self.sessions_closed = self.sessions_closed.saturating_add(1);
+    }
+
+    /// Sessions created on this agent since spawn. Guardrail reporting.
+    pub fn sessions_created(&self) -> u64 {
+        self.sessions_created
+    }
+
+    /// Sessions released on the wire since spawn. Guardrail reporting.
+    pub fn sessions_closed(&self) -> u64 {
+        self.sessions_closed
+    }
+
+    /// Sessions created but neither closed on the wire nor currently live —
+    /// i.e. sessions the agent is still holding that Buzz has walked away from.
+    ///
+    /// Zero in steady state when closes are landing. Subtracting the live count
+    /// is what keeps an agent legitimately serving several channels from
+    /// tripping the guardrail.
+    pub fn leaked_session_estimate(&self) -> u64 {
+        let live = self.sessions.len() as u64 + u64::from(self.heartbeat_session.is_some());
+        self.sessions_created
+            .saturating_sub(self.sessions_closed)
+            .saturating_sub(live)
     }
 
     #[cfg(test)]
@@ -876,6 +985,170 @@ async fn resolve_new_session_channel_context(
     (is_dm, title_channel, Some(info.channel_type))
 }
 
+/// Release every session this agent is holding that Buzz has walked away from,
+/// by sending ACP `session/close` for each queued session ID.
+///
+/// This is the wire half of invalidation and the fix for BUG-036. Without it,
+/// invalidation was purely local: the agent kept each abandoned session — and
+/// the MCP servers it had spawned for that session — alive for the life of the
+/// process, leaking a `buzz-dev-mcp` + `python` + `node_repl` triplet and
+/// ~96 MB of temp disk per session rotation.
+///
+/// # Contract
+///
+/// - **Best-effort.** A close failure is logged and the loop continues. It never
+///   fails a turn, never propagates, and never blocks the new session from
+///   being created. A leaked session is a disk cost; a close that aborts a turn
+///   is an outage.
+/// - **Never silent.** Every failure is logged at WARN with the session ID and
+///   the error. A silent drop here is exactly how BUG-036 went unnoticed for a
+///   week.
+/// - **Gated on the advertised capability.** Agents that do not advertise
+///   `agentCapabilities.sessionCapabilities.close` are never sent one; the queue
+///   is drained and dropped so it cannot grow without bound.
+/// - **Bounded.** Each close carries [`AcpClient::SESSION_CLOSE_TIMEOUT`], well
+///   under the default RPC budget, so a wedged agent costs seconds.
+///
+/// # Safety
+///
+/// Only session IDs that have already been removed from `SessionState` reach
+/// this queue, so by construction Buzz will never prompt them again. Closing a
+/// session that is still in use would interrupt a live turn (the agent's own
+/// handler calls `interruptSessionTurn`), which is far worse than leaking one.
+async fn flush_pending_session_closes(agent: &mut OwnedAgent) {
+    let pending = agent.state.take_pending_closes();
+    if pending.is_empty() {
+        return;
+    }
+    let agent_index = agent.index;
+    // Disjoint field borrows: the closer is the ACP client, the accounting lives
+    // on the session state.
+    run_session_closes(&mut agent.acp, &mut agent.state, agent_index, pending).await;
+}
+
+/// The `session/close` capability of an agent connection, as a seam.
+///
+/// Exists so the best-effort policy in [`run_session_closes`] — capability gate,
+/// one close per retired ID, failure tolerance, guardrail accounting — can be
+/// tested without spawning an agent subprocess. [`AcpClient`] is the only
+/// production implementor.
+trait SessionCloser {
+    /// Whether the agent advertised `sessionCapabilities.close` at `initialize`.
+    fn close_supported(&self) -> bool;
+
+    /// Send `session/close` for `session_id`. `Ok(None)` means the call was
+    /// skipped by the implementor's own capability gate.
+    fn close(
+        &mut self,
+        session_id: &str,
+    ) -> impl std::future::Future<Output = Result<Option<serde_json::Value>, AcpError>> + Send;
+}
+
+impl SessionCloser for AcpClient {
+    fn close_supported(&self) -> bool {
+        self.session_close_supported()
+    }
+
+    fn close(
+        &mut self,
+        session_id: &str,
+    ) -> impl std::future::Future<Output = Result<Option<serde_json::Value>, AcpError>> + Send {
+        self.session_close(session_id)
+    }
+}
+
+/// What one flush did. Returned so the guardrail and the best-effort contract
+/// are assertable in tests; production callers ignore it and read the logs.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SessionCloseReport {
+    /// Sessions the agent confirmed closed.
+    closed: usize,
+    /// Sessions whose close failed. Logged, tolerated, and leaked.
+    failed: usize,
+    /// Sessions not attempted because the agent does not advertise the
+    /// capability.
+    skipped_unsupported: usize,
+    /// Whether GRD-036 tripped on this flush.
+    guardrail_fired: bool,
+}
+
+async fn run_session_closes<C: SessionCloser>(
+    closer: &mut C,
+    state: &mut SessionState,
+    agent_index: usize,
+    pending: Vec<String>,
+) -> SessionCloseReport {
+    let mut report = SessionCloseReport::default();
+
+    if !closer.close_supported() {
+        // Not an error: `session/close` is an optional ACP capability. Logged so
+        // the leak stays attributable if it ever reappears on such an agent.
+        report.skipped_unsupported = pending.len();
+        tracing::debug!(
+            target: "pool::session",
+            agent_index,
+            abandoned = pending.len(),
+            "agent does not advertise session/close — {} abandoned session(s) will be reclaimed only when the agent process exits",
+            pending.len()
+        );
+        return report;
+    }
+
+    for session_id in pending {
+        match closer.close(&session_id).await {
+            Ok(Some(_)) => {
+                state.note_session_closed();
+                report.closed += 1;
+                tracing::debug!(
+                    target: "pool::session",
+                    agent_index,
+                    "released abandoned session {session_id}"
+                );
+            }
+            Ok(None) => {
+                // Capability flipped between the gate above and the call — not
+                // reachable today (the flag is set once at initialize), but do
+                // not report a success we did not get.
+                report.failed += 1;
+                tracing::warn!(
+                    target: "pool::session",
+                    agent_index,
+                    "session/close for {session_id} was skipped by the capability gate after it had already passed"
+                );
+            }
+            Err(error) => {
+                // Best-effort: log the real error with its context and keep
+                // going. Never swallowed, never propagated — a leaked session
+                // costs disk, a close that fails a turn costs an outage.
+                report.failed += 1;
+                tracing::warn!(
+                    target: "pool::session",
+                    agent_index,
+                    "session/close failed for {session_id}: {error} — session and its MCP servers will leak until the agent exits"
+                );
+            }
+        }
+    }
+
+    // GRD-036: watch the gap between sessions created and sessions released, not
+    // the rotation count. Rotation is correct behaviour and a rotation counter
+    // would have shown nothing; the create/close asymmetry is what was broken.
+    let leaked = state.leaked_session_estimate();
+    if leaked > SESSION_CLOSE_LEAK_THRESHOLD {
+        report.guardrail_fired = true;
+        tracing::warn!(
+            target: "pool::session",
+            agent_index,
+            leaked,
+            created = state.sessions_created(),
+            closed = state.sessions_closed(),
+            "[GUARDRAIL] session close leak: agent advertises session/close but {leaked} session(s) have been abandoned without being released"
+        );
+    }
+
+    report
+}
+
 /// Create a new ACP session via `session_new_full()`, populate model capabilities
 /// on the agent (first session only), and apply `desired_model` if set.
 ///
@@ -1593,6 +1866,18 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => None,
     };
 
+    // BUG-036: release anything abandoned since this agent last ran a turn,
+    // *before* asking for a new session. Sync, pool-level paths
+    // (`invalidate_channel_sessions`, `switch_idle_agent_model`) and the
+    // control-signal/error paths below all queue their dropped session IDs
+    // rather than sending inline; this is where the queue is paid off. Placed
+    // ahead of session creation so a rotation closes the old session before the
+    // replacement — and its MCP servers — is spawned, rather than after.
+    //
+    // The agent has just been checked out for a turn, so if it is going to
+    // answer anything it will answer this.
+    flush_pending_session_closes(&mut agent).await;
+
     let (session_id, is_new_session) = match &source {
         PromptSource::Channel(cid) => {
             if let Some(sid) = agent.state.sessions.get(cid) {
@@ -1618,6 +1903,7 @@ pub async fn run_prompt_task(
                             target: "pool::session",
                             "created session {sid} for channel {cid}"
                         );
+                        agent.state.note_session_created();
                         agent.state.sessions.insert(*cid, sid.clone());
                         // Commit canvas only after session creation succeeds (I3).
                         if let Some((pending_cid, section)) = pending_canvas.take() {
@@ -1666,6 +1952,7 @@ pub async fn run_prompt_task(
                             "created heartbeat session {sid} for agent {}",
                             agent.index
                         );
+                        agent.state.note_session_created();
                         agent.state.heartbeat_session = Some(sid.clone());
                         (sid, true)
                     }
@@ -2016,6 +2303,11 @@ pub async fn run_prompt_task(
                             Ok(stop_reason) => {
                                 log_stop_reason(&source, &stop_reason);
                                 agent.state.invalidate(&source);
+                                // BUG-036: the agent answered the cancel, so it
+                                // is alive and can be told to drop the session
+                                // we just abandoned. Best-effort; the requeued
+                                // batch does not wait on it succeeding.
+                                flush_pending_session_closes(&mut agent).await;
                                 let retry_batch =
                                     requeue_cancelled_batch(&ctx, control_signal, batch);
 
@@ -2110,6 +2402,11 @@ pub async fn run_prompt_task(
                             &source,
                             &control_signal,
                         );
+                        // BUG-036: Rotate/SwitchModel invalidated above and the
+                        // turn completed naturally, so the agent is healthy —
+                        // release the retired session now instead of waiting for
+                        // a next turn that may never come.
+                        flush_pending_session_closes(&mut agent).await;
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
@@ -2169,6 +2466,13 @@ pub async fn run_prompt_task(
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
                 agent.state.invalidate(&source);
+                // BUG-036: rotation is the path that caused the leak, and it is
+                // the one path where the agent is provably healthy — the turn
+                // just completed successfully. Pay the close off now rather than
+                // waiting for the next turn, which may never come for this
+                // agent. `invalidate` queued the retired session ID; this sends
+                // it. Best-effort: it cannot fail the turn.
+                flush_pending_session_closes(&mut agent).await;
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -5277,6 +5581,286 @@ mod tests {
         s.heartbeat_session = Some("sess-hb".into());
         s.heartbeat_turn_count = 7;
         (s, ch_a, ch_b)
+    }
+
+    // ---- BUG-036: session/close on every abandoned session ----------------
+    //
+    // The defect was that invalidation was purely local — four `HashMap::remove`
+    // calls and no wire message — so the agent kept every rotated session, and
+    // the MCP servers it had spawned for it, alive forever.
+
+    /// Recording [`SessionCloser`] so the best-effort close policy is testable
+    /// without spawning an agent subprocess.
+    #[derive(Default)]
+    struct MockCloser {
+        supported: bool,
+        /// Every session ID a close was attempted for, in order.
+        calls: Vec<String>,
+        /// Session IDs whose close must fail.
+        fail_for: Vec<String>,
+    }
+
+    impl MockCloser {
+        fn supported() -> Self {
+            Self {
+                supported: true,
+                ..Default::default()
+            }
+        }
+        fn unsupported() -> Self {
+            Self::default()
+        }
+        fn failing_for(mut self, session_id: &str) -> Self {
+            self.fail_for.push(session_id.to_string());
+            self
+        }
+    }
+
+    impl SessionCloser for MockCloser {
+        fn close_supported(&self) -> bool {
+            self.supported
+        }
+
+        fn close(
+            &mut self,
+            session_id: &str,
+        ) -> impl std::future::Future<Output = Result<Option<serde_json::Value>, AcpError>> + Send
+        {
+            self.calls.push(session_id.to_string());
+            let fails = self.fail_for.iter().any(|s| s == session_id);
+            async move {
+                if fails {
+                    Err(AcpError::AgentError {
+                        code: -32603,
+                        message: "boom".into(),
+                    })
+                } else {
+                    Ok(Some(serde_json::json!({})))
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_invalidate_channel_queues_the_retired_session_for_close() {
+        let (mut s, ch_a, _ch_b) = make_state();
+        s.invalidate(&PromptSource::Channel(ch_a));
+
+        // The whole bug: before the fix this queue did not exist and the retired
+        // session ID was simply dropped on the floor.
+        assert_eq!(
+            s.take_pending_closes(),
+            vec!["sess-a".to_string()],
+            "invalidating a channel must queue its session ID for session/close"
+        );
+    }
+
+    #[test]
+    fn test_invalidate_heartbeat_queues_the_retired_session_for_close() {
+        let (mut s, _ch_a, _ch_b) = make_state();
+        s.invalidate(&PromptSource::Heartbeat);
+
+        assert_eq!(
+            s.take_pending_closes(),
+            vec!["sess-hb".to_string()],
+            "invalidating the heartbeat must queue its session ID for session/close"
+        );
+    }
+
+    #[test]
+    fn test_rotate_after_natural_completion_queues_the_retired_session_for_close() {
+        let (mut s, ch_a, _ch_b) = make_state();
+
+        apply_completed_before_control_signal(
+            &mut s,
+            &PromptSource::Channel(ch_a),
+            &ControlSignal::Rotate,
+        );
+
+        assert_eq!(s.take_pending_closes(), vec!["sess-a".to_string()]);
+    }
+
+    #[test]
+    fn test_cancel_after_natural_completion_queues_no_close() {
+        let (mut s, ch_a, _ch_b) = make_state();
+
+        apply_completed_before_control_signal(
+            &mut s,
+            &PromptSource::Channel(ch_a),
+            &ControlSignal::Cancel,
+        );
+
+        // Cancel keeps the session — closing it would kill a session still in use.
+        assert!(s.take_pending_closes().is_empty());
+    }
+
+    #[test]
+    fn test_invalidate_channel_without_a_session_queues_nothing() {
+        let mut s = SessionState::default();
+        assert!(!s.invalidate_channel(&Uuid::new_v4()));
+        assert!(s.take_pending_closes().is_empty());
+    }
+
+    #[test]
+    fn test_invalidate_all_queues_no_closes_and_discards_queued_ones() {
+        let (mut s, ch_a, _ch_b) = make_state();
+        // Queue a close that has NOT been drained, then lose the agent.
+        s.invalidate(&PromptSource::Channel(ch_a));
+        s.invalidate_all();
+
+        // Every `invalidate_all` call site is AgentExited or HardTimeout: the
+        // process is gone or unrecoverable, so there is nobody to answer a
+        // close, and writing to it would only delay the error report.
+        assert!(
+            s.take_pending_closes().is_empty(),
+            "invalidate_all must not queue closes for a dead agent"
+        );
+    }
+
+    #[test]
+    fn test_take_pending_closes_drains_the_queue() {
+        let (mut s, ch_a, ch_b) = make_state();
+        s.invalidate(&PromptSource::Channel(ch_a));
+        s.invalidate(&PromptSource::Channel(ch_b));
+
+        let mut first = s.take_pending_closes();
+        first.sort();
+        assert_eq!(first, vec!["sess-a".to_string(), "sess-b".to_string()]);
+        assert!(
+            s.take_pending_closes().is_empty(),
+            "a drained queue must not replay closes on the next flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_sends_exactly_one_close_per_retired_session() {
+        let (mut s, ch_a, ch_b) = make_state();
+        s.note_session_created();
+        s.note_session_created();
+        s.invalidate(&PromptSource::Channel(ch_a));
+        s.invalidate(&PromptSource::Channel(ch_b));
+
+        let pending = s.take_pending_closes();
+        let mut closer = MockCloser::supported();
+        let report = run_session_closes(&mut closer, &mut s, 0, pending).await;
+
+        closer.calls.sort();
+        assert_eq!(
+            closer.calls,
+            vec!["sess-a".to_string(), "sess-b".to_string()],
+            "each retired session must be closed exactly once"
+        );
+        assert_eq!(report.closed, 2);
+        assert_eq!(report.failed, 0);
+        assert_eq!(s.sessions_closed(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_flush_sends_nothing_when_capability_not_advertised() {
+        let (mut s, ch_a, _ch_b) = make_state();
+        s.invalidate(&PromptSource::Channel(ch_a));
+
+        let pending = s.take_pending_closes();
+        let mut closer = MockCloser::unsupported();
+        let report = run_session_closes(&mut closer, &mut s, 0, pending).await;
+
+        assert!(
+            closer.calls.is_empty(),
+            "an agent that does not advertise sessionCapabilities.close must never be sent one"
+        );
+        assert_eq!(report.skipped_unsupported, 1);
+        assert_eq!(report.closed, 0);
+        assert!(
+            !report.guardrail_fired,
+            "the leak guardrail is meaningless for an agent that cannot close"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_tolerates_a_failing_close_and_keeps_going() {
+        let (mut s, _ch_a, _ch_b) = make_state();
+        let pending = vec!["sess-1".to_string(), "sess-2".to_string()];
+
+        let mut closer = MockCloser::supported().failing_for("sess-1");
+        // Must not panic and must not propagate — this runs on a turn's
+        // critical path and a close failure may never fail a turn.
+        let report = run_session_closes(&mut closer, &mut s, 0, pending).await;
+
+        assert_eq!(
+            closer.calls,
+            vec!["sess-1".to_string(), "sess-2".to_string()],
+            "a failed close must not abort the remaining closes"
+        );
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.closed, 1);
+        assert_eq!(
+            s.sessions_closed(),
+            1,
+            "a failed close must not be counted as released"
+        );
+    }
+
+    #[test]
+    fn test_leaked_session_estimate_ignores_live_sessions() {
+        let mut s = SessionState::default();
+        let ch = Uuid::new_v4();
+        // Three sessions created; one still live, none closed.
+        s.note_session_created();
+        s.note_session_created();
+        s.note_session_created();
+        s.sessions.insert(ch, "live".into());
+        assert_eq!(
+            s.leaked_session_estimate(),
+            2,
+            "live sessions are held on purpose and must not read as leaks"
+        );
+
+        s.note_session_closed();
+        s.note_session_closed();
+        assert_eq!(s.leaked_session_estimate(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_guardrail_fires_when_an_agent_accepts_new_but_ignores_close() {
+        // Mock agent: advertises close, then fails every one — the exact shape
+        // of the BUG-036 leak on an agent that claims to support teardown.
+        let mut s = SessionState::default();
+        let mut closer = MockCloser::supported();
+        for i in 0..=SESSION_CLOSE_LEAK_THRESHOLD {
+            let sid = format!("sess-{i}");
+            closer = closer.failing_for(&sid);
+            s.note_session_created();
+        }
+        let pending: Vec<String> = (0..=SESSION_CLOSE_LEAK_THRESHOLD)
+            .map(|i| format!("sess-{i}"))
+            .collect();
+
+        let report = run_session_closes(&mut closer, &mut s, 0, pending).await;
+
+        assert_eq!(report.failed as u64, SESSION_CLOSE_LEAK_THRESHOLD + 1);
+        assert!(
+            report.guardrail_fired,
+            "[GUARDRAIL] must fire once abandoned-but-unreleased sessions exceed {SESSION_CLOSE_LEAK_THRESHOLD}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_guardrail_stays_quiet_when_closes_land() {
+        let mut s = SessionState::default();
+        let mut closer = MockCloser::supported();
+        let mut pending = Vec::new();
+        for i in 0..=SESSION_CLOSE_LEAK_THRESHOLD + 5 {
+            s.note_session_created();
+            pending.push(format!("sess-{i}"));
+        }
+
+        let report = run_session_closes(&mut closer, &mut s, 0, pending).await;
+
+        assert_eq!(report.failed, 0);
+        assert!(
+            !report.guardrail_fired,
+            "an agent that honours close must never trip the leak guardrail"
+        );
     }
 
     #[test]

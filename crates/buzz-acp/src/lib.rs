@@ -12,6 +12,10 @@ mod pool_lifecycle;
 mod queue;
 mod relay;
 mod setup_mode;
+/// Host-capability detection for tests that drive real POSIX subprocesses.
+/// See `test_support.rs` — BUG-049.
+#[cfg(test)]
+mod test_support;
 mod usage;
 
 pub use usage::TurnUsage;
