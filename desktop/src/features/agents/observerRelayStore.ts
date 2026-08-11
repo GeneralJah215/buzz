@@ -318,6 +318,38 @@ export function _testGetTranscriptRebuildCount(): number {
   return transcriptRebuildCount;
 }
 
+// Number of `subscribeAgentObserverStore` CALLS (not live listeners) since the
+// last store reset. BUG-067's regression for re-subscribe churn asserts on this:
+// a consumer whose subscribe callback is recreated every render tears the
+// subscription down and re-adds it, which leaves the live listener count at 1
+// and is therefore invisible to any assertion on Set size.
+let observerSubscribeCount = 0;
+
+/** Test-only: subscribe calls made since the last store reset. */
+export function _testGetObserverSubscribeCount(): number {
+  return observerSubscribeCount;
+}
+
+/** Test-only: live listener count. */
+export function _testGetObserverListenerCount(): number {
+  return listeners.size;
+}
+
+// Reads of the per-agent snapshot / transcript getters since the last reset.
+//
+// This is the counter that makes the BUG-067 fan-out visible at all. A woken
+// consumer whose snapshot happens to be unchanged does NOT re-render — React
+// bails inside useSyncExternalStore — so a render-count assertion would pass
+// just as happily before the fix as after it. What the fan-out actually costs
+// is one getSnapshot call per subscriber per frame, and that is what this
+// counts.
+let storeReadCount = 0;
+
+/** Test-only: snapshot/transcript getter calls since the last store reset. */
+export function _testGetStoreReadCount(): number {
+  return storeReadCount;
+}
+
 /**
  * `changedAgentKey` is the normalized pubkey of the single agent whose journal
  * changed, or `null` when the change is store-wide (connection state, reset, a
@@ -603,6 +635,7 @@ export function ensureRelayObserverSubscription() {
 export function subscribeAgentObserverStore(
   listener: (changedAgentKey: string | null) => void,
 ) {
+  observerSubscribeCount += 1;
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
@@ -671,6 +704,7 @@ export function getAgentObserverSnapshot(
   // subscription in useObserverEvents. Kept for call-site compatibility.
   _enabled?: boolean,
 ): ObserverSnapshot {
+  storeReadCount += 1;
   // `_enabled` gates the live-relay subscription in useObserverEvents, but we
   // always serve stored data when agentPubkey is present — archived frames are
   // ingested into eventsByAgent regardless of live status and must be readable
@@ -702,6 +736,7 @@ export function getAgentTranscript(
   // subscription in useObserverEvents. Kept for call-site compatibility.
   _enabled?: boolean,
 ): TranscriptItem[] {
+  storeReadCount += 1;
   // Same decoupling as getAgentObserverSnapshot: `_enabled` gates relay
   // subscription, not store reads. Archived items are in transcriptByAgent
   // and must be readable regardless of live status.
@@ -878,6 +913,8 @@ export function resetAgentObserverStore() {
   unrecoverableGapAgents.clear();
   agentManagementListeners.clear();
   transcriptRebuildCount = 0;
+  observerSubscribeCount = 0;
+  storeReadCount = 0;
   onSessionConfigCaptured = null;
   connectionState = "idle";
   errorMessage = null;

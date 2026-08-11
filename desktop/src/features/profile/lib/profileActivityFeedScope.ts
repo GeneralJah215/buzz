@@ -6,8 +6,8 @@ import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlA
 import {
   getAgentObserverSnapshot,
   getAgentTranscript,
-  subscribeAgentObserverStore,
 } from "@/features/agents/observerRelayStore";
+import { subscribeAgentObserverStoreForAgent } from "@/features/agents/agentScopedObserverSubscription";
 import type {
   ObserverEvent,
   TranscriptItem,
@@ -29,6 +29,72 @@ export type ProfileActivityFeedScope = {
 };
 
 const cachedScopes = new Map<string, ProfileActivityFeedScope>();
+
+const EMPTY_EVENTS: readonly ObserverEvent[] = [];
+const EMPTY_TRANSCRIPT: readonly TranscriptItem[] = [];
+
+/**
+ * Last derivation per agent, keyed on the IDENTITY of the three inputs.
+ *
+ * BUG-067. `stableFeedScope` already guaranteed a stable output reference, so
+ * `useSyncExternalStore` never looped — but it bought that stability by running
+ * the full `deriveProfileActivityFeedScope` (a scan of the whole event journal
+ * plus the whole transcript) on every call just to discover nothing changed.
+ * `useSyncExternalStore` calls `getSnapshot` on every render AND on every
+ * notification from both stores, so with 29 agents streaming that scan ran
+ * continuously.
+ *
+ * The three inputs are all reference-stable when unchanged — `events` is the
+ * store's own array, `transcript` is `TranscriptState.items`, and `activeTurns`
+ * comes from `getActiveTurnsForAgent`'s summary cache — so identity comparison
+ * is a sound "nothing changed" test and never returns a stale scope.
+ */
+type FeedScopeDerivation = {
+  activeTurns: readonly ActiveTurnSummary[];
+  events: readonly ObserverEvent[];
+  transcript: readonly TranscriptItem[];
+  scope: ProfileActivityFeedScope;
+};
+
+const derivationCache = new Map<string, FeedScopeDerivation>();
+
+// Number of times the full `deriveProfileActivityFeedScope` scan actually ran.
+// The BUG-067 regression asserts on this counter rather than on elapsed time.
+let derivationCount = 0;
+
+/** Test-only: full feed-scope derivations since the last cache reset. */
+export function _testGetFeedScopeDerivationCount(): number {
+  return derivationCount;
+}
+
+function deriveFeedScopeForCacheKey(
+  cacheKey: string,
+  activeTurns: readonly ActiveTurnSummary[],
+  events: readonly ObserverEvent[],
+  transcript: readonly TranscriptItem[],
+): ProfileActivityFeedScope {
+  const cached = derivationCache.get(cacheKey);
+  if (
+    cached &&
+    cached.activeTurns === activeTurns &&
+    cached.events === events &&
+    cached.transcript === transcript
+  ) {
+    return cached.scope;
+  }
+
+  // stableFeedScope still runs: the derivation can produce a value-equal scope
+  // from different input references (e.g. a new event that adds no channel and
+  // no newer timestamp), and returning a fresh object then would re-render for
+  // nothing.
+  derivationCount += 1;
+  const scope = stableFeedScope(
+    cacheKey,
+    deriveProfileActivityFeedScope({ activeTurns, events, transcript }),
+  );
+  derivationCache.set(cacheKey, { activeTurns, events, transcript, scope });
+  return scope;
+}
 
 function channelIdsEqual(
   left: readonly string[],
@@ -93,6 +159,13 @@ function stableFeedScope(
 
   cachedScopes.set(cacheKey, next);
   return next;
+}
+
+/** Test-only: drop both memo caches so one test cannot seed another. */
+export function _testResetProfileActivityFeedScopeCaches() {
+  cachedScopes.clear();
+  derivationCache.clear();
+  derivationCount = 0;
 }
 
 function collectChannelIdsFromFeed(
@@ -236,32 +309,56 @@ export function useProfileActivityFeedScope(
 
   const getSnapshot = React.useCallback(() => {
     if (!activityAgent || !hasObserver) {
-      return stableFeedScope(
+      // Module-level empties, not fresh `[]` literals: a fresh array would miss
+      // the identity check in deriveFeedScopeForCacheKey on every single call.
+      return deriveFeedScopeForCacheKey(
         agentCacheKey,
-        deriveProfileActivityFeedScope({
-          activeTurns,
-          events: [],
-          transcript: [],
-        }),
+        activeTurns,
+        EMPTY_EVENTS,
+        EMPTY_TRANSCRIPT,
       );
     }
 
     const { events } = getAgentObserverSnapshot(activityAgent.pubkey, true);
     const transcript = getAgentTranscript(activityAgent.pubkey, true);
-    return stableFeedScope(
+    return deriveFeedScopeForCacheKey(
       agentCacheKey,
-      deriveProfileActivityFeedScope({ activeTurns, events, transcript }),
+      activeTurns,
+      events,
+      transcript,
     );
   }, [activeTurns, activityAgent, agentCacheKey, hasObserver]);
 
-  const snapshot = React.useSyncExternalStore((onStoreChange) => {
-    const unsubscribeObserver = subscribeAgentObserverStore(onStoreChange);
-    const unsubscribeTurns = subscribeActiveAgentTurns(onStoreChange);
-    return () => {
-      unsubscribeObserver();
-      unsubscribeTurns();
-    };
-  }, getSnapshot);
+  // BUG-067, two separate defects in the old inline arrow:
+  //
+  //  1. It was recreated on every render, so `useSyncExternalStore` tore down
+  //     and re-established BOTH subscriptions on every render.
+  //  2. The observer half ignored the changed-agent key, so all 29 streaming
+  //     agents woke this feed on every frame.
+  //
+  // `deriveProfileActivityFeedScope` reads exactly one agent (`activityAgent`),
+  // never an aggregate across agents, so scoping the observer subscription to
+  // that agent is correct. The active-turns half stays unfiltered — that store
+  // has no per-agent notification key, and `activeTurns` arrives as an argument
+  // rather than being read in `getSnapshot`, so filtering it here would be
+  // filtering on data this module does not own.
+  const agentPubkey = activityAgent?.pubkey ?? null;
+  const subscribe = React.useCallback(
+    (onStoreChange: () => void) => {
+      const unsubscribeObserver = subscribeAgentObserverStoreForAgent(
+        agentPubkey,
+        onStoreChange,
+      );
+      const unsubscribeTurns = subscribeActiveAgentTurns(onStoreChange);
+      return () => {
+        unsubscribeObserver();
+        unsubscribeTurns();
+      };
+    },
+    [agentPubkey],
+  );
+
+  const snapshot = React.useSyncExternalStore(subscribe, getSnapshot);
 
   return snapshot;
 }

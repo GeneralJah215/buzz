@@ -27,17 +27,15 @@ import type {
 import type { AgentSessionTranscriptVariant } from "./agentSessionTranscriptContext";
 import {
   deriveLatestSessionId,
-  mergeObserverEventWindows,
   resolveDisplayEvents,
   resolveRawRailLayout,
-  scopeByChannel,
 } from "./agentSessionPanelLayout";
 import { shorten } from "./agentSessionUtils";
 import {
   useObserverEvents,
   useArchivedChannelEvents,
 } from "./useObserverEvents";
-import { buildTranscriptState } from "./agentSessionTranscript";
+import { useSessionPanelTranscript } from "./useSessionPanelTranscript";
 
 type ManagedAgentSessionPanelProps = {
   agent: Pick<ManagedAgent, "pubkey" | "name" | "status"> & {
@@ -96,25 +94,15 @@ export function ManagedAgentSessionPanel({
     channelId,
   );
 
-  const scopedLiveEvents = React.useMemo(
-    () => scopeByChannel(events, channelId),
-    [channelId, events],
-  );
-
-  // Combined raw window: live (scoped) + archive merged by (seq, timestamp),
-  // sorted ascending. Used as the single source for both the transcript and the
-  // raw event rail / header count.
-  const combinedEvents = React.useMemo(
-    () => mergeObserverEventWindows(scopedLiveEvents, archivedChannelEvents),
-    [scopedLiveEvents, archivedChannelEvents],
-  );
-
-  // Derive transcript once from the combined raw window. When transcriptOverride
-  // is set (e.g. E2E snapshot specs), bypass both — the caller supplies the full
-  // transcript directly.
-  const derivedTranscript = React.useMemo(
-    () => buildTranscriptState(combinedEvents).items,
-    [combinedEvents],
+  // Scope to this channel, merge with the archive, and derive the transcript
+  // once. Extracted to useSessionPanelTranscript for BUG-067 — see that module
+  // for why the scoped window has to be value-stabilised, and why doing so
+  // cannot make a displayed transcript go stale. When transcriptOverride is set
+  // (e.g. E2E snapshot specs), the caller supplies the transcript directly.
+  const { combinedEvents, derivedTranscript } = useSessionPanelTranscript(
+    events,
+    channelId,
+    archivedChannelEvents,
   );
   const displayTranscript = transcriptOverride ?? derivedTranscript;
 

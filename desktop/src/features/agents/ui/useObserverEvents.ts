@@ -6,8 +6,8 @@ import {
   getAgentTranscript,
   getArchivedChannelEvents,
   ingestArchivedObserverEvents,
-  subscribeAgentObserverStore,
 } from "@/features/agents/observerRelayStore";
+import { useAgentScopedObserverSubscribe } from "@/features/agents/agentScopedObserverSubscription";
 import { retainArchivedChannel } from "@/features/agents/archiveEventWindow";
 import {
   listSaveSubscriptions,
@@ -26,11 +26,11 @@ import {
 } from "./archivePagingState";
 export type { ArchivePagingState } from "./archivePagingState";
 
-// Stable subscribe reference shared by all useSyncExternalStore hooks.
-// subscribeAgentObserverStore already has a fixed identity, so this thin
-// wrapper satisfies React's requirement without per-hook useCallback.
-const subscribeToStore = (onStoreChange: () => void) =>
-  subscribeAgentObserverStore(onStoreChange);
+// BUG-067: every hook in this file reads exactly one agent, so each subscribes
+// through `useAgentScopedObserverSubscribe` — a listener that ignores keyed
+// notifications naming a different agent, and still wakes on every store-wide
+// (`null` key) change. The callback identity is stable per agentPubkey, which
+// is what keeps useSyncExternalStore from resubscribing on every render.
 
 export function useObserverEvents(
   enabled: boolean,
@@ -40,8 +40,9 @@ export function useObserverEvents(
     () => getAgentObserverSnapshot(agentPubkey, enabled),
     [agentPubkey, enabled],
   );
+  const subscribe = useAgentScopedObserverSubscribe(agentPubkey);
 
-  const snapshot = React.useSyncExternalStore(subscribeToStore, getSnapshot);
+  const snapshot = React.useSyncExternalStore(subscribe, getSnapshot);
 
   React.useEffect(() => {
     if (enabled && agentPubkey) {
@@ -60,8 +61,9 @@ export function useAgentTranscript(
     () => getAgentTranscript(agentPubkey, enabled),
     [agentPubkey, enabled],
   );
+  const subscribe = useAgentScopedObserverSubscribe(agentPubkey);
 
-  return React.useSyncExternalStore(subscribeToStore, getSnapshot);
+  return React.useSyncExternalStore(subscribe, getSnapshot);
 }
 
 /**
@@ -97,7 +99,13 @@ export function useArchivedChannelEvents(
     return retainArchivedChannel(channelId);
   }, [channelId]);
 
-  return React.useSyncExternalStore(subscribeToStore, getSnapshot);
+  // Scoped to the agent for symmetry with the two hooks above, but the load
+  // that actually matters here is carried by the `null` key: every writer of
+  // the archive window (`ingestArchivedObserverEvents`) notifies store-wide,
+  // never with an agent key, so this hook cannot miss an archive page.
+  const subscribe = useAgentScopedObserverSubscribe(agentPubkey);
+
+  return React.useSyncExternalStore(subscribe, getSnapshot);
 }
 
 const ARCHIVED_EVENTS_PAGE_SIZE = 200;

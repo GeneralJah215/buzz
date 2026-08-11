@@ -6,10 +6,8 @@ import {
   useActiveAgentTurns,
   type ActiveTurnSummary,
 } from "@/features/agents/activeAgentTurnsStore";
-import {
-  subscribeAgentObserverStore,
-  getLatestLiveSessionId,
-} from "@/features/agents/observerRelayStore";
+import { getLatestLiveSessionId } from "@/features/agents/observerRelayStore";
+import { useAgentScopedObserverSubscribe } from "@/features/agents/agentScopedObserverSubscription";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { useAnchoredScroll } from "@/features/messages/ui/useAnchoredScroll";
 import { useStableArrayShallow } from "@/shared/hooks/useStableReference";
@@ -142,13 +140,17 @@ export function AgentSessionTranscriptList({
   );
 
   // Subscribe to the observer relay store so we read the latest-live-session-id
-  // reactively. We don't need the full snapshot — only the key for boundary labeling.
+  // reactively. We don't need the full snapshot — only the key for boundary
+  // labeling. `getLatestLiveSessionId` reads a per-(agent, channel) entry that
+  // only `appendAgentEvent` for THIS agent can advance, so the subscription is
+  // scoped to this agent (BUG-067).
   const getLatestLive = React.useCallback(
     () => getLatestLiveSessionId(agentPubkey, channelId),
     [agentPubkey, channelId],
   );
+  const subscribeScoped = useAgentScopedObserverSubscribe(agentPubkey);
   const latestLiveSessionId = React.useSyncExternalStore(
-    subscribeAgentObserverStore,
+    subscribeScoped,
     getLatestLive,
   );
 

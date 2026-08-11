@@ -13,6 +13,21 @@ import { listen } from "@tauri-apps/api/event";
 // setting applies to the machine's sleep behavior regardless of account.
 const STORAGE_KEY = "buzz-prevent-sleep";
 
+/**
+ * Minimum gap between two activity-driven `setPreventSleepActive(true)` calls.
+ *
+ * BUG-067. That call is a Tauri IPC, and it fired whenever the newest observer
+ * event key changed — which for a busy agent is every frame. All the Rust side
+ * does with a repeat call is re-arm the inactivity cap timer, and that cap is
+ * one hour (`INACTIVITY_CAP_SECONDS`), so refreshing it at most every 30s is
+ * 120x more often than the cap needs and cannot let the assertion lapse while
+ * an agent is genuinely working.
+ *
+ * The `expired` recovery path deliberately bypasses this throttle: coming back
+ * from an expired assertion must re-acquire immediately, not up to 30s late.
+ */
+const ACTIVITY_REFRESH_INTERVAL_MS = 30_000;
+
 function readPreference(): boolean {
   return window.localStorage.getItem(STORAGE_KEY) === "true";
 }
@@ -93,14 +108,38 @@ function usePreventSleepInternal() {
     };
   }, []);
 
+  // Timestamp of the last activity-driven IPC. A ref, not effect-local state,
+  // so re-running the effect (an agent starts, `expired` flips) cannot reset
+  // the throttle window and let a burst of IPC through.
+  const lastActivityIpcAtRef = React.useRef(0);
+
   React.useEffect(() => {
     if (!enabled || !runningAgentPubkeyKey) return;
 
     const observedPubkeys = runningAgentPubkeyKey.split(",");
+    // Both sides are already normalized: runningAgentPubkeys maps through
+    // normalizePubkey, and the store's changedAgentKey is normalized too.
+    const observedPubkeySet = new Set(observedPubkeys);
     const tracker = createPreventSleepActivityTracker();
-    const observeActivity = () => {
+
+    // BUG-067 — this consumer AGGREGATES across every running agent, so it is
+    // deliberately NOT filtered down to a single agent. What the changed-agent
+    // key buys here is the size of each wakeup: re-reading one agent's snapshot
+    // instead of all 29. A `null` key (reset, connection state, archive page)
+    // still re-reads everything, and a key naming an agent we don't track is
+    // dropped because its events can never move this tracker.
+    const observeActivity = (changedAgentKey: string | null = null) => {
+      let observed: readonly string[];
+      if (changedAgentKey === null) {
+        observed = observedPubkeys;
+      } else if (observedPubkeySet.has(changedAgentKey)) {
+        observed = [changedAgentKey];
+      } else {
+        return;
+      }
+
       const hasNewActivity = tracker.observe(
-        observedPubkeys.map((pubkey) => ({
+        observed.map((pubkey) => ({
           pubkey,
           events: getAgentObserverSnapshot(pubkey, true).events,
         })),
@@ -109,7 +148,16 @@ function usePreventSleepInternal() {
 
       if (expired) {
         setExpired(false);
+        lastActivityIpcAtRef.current = Date.now();
+        void setPreventSleepActive(true);
+        return;
       }
+
+      const now = Date.now();
+      if (now - lastActivityIpcAtRef.current < ACTIVITY_REFRESH_INTERVAL_MS) {
+        return;
+      }
+      lastActivityIpcAtRef.current = now;
       void setPreventSleepActive(true);
     };
 
