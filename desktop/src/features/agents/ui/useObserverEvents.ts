@@ -8,6 +8,7 @@ import {
   ingestArchivedObserverEvents,
   subscribeAgentObserverStore,
 } from "@/features/agents/observerRelayStore";
+import { retainArchivedChannel } from "@/features/agents/archiveEventWindow";
 import {
   listSaveSubscriptions,
   readArchivedObserverEventsForChannel,
@@ -85,6 +86,16 @@ export function useArchivedChannelEvents(
     () => getArchivedChannelEvents(agentPubkey, channelId),
     [agentPubkey, channelId],
   );
+
+  // Mark this channel as on screen for as long as the hook is mounted. The
+  // archive window only evicts channels nobody is reading, so a mounted panel
+  // can never have its history pulled out from under it — the recovery path for
+  // an evicted channel is re-hydration on the next open, which a mounted panel
+  // would not run.
+  React.useEffect(() => {
+    if (!channelId) return;
+    return retainArchivedChannel(channelId);
+  }, [channelId]);
 
   return React.useSyncExternalStore(subscribeToStore, getSnapshot);
 }

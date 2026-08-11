@@ -33,6 +33,15 @@ import {
   syntheticGapEvent,
 } from "./observerGapDetection";
 import {
+  appendArchivedChannelEvent,
+  clearArchivedChannelEvents,
+  readArchivedChannelEvents,
+} from "./archiveEventWindow";
+import {
+  compareObserverEvents,
+  isObserverEventAfter,
+} from "./observerEventOrder";
+import {
   type TranscriptWindowIndex,
   collectTouchedItemIds,
   createTranscriptWindowIndex,
@@ -71,14 +80,10 @@ const snapshotByAgent = new Map<string, ObserverSnapshot>();
 // instead of forcing a full transcript rebuild (BUG-065). See transcriptWindow.
 const transcriptWindowByAgent = new Map<string, TranscriptWindowIndex>();
 
-// Channel-scoped archive event journal — holds paged history loaded from the local
-// SQLite archive without the MAX_OBSERVER_EVENTS live-relay cap. Keyed by
-// `${normalizedAgentPubkey}:${channelId}`. The live relay path writes to
-// `eventsByAgent` (per-agent, capped) and this map is NEVER written by live
-// events — separation is strict so loading deep history can never evict live frames
-// or vice versa. UI consumers merge the raw events from both sources, then derive
-// TranscriptState once over the combined window.
-const archiveEventsByChannel = new Map<string, ObserverEvent[]>();
+// The channel-scoped archive event journal now lives in `archiveEventWindow`.
+// Its contract is unchanged — the live relay path writes to `eventsByAgent`
+// (per-agent, capped) and never to the archive, so loading deep history can
+// never evict live frames or vice versa. See that module for what it adds.
 
 // Per-agent, per-channel latest-live-session-id.
 // Key: `${normalizePubkey(agentPubkey)}:${channelId}`.
@@ -109,6 +114,16 @@ const lastSeqByAgent = new Map<string, number>();
 const gapsByAgent = new Map<string, ObserverGap[]>();
 const EMPTY_GAPS: ObserverGap[] = [];
 
+// Frame loss under sustained load is "structural, not bad luck"
+// (observerGapDetection), so this list grew for the whole session and every
+// append copied it. Keep the newest window of gap RECORDS...
+export const MAX_OBSERVER_GAPS_PER_AGENT = 200;
+// ...and keep the one fact a record carries that a caller acts on — "frames
+// were lost that nothing could refill" — in a set that is never trimmed. So
+// trimming the list can only lose detail, never the verdict: the divergence
+// from an uncapped list retains MORE than the list alone, never less.
+const unrecoverableGapAgents = new Set<string>();
+
 /**
  * Every observer discontinuity recorded for an agent, oldest first.
  *
@@ -128,12 +143,24 @@ export function getAgentObserverGaps(
 export function isAgentObserverStateStale(
   agentPubkey: string | null | undefined,
 ): boolean {
-  return getAgentObserverGaps(agentPubkey).some((gap) => !gap.controlComplete);
+  if (!agentPubkey) return false;
+  // Read the sticky set rather than scanning the (now capped) list, so an agent
+  // that lost frames stays marked stale even after 200 later gaps push the
+  // original record out of the retained window.
+  return unrecoverableGapAgents.has(normalizePubkey(agentPubkey));
 }
 
 function recordObserverGap(agentPubkey: string, gap: ObserverGap) {
   const key = normalizePubkey(agentPubkey);
-  gapsByAgent.set(key, [...(gapsByAgent.get(key) ?? []), gap]);
+  if (!gap.controlComplete) {
+    unrecoverableGapAgents.add(key);
+  }
+  const current = gapsByAgent.get(key) ?? EMPTY_GAPS;
+  const overflow = current.length + 1 - MAX_OBSERVER_GAPS_PER_AGENT;
+  gapsByAgent.set(
+    key,
+    overflow > 0 ? [...current.slice(overflow), gap] : [...current, gap],
+  );
   if (gap.controlComplete) {
     // The harness refilled the control plane from its own replay ring. Content
     // is still missing — the transcript marker says so — but no waiting caller
@@ -408,46 +435,6 @@ function archiveChannelKey(agentPubkey: string, channelId: string): string {
 }
 
 /**
- * Append a decoded archived observer event to the channel-scoped archive
- * event journal. Unlike `appendAgentEvent`, this path does NOT cap or trim —
- * the channel archive window grows only by explicit paged loads from SQLite,
- * so unbounded growth from live relay events is impossible.
- *
- * Deduplicates on `(seq, timestamp)` — identical to `appendAgentEvent` — so
- * events that arrive on the live relay before the archive page is loaded are
- * silently skipped. The archive window and the live transcript are kept
- * strictly separate: live events never write here.
- *
- * Returns `true` if the event was added (state changed), `false` if it was a
- * duplicate and was skipped. The caller batches notifications.
- */
-function appendArchivedChannelEvent(
-  agentPubkey: string,
-  channelId: string,
-  event: ObserverEvent,
-): boolean {
-  const key = archiveChannelKey(agentPubkey, channelId);
-  const current = archiveEventsByChannel.get(key) ?? [];
-
-  // Dedup: skip if (seq, timestamp) already present in the archive window.
-  if (
-    current.some(
-      (existing) =>
-        existing.seq === event.seq && existing.timestamp === event.timestamp,
-    )
-  ) {
-    return false;
-  }
-
-  // Archive pages arrive newest-first from SQLite, so each new event sorts
-  // BEFORE the existing entries. Sort the combined array to maintain ascending
-  // order for consumers that call buildTranscriptState over the window.
-  const sorted = [...current, event].sort(compareObserverEvents);
-  archiveEventsByChannel.set(key, sorted);
-  return true;
-}
-
-/**
  * Read the channel-scoped archive raw events for a given (agent, channel)
  * pair. Returns an empty array when no archive has been loaded yet.
  *
@@ -461,61 +448,10 @@ export function getArchivedChannelEvents(
   channelId: string | null | undefined,
 ): ObserverEvent[] {
   if (!agentPubkey || !channelId) return EMPTY_EVENTS;
-  return (
-    archiveEventsByChannel.get(archiveChannelKey(agentPubkey, channelId)) ??
-    EMPTY_EVENTS
-  );
+  return readArchivedChannelEvents(archiveChannelKey(agentPubkey, channelId));
 }
 
-// `Date.parse` on an ISO string is not free, and comparison is the innermost
-// loop of every journal sort and every watermark check. Events are immutable
-// once decoded, so their parsed time is memoized against the object itself; the
-// WeakMap drops the entry when the event is evicted (BUG-065 rank 3).
-const parsedTimestampByEvent = new WeakMap<object, number>();
-
-function observerEventTimeMs(event: ObserverEvent): number {
-  const cached = parsedTimestampByEvent.get(event);
-  if (cached !== undefined) return cached;
-  const parsed = Date.parse(event.timestamp);
-  parsedTimestampByEvent.set(event, parsed);
-  return parsed;
-}
-
-export function compareObserverEvents(
-  left: ObserverEvent,
-  right: ObserverEvent,
-) {
-  const leftTime = observerEventTimeMs(left);
-  const rightTime = observerEventTimeMs(right);
-  if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
-    const timeDiff = leftTime - rightTime;
-    if (timeDiff !== 0) {
-      return timeDiff;
-    }
-  }
-
-  return left.seq - right.seq;
-}
-
-/**
- * Returns true if `candidate` sorts strictly after `stored` using the same
- * two-key ordering as `compareObserverEvents`: later timestamp wins; equal
- * timestamp falls back to higher seq.  Extracted so latest-live advancement
- * cannot drift from transcript ordering.
- */
-export function isObserverEventAfter(
-  candidate: { timestamp: string; seq: number },
-  stored: { timestamp: string; seq: number },
-): boolean {
-  const candidateTime = Date.parse(candidate.timestamp);
-  const storedTime = Date.parse(stored.timestamp);
-  if (Number.isFinite(candidateTime) && Number.isFinite(storedTime)) {
-    if (candidateTime !== storedTime) {
-      return candidateTime > storedTime;
-    }
-  }
-  return candidate.seq > stored.seq;
-}
+export { compareObserverEvents, isObserverEventAfter };
 
 async function handleRelayObserverEvent(
   event: RelayEvent,
@@ -869,7 +805,7 @@ export async function ingestArchivedObserverEvents(
       // remain visible in the agent's general transcript.
       if (parsed.channelId) {
         const added = appendArchivedChannelEvent(
-          agentPubkey,
+          archiveChannelKey(agentPubkey, parsed.channelId),
           parsed.channelId,
           parsed,
         );
@@ -932,13 +868,14 @@ export function resetAgentObserverStore() {
   transcriptByAgent.clear();
   transcriptWindowByAgent.clear();
   snapshotByAgent.clear();
-  archiveEventsByChannel.clear();
+  clearArchivedChannelEvents();
   knownAgentPubkeys.clear();
   knownAgentsBySubscription.clear();
   pendingUnknownAgentFrames.length = 0;
   latestLiveSessionByAgentChannel.clear();
   lastSeqByAgent.clear();
   gapsByAgent.clear();
+  unrecoverableGapAgents.clear();
   agentManagementListeners.clear();
   transcriptRebuildCount = 0;
   onSessionConfigCaptured = null;
@@ -969,7 +906,5 @@ export function _testGetArchivedChannelEvents(
   agentPubkey: string,
   channelId: string,
 ): ObserverEvent[] {
-  return (
-    archiveEventsByChannel.get(archiveChannelKey(agentPubkey, channelId)) ?? []
-  );
+  return readArchivedChannelEvents(archiveChannelKey(agentPubkey, channelId));
 }

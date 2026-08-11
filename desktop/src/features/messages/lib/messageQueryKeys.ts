@@ -30,17 +30,44 @@ export function dedupeMessagesById(messages: RelayEvent[]) {
   return deduped.reverse();
 }
 
+export function compareTimelineMessages(left: RelayEvent, right: RelayEvent) {
+  if (left.created_at !== right.created_at) {
+    return left.created_at - right.created_at;
+  }
+  // Tiebreak same-second events on id so the merge order is deterministic.
+  // Without this, two events sharing a created_at can land in a different
+  // position depending on which REQ (history vs live-sub) delivered them
+  // first — reading as a "missing"/shuffled message at a fixed scroll offset.
+  return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+}
+
+/**
+ * Arrays this module has proved are deduplicated and in `compareTimelineMessages`
+ * order. Membership is what lets `mergeTimelineCacheMessages` append a newer
+ * message to the tail instead of re-sorting: an array of unknown provenance
+ * (a relay page, a window projection, anything hand-built in a test) is not a
+ * member, so it takes the full normalizing path exactly as before, and the
+ * result of that path is what becomes a member. The ordering an append produces
+ * is therefore identical to the ordering a sort would have produced.
+ *
+ * A `WeakSet` keyed on the array itself holds no reference of its own, so a
+ * cache array dropped by React Query is collected with nothing left behind.
+ */
+const normalizedTimelineArrays = new WeakSet<RelayEvent[]>();
+
+export function isNormalizedTimeline(messages: RelayEvent[]) {
+  return normalizedTimelineArrays.has(messages);
+}
+
+export function markNormalizedTimeline(messages: RelayEvent[]) {
+  normalizedTimelineArrays.add(messages);
+  return messages;
+}
+
 export function sortMessages(messages: RelayEvent[]) {
-  return dedupeMessagesById(messages).sort((left, right) => {
-    if (left.created_at !== right.created_at) {
-      return left.created_at - right.created_at;
-    }
-    // Tiebreak same-second events on id so the merge order is deterministic.
-    // Without this, two events sharing a created_at can land in a different
-    // position depending on which REQ (history vs live-sub) delivered them
-    // first — reading as a "missing"/shuffled message at a fixed scroll offset.
-    return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
-  });
+  return markNormalizedTimeline(
+    dedupeMessagesById(messages).sort(compareTimelineMessages),
+  );
 }
 
 export function normalizeTimelineMessages(messages: RelayEvent[]) {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
 
 import {
+  MAX_OBSERVER_GAPS_PER_AGENT,
   _testRegisterKnownAgents,
   getAgentObserverGaps,
   getAgentObserverSnapshot,
@@ -143,5 +144,95 @@ describe("observer seq-gap tracking", () => {
     trackObserverContinuity(AGENT_PUBKEY, frame(4));
     trackObserverContinuity(AGENT_PUBKEY, frame(12));
     assert.deepEqual([...getAgentObserverGaps(AGENT_PUBKEY)], []);
+  });
+});
+
+/**
+ * Frame loss under sustained load is structural, not bad luck
+ * (observerGapDetection), so the gap list grew for the whole session and every
+ * append copied it. It is now a bounded window of records — but the one thing
+ * a caller acts on, "frames were lost that nothing could refill", is kept
+ * outside the window so trimming can only lose detail, never the verdict.
+ */
+describe("observer gap retention", () => {
+  beforeEach(() => {
+    resetAgentObserverStore();
+    _testRegisterKnownAgents(SUB_ID, [AGENT_PUBKEY]);
+  });
+
+  /** Monotonic timestamps so ingestion stays on the in-order journal path. */
+  function orderedFrame(seq) {
+    return frame(seq, {
+      timestamp: new Date(1_760_000_000_000 + seq * 1000).toISOString(),
+    });
+  }
+
+  /** Every jump of two leaves one hole, so each call records one gap. */
+  function driveGaps(count) {
+    trackObserverContinuity(AGENT_PUBKEY, orderedFrame(1));
+    for (let index = 1; index <= count; index += 1) {
+      trackObserverContinuity(AGENT_PUBKEY, orderedFrame(1 + index * 3));
+    }
+  }
+
+  it("bounds the retained gap records instead of growing all session", () => {
+    driveGaps(MAX_OBSERVER_GAPS_PER_AGENT + 250);
+    assert.equal(
+      getAgentObserverGaps(AGENT_PUBKEY).length,
+      MAX_OBSERVER_GAPS_PER_AGENT,
+    );
+  });
+
+  it("keeps the newest gap records and drops the oldest", () => {
+    driveGaps(MAX_OBSERVER_GAPS_PER_AGENT + 10);
+    const gaps = getAgentObserverGaps(AGENT_PUBKEY);
+    const newest = gaps[gaps.length - 1];
+    assert.equal(newest.toSeq, 1 + (MAX_OBSERVER_GAPS_PER_AGENT + 10) * 3);
+  });
+
+  it("still reports stale state after the original gap record is trimmed out", () => {
+    // One unrecoverable relay loss, then a long run of harness gaps the
+    // harness DID refill. The recoverable records push the unrecoverable one
+    // out of the retained window, which is exactly the case where a verdict
+    // derived by scanning the window silently flips back to "healthy".
+    trackObserverContinuity(AGENT_PUBKEY, orderedFrame(1));
+    trackObserverContinuity(AGENT_PUBKEY, orderedFrame(9));
+    assert.equal(isAgentObserverStateStale(AGENT_PUBKEY), true);
+
+    for (let index = 1; index <= MAX_OBSERVER_GAPS_PER_AGENT + 50; index += 1) {
+      trackObserverContinuity(
+        AGENT_PUBKEY,
+        frame(9 + index, {
+          timestamp: new Date(
+            1_760_000_000_000 + (9 + index) * 1000,
+          ).toISOString(),
+          kind: OBSERVER_GAP_KIND,
+          payload: {
+            fromSeq: 9 + index,
+            toSeq: 10 + index,
+            unrecoverable: 0,
+            lostContent: 400,
+            controlComplete: true,
+          },
+        }),
+      );
+    }
+
+    assert.equal(
+      getAgentObserverGaps(AGENT_PUBKEY).every((gap) => gap.controlComplete),
+      true,
+      "the retained window should hold only the recoverable records by now",
+    );
+    assert.equal(
+      isAgentObserverStateStale(AGENT_PUBKEY),
+      true,
+      "the unrecoverable-loss verdict was lost when its record aged out",
+    );
+  });
+
+  it("keeps the gap window per agent", () => {
+    driveGaps(MAX_OBSERVER_GAPS_PER_AGENT + 50);
+    assert.equal(getAgentObserverGaps("c".repeat(64)).length, 0);
+    assert.equal(isAgentObserverStateStale("c".repeat(64)), false);
   });
 });
