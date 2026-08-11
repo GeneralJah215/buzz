@@ -101,6 +101,25 @@ const terminalAtByAgent = new Map<string, Map<string, number>>();
 
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
 
+// Observer events actually walked by `syncAgentTurnsFromEvents`. The BUG-065
+// regressions assert on this count rather than on elapsed time — a timing
+// threshold can be widened until it passes, a call count cannot.
+let turnSyncScanCount = 0;
+// Agents whose observer snapshot was read by a sync pass. An up-to-date agent
+// costs zero scanned events, so only this counter can prove that a per-agent
+// notification did not fan back out across every agent.
+let turnSyncAgentVisits = 0;
+
+/** Test-only: observer events examined by the turn sync since the last reset. */
+export function _testGetTurnSyncScanCount(): number {
+  return turnSyncScanCount;
+}
+
+/** Test-only: agent snapshots read by the turn sync since the last reset. */
+export function _testGetTurnSyncAgentVisits(): number {
+  return turnSyncAgentVisits;
+}
+
 function invalidateCache(agentKey: string) {
   cachedTurnSummaries.delete(agentKey);
   cachedChannelTurnSummaries = null;
@@ -514,8 +533,22 @@ export function syncAgentTurnsFromEvents(
   agentPubkey: string,
   events: ObserverEvent[],
 ) {
-  for (const event of events) {
-    processEvent(agentPubkey, event);
+  // The buffer is sorted (documented invariant above) and `processEvent` gates
+  // on a strictly-increasing watermark, so every event at or below the
+  // watermark is a guaranteed no-op. Walk back from the end to find just the
+  // new tail. Without this, one incoming frame re-scanned the agent's entire
+  // capped journal, parsing two ISO timestamps per event (BUG-065 rank 2).
+  const last = lastProcessed.get(normalizePubkey(agentPubkey));
+  let start = 0;
+  if (last) {
+    start = events.length;
+    while (start > 0 && compareObserverEvents(events[start - 1], last) > 0) {
+      start -= 1;
+    }
+  }
+  turnSyncScanCount += events.length - start;
+  for (let index = start; index < events.length; index += 1) {
+    processEvent(agentPubkey, events[index]);
   }
 }
 
@@ -553,9 +586,13 @@ export function useActiveAgentTurnsByChannel(): ActiveChannelTurnSummary[] {
  */
 export function syncActiveAgentTurnsFromObserver(
   agents: readonly { pubkey: string; status: string }[],
+  onlyAgentKey?: string | null,
 ) {
+  const only = onlyAgentKey ? normalizePubkey(onlyAgentKey) : null;
   for (const agent of agents) {
     if (agent.status !== "running" && agent.status !== "deployed") continue;
+    if (only && normalizePubkey(agent.pubkey) !== only) continue;
+    turnSyncAgentVisits += 1;
     const snapshot = getAgentObserverSnapshot(agent.pubkey, true);
     syncAgentTurnsFromEvents(agent.pubkey, snapshot.events);
   }
@@ -569,12 +606,13 @@ export function useActiveAgentTurnsBridge(
   agents: readonly { pubkey: string; status: string }[],
 ) {
   React.useEffect(() => {
-    function syncAll() {
-      syncActiveAgentTurnsFromObserver(agents);
-    }
-
-    syncAll();
-    return subscribeAgentObserverStore(syncAll);
+    syncActiveAgentTurnsFromObserver(agents);
+    // The store reports which agent's journal changed. Syncing only that agent
+    // turns one incoming frame from `agents × journal` work into `1 × new
+    // events`; a `null` key means a store-wide change and still syncs all.
+    return subscribeAgentObserverStore((changedAgentKey) => {
+      syncActiveAgentTurnsFromObserver(agents, changedAgentKey);
+    });
   }, [agents]);
 }
 
@@ -620,6 +658,8 @@ export function resetActiveAgentTurnsStore() {
   cachedTurnSummaries.clear();
   cachedChannelTurnSummaries = null;
   terminalAtByAgent.clear();
+  turnSyncScanCount = 0;
+  turnSyncAgentVisits = 0;
   notifyListeners();
 }
 

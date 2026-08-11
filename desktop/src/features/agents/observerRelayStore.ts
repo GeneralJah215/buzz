@@ -32,8 +32,18 @@ import {
   processTranscriptEventWithGaps,
   syntheticGapEvent,
 } from "./observerGapDetection";
+import {
+  type TranscriptWindowIndex,
+  collectTouchedItemIds,
+  createTranscriptWindowIndex,
+  dropTranscriptItems,
+  observerEventKey,
+  recordTouchedItems,
+  seedTranscriptWindowIndex,
+  takeEvictedItemIds,
+} from "./transcriptWindow";
 
-const MAX_OBSERVER_EVENTS = 3000;
+export const MAX_OBSERVER_EVENTS = 3000;
 const MAX_PENDING_UNKNOWN_AGENT_FRAMES = 100;
 
 export type ObserverSnapshot = {
@@ -51,10 +61,15 @@ const IDLE_SNAPSHOT: ObserverSnapshot = {
 const EMPTY_EVENTS: ObserverEvent[] = [];
 const EMPTY_TRANSCRIPT: TranscriptItem[] = [];
 
-const listeners = new Set<() => void>();
+const listeners = new Set<(changedAgentKey: string | null) => void>();
 const eventsByAgent = new Map<string, ObserverEvent[]>();
 const transcriptByAgent = new Map<string, TranscriptState>();
 const snapshotByAgent = new Map<string, ObserverSnapshot>();
+
+// Per-agent map of "which transcript item did each journal event last touch",
+// so an event leaving the capped journal can evict exactly its own items
+// instead of forcing a full transcript rebuild (BUG-065). See transcriptWindow.
+const transcriptWindowByAgent = new Map<string, TranscriptWindowIndex>();
 
 // Channel-scoped archive event journal — holds paged history loaded from the local
 // SQLite archive without the MAX_OBSERVER_EVENTS live-relay cap. Keyed by
@@ -266,10 +281,26 @@ let unsubscribeRelay: (() => Promise<void>) | null = null;
 let startPromise: Promise<void> | null = null;
 let eventProcessingQueue: Promise<void> = Promise.resolve();
 let generation = 0;
+// Count of full transcript rebuilds. The regression for BUG-065 asserts on this
+// counter rather than on elapsed time: a timing threshold can be widened until
+// it passes, a call count cannot.
+let transcriptRebuildCount = 0;
 
-function notifyListeners() {
+/** Test-only: full transcript rebuilds performed since the last store reset. */
+export function _testGetTranscriptRebuildCount(): number {
+  return transcriptRebuildCount;
+}
+
+/**
+ * `changedAgentKey` is the normalized pubkey of the single agent whose journal
+ * changed, or `null` when the change is store-wide (connection state, reset, a
+ * multi-agent archive page). Subscribers that would otherwise re-scan every
+ * agent on every frame use it to do O(1) work instead of O(agents × journal)
+ * — see `useActiveAgentTurnsBridge` (BUG-065 rank 2).
+ */
+function notifyListeners(changedAgentKey: string | null = null) {
   for (const listener of listeners) {
-    listener();
+    listener(changedAgentKey);
   }
 }
 
@@ -303,35 +334,68 @@ function appendAgentEvent(agentPubkey: string, event: ObserverEvent) {
     return;
   }
 
-  const sorted = [...current, event].sort(compareObserverEvents);
-  const trimmed = sorted.length > MAX_OBSERVER_EVENTS;
-  const final = trimmed
-    ? sorted.slice(sorted.length - MAX_OBSERVER_EVENTS)
-    : sorted;
+  // The journal is kept sorted, so an in-order frame — every frame, in normal
+  // operation — needs one comparison rather than a 3000-element sort whose
+  // comparator parses two ISO timestamps per call (BUG-065 rank 3).
+  const newest = current.length > 0 ? current[current.length - 1] : null;
+  const arrivedInOrder = !newest || compareObserverEvents(newest, event) <= 0;
+  const sorted = arrivedInOrder
+    ? [...current, event]
+    : [...current, event].sort(compareObserverEvents);
+
+  const overflow = sorted.length - MAX_OBSERVER_EVENTS;
+  const final = overflow > 0 ? sorted.slice(overflow) : sorted;
   eventsByAgent.set(key, final);
 
-  // Determine whether the new event landed at the end of the sorted array.
-  // If it did (common case), we can incrementally process just this event.
-  // If not (out-of-order arrival) or if we trimmed, fall back to full rebuild.
-  const eventAtEnd = sorted[sorted.length - 1] === event;
+  // Whether the new event landed at the end of the sorted array. If it did
+  // (the common case) only this event needs processing, even when the append
+  // pushed older events out of the journal — those are handled by evicting the
+  // transcript items they own. A genuinely out-of-order arrival is the only
+  // case that still needs a full rebuild.
+  const eventAtEnd = arrivedInOrder;
 
-  if (eventAtEnd && !trimmed) {
-    // Fast path: incremental update
-    const transcriptState =
-      transcriptByAgent.get(key) ?? createEmptyTranscriptState();
-    const updatedTranscript = processTranscriptEventWithGaps(
-      transcriptState,
-      event,
+  let index = transcriptWindowByAgent.get(key);
+  if (!index) {
+    index = createTranscriptWindowIndex();
+    transcriptWindowByAgent.set(key, index);
+  }
+
+  if (eventAtEnd) {
+    const previous = transcriptByAgent.get(key) ?? createEmptyTranscriptState();
+    const appended = processTranscriptEventWithGaps(previous, event);
+    recordTouchedItems(
+      index,
+      observerEventKey(event),
+      collectTouchedItemIds(previous, appended),
     );
-    transcriptByAgent.set(key, updatedTranscript);
+    const evicted =
+      overflow > 0
+        ? takeEvictedItemIds(
+            index,
+            sorted.slice(0, overflow).map(observerEventKey),
+          )
+        : null;
+    transcriptByAgent.set(
+      key,
+      evicted ? dropTranscriptItems(appended, evicted) : appended,
+    );
   } else {
-    // Slow path: full rebuild (out-of-order insertion or trim fired)
-    transcriptByAgent.set(key, buildTranscriptStateWithGaps(final));
+    // Slow path: out-of-order insertion. Re-derive the whole window, then seed
+    // the eviction index conservatively off the newest surviving event so the
+    // rebuild itself stays O(events) — see seedTranscriptWindowIndex.
+    transcriptRebuildCount += 1;
+    const rebuilt = buildTranscriptStateWithGaps(final);
+    seedTranscriptWindowIndex(
+      index,
+      rebuilt,
+      observerEventKey(final[final.length - 1]),
+    );
+    transcriptByAgent.set(key, rebuilt);
   }
 
   invalidateSnapshot(key);
 
-  notifyListeners();
+  notifyListeners(key);
 }
 
 /**
@@ -403,12 +467,26 @@ export function getArchivedChannelEvents(
   );
 }
 
+// `Date.parse` on an ISO string is not free, and comparison is the innermost
+// loop of every journal sort and every watermark check. Events are immutable
+// once decoded, so their parsed time is memoized against the object itself; the
+// WeakMap drops the entry when the event is evicted (BUG-065 rank 3).
+const parsedTimestampByEvent = new WeakMap<object, number>();
+
+function observerEventTimeMs(event: ObserverEvent): number {
+  const cached = parsedTimestampByEvent.get(event);
+  if (cached !== undefined) return cached;
+  const parsed = Date.parse(event.timestamp);
+  parsedTimestampByEvent.set(event, parsed);
+  return parsed;
+}
+
 export function compareObserverEvents(
   left: ObserverEvent,
   right: ObserverEvent,
 ) {
-  const leftTime = Date.parse(left.timestamp);
-  const rightTime = Date.parse(right.timestamp);
+  const leftTime = observerEventTimeMs(left);
+  const rightTime = observerEventTimeMs(right);
   if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
     const timeDiff = leftTime - rightTime;
     if (timeDiff !== 0) {
@@ -581,7 +659,14 @@ export function ensureRelayObserverSubscription() {
   return startPromise;
 }
 
-export function subscribeAgentObserverStore(listener: () => void) {
+/**
+ * Subscribe to store changes. The listener receives the normalized pubkey of
+ * the one agent whose journal changed, or `null` for a store-wide change.
+ * Existing zero-argument listeners are unaffected.
+ */
+export function subscribeAgentObserverStore(
+  listener: (changedAgentKey: string | null) => void,
+) {
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
@@ -845,6 +930,7 @@ export function resetAgentObserverStore() {
   eventProcessingQueue = Promise.resolve();
   eventsByAgent.clear();
   transcriptByAgent.clear();
+  transcriptWindowByAgent.clear();
   snapshotByAgent.clear();
   archiveEventsByChannel.clear();
   knownAgentPubkeys.clear();
@@ -854,6 +940,7 @@ export function resetAgentObserverStore() {
   lastSeqByAgent.clear();
   gapsByAgent.clear();
   agentManagementListeners.clear();
+  transcriptRebuildCount = 0;
   onSessionConfigCaptured = null;
   connectionState = "idle";
   errorMessage = null;
