@@ -56,19 +56,38 @@ function parseCachedUserLabel(value: unknown): CachedUserLabel | null {
   };
 }
 
+// Memoised parse. readCache is reached from resolveUserLabelPlaceholderData,
+// which React Query invokes on EVERY result computation — once per render per
+// observer, and every rendered username is an observer. Each uncached call
+// JSON.parses up to MAX_CACHED_LABELS entries and rebuilds the whole map. A
+// live CPU profile of the minimized app put this function at the top of the JS
+// self-time list, with the garbage collector second (BUG-076).
+//
+// The memo key is the RAW STRING, not a dirty flag. Any write invalidates it
+// automatically — ours, another window's, or a devtools edit — because the
+// string changes. A flag has to be remembered at every write site and goes
+// stale the first time someone forgets one. A string compare cannot.
+let memoKey: string | null = null;
+let memoRaw: string | null = null;
+let memoValue: UserLabelCache | null = null;
+
 function readCache(relayUrl: string): UserLabelCache | null {
   try {
-    const raw = window.localStorage.getItem(userLabelCacheKey(relayUrl));
+    const cacheKey = userLabelCacheKey(relayUrl);
+    const raw = window.localStorage.getItem(cacheKey);
     if (!raw) return null;
+    if (cacheKey === memoKey && raw === memoRaw) return memoValue;
     const parsed = JSON.parse(raw) as unknown;
-    if (typeof parsed !== "object" || parsed === null) return null;
+    if (typeof parsed !== "object" || parsed === null) {
+      return remember(cacheKey, raw, null);
+    }
     const payload = parsed as Record<string, unknown>;
     if (
       payload.version !== 1 ||
       typeof payload.profiles !== "object" ||
       payload.profiles === null
     ) {
-      return null;
+      return remember(cacheKey, raw, null);
     }
 
     const profiles: Record<string, CachedUserLabel> = {};
@@ -78,13 +97,29 @@ function readCache(relayUrl: string): UserLabelCache | null {
       const label = parseCachedUserLabel(value);
       if (label) profiles[pubkey.toLowerCase()] = label;
     }
-    return {
+    // Frozen because this object is now shared with every caller instead of
+    // being rebuilt per call. An in-place mutation would silently corrupt every
+    // later read; frozen, it throws at the mutation site instead.
+    return remember(cacheKey, raw, {
       version: 1,
-      profiles,
-    };
+      profiles: Object.freeze(profiles),
+    });
   } catch {
     return null;
   }
+}
+
+function remember(
+  cacheKey: string,
+  raw: string,
+  value: UserLabelCache | null,
+): UserLabelCache | null {
+  memoKey = cacheKey;
+  memoRaw = raw;
+  // A malformed payload is memoised too. It sits on the same per-render path as
+  // a good one, so re-parsing it every render would cost exactly as much.
+  memoValue = value === null ? null : Object.freeze(value);
+  return memoValue;
 }
 
 export function readCachedUserLabels(

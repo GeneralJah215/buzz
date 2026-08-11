@@ -223,3 +223,118 @@ test("ignores malformed cache payloads", async () => {
     undefined,
   );
 });
+
+// --- BUG-076 regression guards -------------------------------------------
+//
+// resolveUserLabelPlaceholderData is React Query's placeholderData callback,
+// so it runs on every result computation: once per render, per observer, and
+// every rendered username is an observer. Re-parsing the whole cache there put
+// this module at the top of a live CPU profile of the minimized app. These
+// tests count JSON.parse calls because call COUNT is the defect — asserting on
+// the returned value alone passes both before and after the fix.
+
+function countingJsonParse() {
+  const real = JSON.parse;
+  const state = { calls: 0 };
+  JSON.parse = (...args) => {
+    state.calls += 1;
+    return real.apply(JSON, args);
+  };
+  state.restore = () => {
+    JSON.parse = real;
+  };
+  return state;
+}
+
+function seedRelay(relayUrl, entries) {
+  const profiles = {};
+  for (let i = 0; i < entries; i++) {
+    profiles[`pubkey${i}`] = {
+      displayName: `User ${i}`,
+      name: `user${i}`,
+      nip05Handle: null,
+      updatedAt: 1_000 + i,
+    };
+  }
+  window.localStorage.setItem(
+    `buzz-user-labels.v1:${relayUrl}`,
+    JSON.stringify({ version: 1, profiles }),
+  );
+}
+
+test("parses the stored cache once across repeated placeholder lookups", async () => {
+  const subject = await loadSubject();
+  assert.equal(typeof subject.resolveUserLabelPlaceholderData, "function");
+  installLocalStorage();
+  const relay = "wss://memo-once.example";
+  seedRelay(relay, 200);
+
+  const spy = countingJsonParse();
+  try {
+    for (let i = 0; i < 25; i++) {
+      const result = subject.resolveUserLabelPlaceholderData(undefined, relay, [
+        "pubkey1",
+      ]);
+      assert.equal(result.profiles.pubkey1.displayName, "User 1");
+    }
+  } finally {
+    spy.restore();
+  }
+
+  assert.equal(
+    spy.calls,
+    1,
+    `expected one parse across 25 lookups, saw ${spy.calls}`,
+  );
+});
+
+test("re-parses once the stored payload actually changes", async () => {
+  const subject = await loadSubject();
+  assert.equal(typeof subject.writeCachedUserLabels, "function");
+  installLocalStorage();
+  const relay = "wss://memo-invalidate.example";
+  seedRelay(relay, 5);
+
+  assert.equal(
+    subject.readCachedUserLabels(relay, ["pubkey0"]).profiles.pubkey0
+      .displayName,
+    "User 0",
+  );
+
+  subject.writeCachedUserLabels(relay, {
+    pubkey0: {
+      displayName: "Renamed",
+      name: "renamed",
+      nip05Handle: null,
+      avatarUrl: null,
+      ownerPubkey: null,
+    },
+  });
+
+  // A memo keyed on a dirty flag would still be serving "User 0" here.
+  assert.equal(
+    subject.readCachedUserLabels(relay, ["pubkey0"]).profiles.pubkey0
+      .displayName,
+    "Renamed",
+  );
+});
+
+test("the shared cache cannot be mutated by a caller", async () => {
+  const subject = await loadSubject();
+  assert.equal(typeof subject.readCachedUserLabels, "function");
+  installLocalStorage();
+  const relay = "wss://memo-frozen.example";
+  seedRelay(relay, 3);
+
+  // readCachedUserLabels builds its own object, so reach the shared one the
+  // way writeCachedUserLabels does and confirm a stray write throws rather
+  // than poisoning every later read.
+  subject.readCachedUserLabels(relay, ["pubkey0"]);
+  subject.writeCachedUserLabels(relay, {});
+
+  assert.equal(
+    subject.readCachedUserLabels(relay, ["pubkey0"]).profiles.pubkey0
+      .displayName,
+    "User 0",
+  );
+});
