@@ -533,17 +533,62 @@ fn resolve_workspace_command(command: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable_file(candidate))
 }
 
-fn resolve_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<PathBuf>>>
-{
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// The `resolve_command` memo, together with the `PATH` it was computed under.
+///
+/// `resolve_command_uncached` reads the process-global `PATH` (see
+/// [`path_candidates_from_env`]), so a cached answer is only valid while that
+/// `PATH` is unchanged.  Storing the generating `PATH` alongside the entries
+/// makes the cache self-invalidating: any `PATH` change discards the memo
+/// rather than serving an answer computed under a different search path.
+///
+/// This is a correctness property, not a test affordance.  The app mutates its
+/// own `PATH` (managed Node/npm dirs are pushed onto it during install and
+/// Doctor flows), and before this the cache could pin a pre-install resolution
+/// for the life of the process.  It also removes an entire class of
+/// order-dependent test failures: several tests swap `PATH` to a tempdir to
+/// exercise resolution, and previously each one both poisoned and was poisoned
+/// by every other `resolve_command` caller in the suite (BUG-070).
+struct ResolveCache {
+    /// `PATH` value the `entries` below were resolved under. `None` means the
+    /// variable was unset at that time, which is distinct from any set value.
+    path_env: Option<std::ffi::OsString>,
+    entries: std::collections::HashMap<String, Option<PathBuf>>,
 }
 
-/// Resolve a command to an absolute path, caching results for the app lifetime.
-/// The cache eliminates redundant login-shell spawns when multiple agents share
-/// the same binaries (e.g. `npx`, `uvx`).
+impl ResolveCache {
+    /// Discard every memoised entry when the current `PATH` differs from the
+    /// one they were resolved under, and adopt the current `PATH` as the new
+    /// generation. Callers must invoke this while holding the lock, before
+    /// reading or writing `entries`.
+    fn sync_generation(&mut self) {
+        let current = std::env::var_os("PATH");
+        if self.path_env != current {
+            self.entries.clear();
+            self.path_env = current;
+        }
+    }
+}
+
+fn resolve_cache() -> &'static std::sync::Mutex<ResolveCache> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<ResolveCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(ResolveCache {
+            // A sentinel that cannot equal any real `PATH` (including unset),
+            // so the first lookup always takes the invalidation branch and
+            // records the true generating value.
+            path_env: Some(std::ffi::OsString::from("\u{0}buzz-resolve-cache-uninit")),
+            entries: HashMap::new(),
+        })
+    })
+}
+
+/// Resolve a command to an absolute path, memoising results for as long as the
+/// process `PATH` is unchanged.  The cache eliminates redundant login-shell
+/// spawns and filesystem scans when multiple agents share the same binaries
+/// (e.g. `npx`, `uvx`), and is discarded automatically whenever `PATH` changes
+/// so a stale search path can never be served.
 pub fn resolve_command(command: &str) -> Option<PathBuf> {
     if let Some(managed) = resolve_buzz_managed_command(command) {
         return Some(managed);
@@ -551,19 +596,29 @@ pub fn resolve_command(command: &str) -> Option<PathBuf> {
 
     let cache = resolve_cache();
 
-    // Fast path: return cached result without allocating a key.
-    if let Ok(guard) = cache.lock() {
-        if let Some(result) = guard.get(command) {
+    // Fast path: return the cached result, after confirming it was computed
+    // under the PATH currently in effect.
+    if let Ok(mut guard) = cache.lock() {
+        guard.sync_generation();
+        if let Some(result) = guard.entries.get(command) {
             return result.clone();
         }
     }
 
-    // Slow path: resolve and cache.
+    // Slow path: resolve and cache. Snapshot the PATH the resolution is about
+    // to be computed under, so the write below can prove it still applies.
+    let path_at_resolve = std::env::var_os("PATH");
     let result = resolve_command_uncached(command);
 
     if result.is_some() {
         if let Ok(mut guard) = cache.lock() {
-            guard.insert(command.to_string(), result.clone());
+            guard.sync_generation();
+            // Only memoise when PATH has not moved since the resolution was
+            // computed; otherwise `result` belongs to a superseded generation
+            // and caching it would reintroduce the stale-answer bug.
+            if guard.path_env == path_at_resolve {
+                guard.entries.insert(command.to_string(), result.clone());
+            }
         }
     }
 
@@ -573,7 +628,7 @@ pub fn resolve_command(command: &str) -> Option<PathBuf> {
 /// Clear the resolve_command cache so that newly-installed binaries are detected.
 pub fn clear_resolve_cache() {
     let mut guard = resolve_cache().lock().unwrap_or_else(|e| e.into_inner());
-    guard.clear();
+    guard.entries.clear();
     // Also invalidate the adapter-availability cache so a freshly-installed
     // adapter is reflected the next time the summary builder checks the badge.
     clear_adapter_availability_cache();

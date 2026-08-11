@@ -1,5 +1,63 @@
 use crate::managed_agents::discovery::{clear_resolve_cache, resolve_command};
 
+/// Regression guard for BUG-070.
+///
+/// `resolve_command` memoises its answers process-globally, but the answer is a
+/// function of `PATH`. Before the fix the memo survived a `PATH` change, so the
+/// first caller to resolve a name pinned that answer for the life of the
+/// process — in production across the app's own managed-Node/npm `PATH`
+/// mutations, and in the test suite as an order-dependent failure where any
+/// earlier `resolve_command("claude")` (e.g. via `discover_acp_runtimes_from`)
+/// made `claude_spawn_uses_the_probed_cli_executable` fail.
+///
+/// This test never calls `clear_resolve_cache`: invalidation must be automatic.
+#[test]
+fn resolve_command_cache_is_invalidated_by_a_path_change() {
+    let _guard = crate::managed_agents::lock_path_mutex();
+
+    let name = format!("buzz-cache-gen-probe{}", std::env::consts::EXE_SUFFIX);
+    let first = tempfile::tempdir().expect("first tempdir");
+    let second = tempfile::tempdir().expect("second tempdir");
+    let first_bin = first.path().join(&name);
+    let second_bin = second.path().join(&name);
+
+    for bin in [&first_bin, &second_bin] {
+        std::fs::write(bin, "").expect("write probe binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod probe binary");
+        }
+    }
+
+    let original_path = std::env::var_os("PATH");
+
+    std::env::set_var("PATH", first.path());
+    let resolved_first = resolve_command("buzz-cache-gen-probe");
+
+    // No cache clear here — the PATH change alone must invalidate the memo.
+    std::env::set_var("PATH", second.path());
+    let resolved_second = resolve_command("buzz-cache-gen-probe");
+
+    match original_path {
+        Some(path) => std::env::set_var("PATH", path),
+        None => std::env::remove_var("PATH"),
+    }
+    clear_resolve_cache();
+
+    assert_eq!(
+        resolved_first.as_deref(),
+        Some(first_bin.as_path()),
+        "first resolution must come from the first PATH entry"
+    );
+    assert_eq!(
+        resolved_second.as_deref(),
+        Some(second_bin.as_path()),
+        "a PATH change must invalidate the resolve cache without an explicit clear"
+    );
+}
+
 /// The legacy Goose Windows installer wrote `%USERPROFILE%\goose\goose.exe`,
 /// a directory on no standard PATH. `resolve_command_uncached` finds binaries
 /// outside PATH only by scanning `common_binary_paths()`, so that directory
