@@ -1,6 +1,41 @@
 import * as React from "react";
 import type { VListHandle } from "virtua";
 
+/**
+ * Distance from the physical floor below which a bottom pin would be a no-op
+ * write. Tight enough that a partially revealed trailing row still re-pins,
+ * loose enough to absorb sub-pixel layout rounding.
+ */
+const BOTTOM_EPSILON_PX = 1;
+
+type ScrollerBottomMetrics = {
+  scrollHeight: number;
+  clientHeight: number;
+  scrollTop: number;
+};
+
+/**
+ * True when the scroller is already at its physical floor, so `scrollToIndex`
+ * would write the position it is already in.
+ *
+ * That write is not free: it re-renders Virtua's range, which resizes the
+ * scroller and the inner sizing element, which re-notifies the observers that
+ * asked for the pin. Skipping it is what makes the pin converge instead of
+ * running every frame for as long as bottom intent is armed.
+ *
+ * Unknown geometry (a detached node, a non-finite measurement) reports false so
+ * the pin still happens; the failure direction must be "scroll needlessly",
+ * never "silently stop following the conversation".
+ */
+export function isVirtualizedScrollerAtBottom(
+  metrics: ScrollerBottomMetrics,
+): boolean {
+  const distance =
+    metrics.scrollHeight - metrics.clientHeight - metrics.scrollTop;
+  if (!Number.isFinite(distance)) return false;
+  return distance <= BOTTOM_EPSILON_PX;
+}
+
 const SCROLL_INTENT_KEYS = new Set([
   "ArrowDown",
   "ArrowUp",
@@ -44,6 +79,9 @@ export function useVirtualizedBottomSettle(
     const scroller = hostRef.current?.firstElementChild;
     const lastIndex = itemsLengthRef.current - 1;
     if (!(scroller instanceof HTMLDivElement) || lastIndex < 0) return;
+    // Already on the floor: the write would change nothing visible and would
+    // re-trigger the observers that scheduled it.
+    if (isVirtualizedScrollerAtBottom(scroller)) return;
     listRef.current?.scrollToIndex(lastIndex, { align: "end" });
   }, [hostRef, itemsLengthRef, listRef]);
 
@@ -113,12 +151,35 @@ export function useVirtualizedBottomSettle(
     // as it remains active, rather than guessing that layout is done after an
     // arbitrary timeout. Reader input and explicit target/prepend navigation
     // retire the intent through `cancel`.
+    //
+    // The scroller stays observed alongside the content: a viewport-only change
+    // (split panel, window resize, composer growth) moves the physical floor
+    // without resizing content, and this observer's gate is bottom *intent*,
+    // which is armed in windows where the virtualizer's reported at-bottom flag
+    // is transiently false. It no longer free-runs, because `pinToBottom` skips
+    // the write once the floor is reached, so the loop terminates at the write
+    // rather than at a timer.
     const observer = new ResizeObserver(schedulePinToBottom);
     observer.observe(content);
     observer.observe(scroller);
     return () => observer.disconnect();
   }, [hostRef, schedulePinToBottom]);
 
+  /**
+   * Arm bottom intent and pin NOW, deliberately bypassing the frame throttle.
+   *
+   * Every caller reaches this from a layout effect that has just committed new
+   * trailing rows (an arrival, or the split panel taking viewport height). The
+   * write has to land before the browser paints that commit; a frame of
+   * deferral paints one frame of the new message sitting below the fold and
+   * then yanks it up. The throttle exists for observer-driven corrections,
+   * which arrive after paint and have nothing to be simultaneous with.
+   *
+   * This synchronous call is safe against the ResizeObserver feedback loop
+   * because it is never invoked from inside an observation pass — the viewport
+   * observer defers to a frame before calling it, and `pinToBottom` no-ops when
+   * the scroller is already on the floor.
+   */
   const settle = React.useCallback(() => {
     bottomIntentRef.current = true;
     cancelFrame();

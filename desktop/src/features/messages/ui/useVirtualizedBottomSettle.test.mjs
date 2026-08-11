@@ -32,6 +32,11 @@ class ElementShim extends EventTargetShim {
     this.tagName = "DIV";
     this.nodeType = 1;
     this.namespaceURI = "http://www.w3.org/1999/xhtml";
+    // Scroller geometry: a floor 500px below the current position, i.e. NOT
+    // pinned. Tests that need the pinned state set `scrollTop` explicitly.
+    this.scrollHeight = 1_000;
+    this.clientHeight = 500;
+    this.scrollTop = 0;
   }
   get ownerDocument() {
     return globalThis.document;
@@ -105,7 +110,10 @@ globalThis.ResizeObserver = class {
 import React from "react";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { useVirtualizedBottomSettle } from "./useVirtualizedBottomSettle.ts";
+import {
+  isVirtualizedScrollerAtBottom,
+  useVirtualizedBottomSettle,
+} from "./useVirtualizedBottomSettle.ts";
 
 function flushAnimationFrames() {
   const callbacks = [...animationFrames.values()];
@@ -246,6 +254,105 @@ test("Ctrl+wheel zoom preserves bottom intent through geometry reflow", async ()
 
   assert.equal(writes.length, 2);
   await act(async () => root.unmount());
+});
+
+test("a live arrival pins the view in the same commit, before paint", async () => {
+  const { refs, root, writes } = await mountHarness();
+
+  // `settle()` is what the anchored-scroll layout effect calls when a message
+  // arrives while the reader is at the bottom. The write must land in that
+  // commit; deferring it to a frame paints the arrival below the fold first.
+  refs.api.current.settle();
+  assert.deepEqual(
+    writes,
+    [{ index: 4, options: { align: "end" } }],
+    "the arrival is followed synchronously, with no frame flushed",
+  );
+  assert.equal(animationFrames.size, 0, "no frame was queued to do the pin");
+  await act(async () => root.unmount());
+});
+
+test("a reader who scrolled up is never pulled back to the bottom", async () => {
+  const { content, refs, root, scroller, writes } = await mountHarness();
+  refs.api.current.settle();
+  assert.equal(writes.length, 1);
+
+  scroller.dispatchEvent({ ctrlKey: false, deltaY: -240, type: "wheel" });
+  const geometryObserver = resizeObservers.find((observer) =>
+    observer.targets?.includes(content),
+  );
+  // Live traffic keeps arriving and keeps changing geometry while the reader
+  // is up in history.
+  for (let i = 0; i < 4; i++) {
+    geometryObserver.callback();
+    flushAnimationFrames();
+  }
+  assert.equal(writes.length, 1, "history reading is not interrupted");
+  await act(async () => root.unmount());
+});
+
+test("a pin that would not move the scroller is not written", async () => {
+  const { content, refs, root, scroller, writes } = await mountHarness();
+  scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight;
+
+  refs.api.current.settle();
+  assert.equal(writes.length, 0, "already on the floor; nothing to write");
+
+  const geometryObserver = resizeObservers.find((observer) =>
+    observer.targets?.includes(content),
+  );
+  // A settled timeline still receives geometry notifications (row measurement,
+  // scrollbar toggles). None of them may produce a write.
+  for (let i = 0; i < 5; i++) {
+    geometryObserver.callback();
+    flushAnimationFrames();
+  }
+  assert.equal(writes.length, 0, "the pin converges instead of free-running");
+
+  // A trailing row grows: the floor moved, so the pin must resume.
+  scroller.scrollHeight = 1_400;
+  geometryObserver.callback();
+  flushAnimationFrames();
+  assert.equal(writes.length, 1, "a real floor change still re-pins");
+  await act(async () => root.unmount());
+});
+
+test("bottom pin geometry treats only the floor as settled", () => {
+  assert.equal(
+    isVirtualizedScrollerAtBottom({
+      scrollHeight: 1_000,
+      clientHeight: 500,
+      scrollTop: 500,
+    }),
+    true,
+  );
+  assert.equal(
+    isVirtualizedScrollerAtBottom({
+      scrollHeight: 1_000,
+      clientHeight: 500,
+      scrollTop: 499.5,
+    }),
+    true,
+    "sub-pixel rounding still counts as the floor",
+  );
+  assert.equal(
+    isVirtualizedScrollerAtBottom({
+      scrollHeight: 1_000,
+      clientHeight: 500,
+      scrollTop: 480,
+    }),
+    false,
+    "a partially hidden trailing row is not the floor",
+  );
+  assert.equal(
+    isVirtualizedScrollerAtBottom({
+      scrollHeight: Number.NaN,
+      clientHeight: 500,
+      scrollTop: 500,
+    }),
+    false,
+    "unmeasurable geometry pins rather than silently stopping",
+  );
 });
 
 test("typing and editable navigation keys preserve bottom intent", async () => {
