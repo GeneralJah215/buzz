@@ -811,11 +811,6 @@ pub struct UpdateTeamRequest {
 pub const DEFAULT_ACP_COMMAND: &str = "buzz-acp";
 /// ~5 min (320s) — matches the CLI harness default (BUZZ_ACP_IDLE_TIMEOUT).
 pub const DEFAULT_AGENT_TURN_TIMEOUT_SECONDS: u64 = 320;
-pub const DEFAULT_AGENT_PARALLELISM: u32 = 10;
-
-fn default_agent_parallelism() -> u32 {
-    DEFAULT_AGENT_PARALLELISM
-}
 
 fn default_start_on_app_launch() -> bool {
     true
@@ -972,7 +967,8 @@ pub fn resolve_mint_behavioral_defaults(
                 "parallelism {count} is out of range (must be between 1 and 32)"
             ))
         }
-        None => match definition.and_then(|d| d.parallelism) {
+        // Clamped first: a definition's `10` is machine-written (BUG-064).
+        None => match definition.and_then(|d| d.parallelism).map(clamp_legacy_parallelism) {
             Some(count) if (1..=32).contains(&count) => Some(count),
             Some(count) => {
                 return Err(format!(
@@ -992,6 +988,9 @@ pub fn resolve_mint_behavioral_defaults(
 
 mod catalog_source;
 pub use catalog_source::CatalogSource;
+mod parallelism;
+use parallelism::{clamp_legacy_parallelism, default_agent_parallelism};
+pub use parallelism::{DEFAULT_AGENT_PARALLELISM, LEGACY_DEFAULT_AGENT_PARALLELISM};
 mod requests;
 pub use requests::*;
 

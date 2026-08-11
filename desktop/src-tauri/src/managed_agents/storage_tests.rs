@@ -12,8 +12,8 @@ use std::path::Path;
 use tempfile::NamedTempFile;
 
 use super::{
-    agent_keyring_name, hydrate_keys_with, migrate_inline_key, persist_agent_keys_with,
-    KeyMigration, KeyStore, KeyringProbe, ManagedAgentRecord,
+    agent_keyring_name, hydrate_keys_with, migrate_inline_key, migrate_legacy_parallelism,
+    persist_agent_keys_with, KeyMigration, KeyStore, KeyringProbe, ManagedAgentRecord,
 };
 
 /// In-memory [`KeyStore`] for testing the migrate decision without the OS
@@ -829,4 +829,163 @@ fn install_log_filename_accepts_ordinary_runtime_ids() {
             format!("install-{id}.log")
         );
     }
+}
+
+// ── BUG-064: legacy parallelism clamp ────────────────────────────────────────
+
+/// Build a record carrying an explicit pool size. Values are set after parsing
+/// rather than in the JSON so the fixture cannot accidentally exercise the
+/// serde default instead of the stored value.
+fn record_with_parallelism(pubkey: &str, parallelism: u32) -> ManagedAgentRecord {
+    let mut record = record_with_pubkey_and_key(pubkey, "nsec1legacy");
+    record.parallelism = parallelism;
+    record
+}
+
+/// Only the exact pre-fix default (10) is a machine-written value; every other
+/// number came from an operator and must survive untouched — including numbers
+/// above the new default (11, 32) and below it (1). Rewriting by comparison
+/// (`>=`/`>`) instead of equality would silently overwrite deliberate choices.
+#[test]
+fn migrate_legacy_parallelism_rewrites_only_the_legacy_default() {
+    let mut records: Vec<ManagedAgentRecord> = [10, 1, 2, 4, 9, 11, 32]
+        .into_iter()
+        .map(|parallelism| record_with_parallelism("agent-pubkey", parallelism))
+        .collect();
+
+    let migrated = migrate_legacy_parallelism(&mut records);
+
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.parallelism)
+            .collect::<Vec<_>>(),
+        vec![2, 1, 2, 4, 9, 11, 32],
+        "only the legacy default 10 may be rewritten, and only to 2"
+    );
+    assert_eq!(migrated, 1, "exactly one record carried the legacy default");
+}
+
+/// The clamp runs on every load, so it must be a no-op the second time: a
+/// record already at the new default must not be counted or touched again.
+#[test]
+fn migrate_legacy_parallelism_is_idempotent() {
+    let mut records = vec![record_with_parallelism("agent-pubkey", 10)];
+
+    assert_eq!(migrate_legacy_parallelism(&mut records), 1);
+    assert_eq!(records[0].parallelism, 2);
+
+    assert_eq!(
+        migrate_legacy_parallelism(&mut records),
+        0,
+        "a second load must migrate nothing"
+    );
+    assert_eq!(
+        records[0].parallelism, 2,
+        "the already-migrated value must be left alone"
+    );
+}
+
+/// The clamp touches one field. Identity and configuration around it must come
+/// back byte-identical — a migration that rebuilt the record from defaults
+/// would silently reset an agent's key, relay, or timeout.
+#[test]
+fn migrate_legacy_parallelism_preserves_every_other_field() {
+    let mut record = record_with_parallelism("pubkey-abc123", 10);
+    record.name = "keeper".to_string();
+    let before = record.clone();
+    let mut records = vec![record];
+
+    assert_eq!(migrate_legacy_parallelism(&mut records), 1);
+
+    let after = &records[0];
+    assert_eq!(after.parallelism, 2, "the pool size is the one field to move");
+    assert_eq!(after.name, before.name);
+    assert_eq!(after.pubkey, before.pubkey);
+    assert_eq!(after.private_key_nsec, before.private_key_nsec);
+    assert_eq!(after.relay_url, before.relay_url);
+    assert_eq!(after.turn_timeout_seconds, before.turn_timeout_seconds);
+    assert_eq!(after.updated_at, before.updated_at);
+}
+
+/// The unified store holds keyed instances AND key-less definitions, and both
+/// are read through the one `load_agent_store` chokepoint this runs in. A
+/// pubkey-gated loop (the shape `hydrate_keys_with` uses, which `continue`s on
+/// an empty pubkey) would leave every definition stuck at 10 and re-seed the
+/// bug at the next mint.
+#[test]
+fn migrate_legacy_parallelism_covers_key_less_definitions_and_keyed_instances() {
+    let mut records = vec![
+        record_with_parallelism("", 10),
+        record_with_parallelism("agent-pubkey", 10),
+    ];
+
+    let migrated = migrate_legacy_parallelism(&mut records);
+
+    assert_eq!(migrated, 2, "both halves of the unified store must migrate");
+    assert!(
+        records[0].pubkey.is_empty(),
+        "the first fixture must be a key-less definition"
+    );
+    assert_eq!(records[0].parallelism, 2, "definition was not migrated");
+    assert_eq!(records[1].parallelism, 2, "instance was not migrated");
+}
+
+/// `definition_parallelism` is what a definition advertises to future mints.
+/// Left at 10 it re-seeds the bug on the next agent minted from it, so it is
+/// clamped by the same rule — independently of the instance field.
+#[test]
+fn migrate_legacy_parallelism_clamps_legacy_definition_parallelism() {
+    let mut record = record_with_parallelism("agent-pubkey", 4);
+    record.definition_parallelism = Some(10);
+    let mut records = vec![record];
+
+    assert_eq!(migrate_legacy_parallelism(&mut records), 1);
+
+    assert_eq!(records[0].definition_parallelism, Some(2));
+    assert_eq!(
+        records[0].parallelism, 4,
+        "the instance field was never legacy and must not move"
+    );
+}
+
+/// `None` means the definition advertises nothing and must stay silent —
+/// filling it in would invent a default its author never published. Every
+/// other `Some(n)` is an authored choice.
+#[test]
+fn migrate_legacy_parallelism_leaves_non_legacy_definition_parallelism_alone() {
+    let mut records: Vec<ManagedAgentRecord> = [None, Some(1), Some(4), Some(32)]
+        .into_iter()
+        .map(|advertised| {
+            let mut record = record_with_parallelism("agent-pubkey", 4);
+            record.definition_parallelism = advertised;
+            record
+        })
+        .collect();
+
+    let migrated = migrate_legacy_parallelism(&mut records);
+
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.definition_parallelism)
+            .collect::<Vec<_>>(),
+        vec![None, Some(1), Some(4), Some(32)]
+    );
+    assert_eq!(migrated, 0, "none of these were machine-written");
+}
+
+/// The return value is a RECORD count, not a field count. A record whose
+/// instance and definition values were both legacy is one migrated record, so
+/// the "clamped N agent record(s)" log line stays literally true.
+#[test]
+fn migrate_legacy_parallelism_counts_a_record_once_when_both_fields_are_legacy() {
+    let mut record = record_with_parallelism("agent-pubkey", 10);
+    record.definition_parallelism = Some(10);
+    let mut records = vec![record];
+
+    assert_eq!(migrate_legacy_parallelism(&mut records), 1);
+
+    assert_eq!(records[0].parallelism, 2);
+    assert_eq!(records[0].definition_parallelism, Some(2));
 }

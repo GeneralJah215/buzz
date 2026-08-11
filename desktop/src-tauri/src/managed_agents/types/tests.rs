@@ -684,6 +684,26 @@ fn mint_resolves_each_behavioral_field_independently() {
 }
 
 #[test]
+fn mint_clamps_the_legacy_definition_parallelism_default() {
+    // BUG-064: a definition advertising 10 carries the pre-fix default nobody
+    // chose. Clamping at the mint boundary means an instance minted before any
+    // store load never stamps 10 onto disk in the first place.
+    let mut definition = quad_definition("anyone", vec![]);
+    definition.parallelism = Some(10);
+    let minted =
+        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap();
+    assert_eq!(minted.parallelism, Some(2));
+}
+
+#[test]
+fn mint_keeps_an_explicit_input_parallelism_of_ten() {
+    // The clamp is definition-only. A 10 that came from the dialog is an
+    // operator's choice and the mint boundary must not second-guess it.
+    let minted = resolve_mint_behavioral_defaults(None, Vec::new(), Some(10), None).unwrap();
+    assert_eq!(minted.parallelism, Some(10));
+}
+
+#[test]
 fn mint_rejects_out_of_range_input_parallelism() {
     // The "validated when present" contract on MintBehavioralDefaults holds
     // for the INPUT branch too, not just definition values.

@@ -12,6 +12,7 @@ mod pool_lifecycle;
 mod queue;
 mod relay;
 mod setup_mode;
+mod slot_scaling;
 /// Host-capability detection for tests that drive real POSIX subprocesses.
 /// See `test_support.rs` — BUG-049.
 #[cfg(test)]
@@ -49,6 +50,7 @@ use pool::{
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{HarnessRelay, RelayEventPublisher};
+use slot_scaling::{SlotIntent, IDLE_SLOT_TTL, MIN_WARM_SLOTS};
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -2002,10 +2004,27 @@ async fn tokio_main() -> Result<()> {
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
 
+            // Grow on demand (BUG-064): a `try_claim` that found nothing free
+            // promotes exactly one cold slot to `Live`. The refill loop
+            // immediately below spawns it, circuit breaker and all, so growth
+            // reuses the machinery crash recovery already proved.
+            if let Some(idx) = pool.take_growth_slot() {
+                tracing::info!(
+                    agent = idx,
+                    "pool growth: claim was starved, promoting cold slot"
+                );
+            }
+
             // Slot refill: spawn background tasks for empty slots whose
             // circuit breaker allows it. spawn_and_init runs off the main
             // loop so it never blocks event processing.
             for (idx, slot) in crash_history.iter_mut().enumerate() {
+                // A cold slot is empty *on purpose* — never started, or reaped
+                // for idleness. Refilling it here would undo the reaper on the
+                // very next tick and turn BUG-064's fix into a respawn loop.
+                if pool.slot_is_cold(idx) {
+                    continue;
+                }
                 if pool.slot_alive(idx) || slot.respawn_in_flight {
                     continue;
                 }
@@ -2024,6 +2043,27 @@ async fn tokio_main() -> Result<()> {
                     let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
                     guard.send(result);
                 });
+            }
+
+            // Reap idle slots (BUG-064). Without this, growth is a one-way
+            // ratchet: the pool climbs to its ceiling on the first busy hour
+            // and holds every runtime — and the memory behind it — forever.
+            // One slot per tick, so shrinking is gradual and the shutdown
+            // never blocks the main loop.
+            if let Some(mut agent) =
+                pool.reap_idle_slot(std::time::Instant::now(), IDLE_SLOT_TTL, MIN_WARM_SLOTS)
+            {
+                let idx = agent.index;
+                tracing::info!(
+                    agent = idx,
+                    idle_ttl_secs = IDLE_SLOT_TTL.as_secs(),
+                    "pool reap: shutting down slot idle past TTL"
+                );
+                // Detached: `AcpClient::shutdown` tree-kills the agent and
+                // waits up to 5s for it to exit, which the main loop must not
+                // sit through. The desktop's job object is the backstop if the
+                // harness dies before this completes.
+                tokio::spawn(async move { agent.acp.shutdown().await });
             }
 
             // Flush requeued batches whose retry_after has expired. Without
@@ -4070,9 +4110,20 @@ async fn initialize_agent_pool(
     startup: &PoolStartup,
     mut shutdown: Option<watch::Receiver<()>>,
 ) -> Result<AgentPool> {
-    // One agent failing to start must not kill the whole pool.
-    // Attempt each spawn under a 60-second timeout; a partial pool is valid.
+    // Grow on demand, not all at once (BUG-064).
+    //
+    // This loop used to spawn `startup.agents` runtimes before a single message
+    // had arrived — ten per harness, on a desktop that ran 29 harnesses. It now
+    // stops at the *first* agent that comes up: the remaining slots are marked
+    // `Cold`, and the maintenance tick promotes one whenever `try_claim` finds
+    // nothing free, up to the same `startup.agents` ceiling.
+    //
+    // It keeps walking past failures rather than giving up on slot 0, so the
+    // old "one agent failing to start must not kill the whole pool" property
+    // survives: a partial pool is valid, an empty one is fatal. Each attempt is
+    // still bounded by a 60-second initialize timeout.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
+    let mut slot_intents: Vec<SlotIntent> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
         let spawn_result = AcpClient::spawn(
             &startup.command,
@@ -4132,24 +4183,35 @@ async fn initialize_agent_pool(
                             goose_system_prompt_supported: None,
                             protocol_version,
                         }));
+                        slot_intents.push(SlotIntent::Live);
+                        // One warm agent is the whole startup budget now.
+                        break;
                     }
                     Ok(Err(e)) => {
                         tracing::error!(agent = i, "agent initialize failed: {e}");
                         acp.shutdown().await;
                         agent_slots.push(None);
+                        slot_intents.push(SlotIntent::Cold);
                     }
                     Err(_) => {
                         tracing::error!(agent = i, "agent timed out during init (60s)");
                         acp.shutdown().await;
                         agent_slots.push(None);
+                        slot_intents.push(SlotIntent::Cold);
                     }
                 }
             }
             Err(e) => {
                 tracing::error!(agent = i, "agent failed to spawn: {e}");
                 agent_slots.push(None);
+                slot_intents.push(SlotIntent::Cold);
             }
         }
+    }
+    // Slots the loop never reached: cold by design, grown on demand.
+    while agent_slots.len() < startup.agents as usize {
+        agent_slots.push(None);
+        slot_intents.push(SlotIntent::Cold);
     }
     let live_count = agent_slots.iter().filter(|slot| slot.is_some()).count();
     if live_count == 0 {
@@ -4158,15 +4220,12 @@ async fn initialize_agent_pool(
             startup.agents
         ));
     }
-    if live_count < startup.agents as usize {
-        tracing::warn!(
-            "started {}/{} agents — continuing with reduced pool",
-            live_count,
-            startup.agents
-        );
-    }
-    tracing::info!("agent_pool_ready agents={}", live_count);
-    Ok(AgentPool::from_slots(agent_slots))
+    tracing::info!(
+        "agent_pool_ready agents={} ceiling={} (slots grow on demand — BUG-064)",
+        live_count,
+        startup.agents
+    );
+    Ok(AgentPool::from_slots_with_intents(agent_slots, slot_intents))
 }
 
 // ── spawn_and_init ────────────────────────────────────────────────────────────

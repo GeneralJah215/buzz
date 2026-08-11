@@ -22,7 +22,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -41,6 +41,7 @@ use crate::queue::{
     PromptProfile, PromptProfileLookup, ThreadTags,
 };
 use crate::relay::{ChannelInfo, RestClient};
+use crate::slot_scaling::{self, SlotIntent, SlotOccupancy, SlotView};
 
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
@@ -338,6 +339,20 @@ pub struct AgentPool {
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
+    /// Per-slot provisioning intent (BUG-064). Parallel to `agents`.
+    ///
+    /// Distinguishes "empty because it crashed" (`Live` — refill it) from
+    /// "empty because we never started it, or reaped it" (`Cold` — leave it).
+    /// Without this the refill loop in the maintenance tick would respawn every
+    /// slot the reaper shut down, ~30 seconds later, forever.
+    slot_intent: Vec<SlotIntent>,
+    /// When each slot's agent last landed back in its slot. `None` while the
+    /// slot is empty or checked out. Parallel to `agents`.
+    idle_since: Vec<Option<Instant>>,
+    /// Set by a [`try_claim`](Self::try_claim) that found nothing free — the
+    /// demand signal that grows the pool. Cleared by
+    /// [`take_growth_slot`](Self::take_growth_slot).
+    claim_starved: bool,
 }
 
 /// Result returned by a completed prompt task.
@@ -683,13 +698,45 @@ impl AgentPool {
     /// loop skips failed agents — `new()` would pack agents densely and break
     /// the index invariant.
     pub fn from_slots(slots: Vec<Option<OwnedAgent>>) -> Self {
+        let intents = vec![SlotIntent::Live; slots.len()];
+        Self::from_slots_with_intents(slots, intents)
+    }
+
+    /// Create a pool whose slots carry explicit provisioning intents (BUG-064).
+    ///
+    /// Startup now spawns exactly one agent and marks the rest
+    /// [`SlotIntent::Cold`], so the pool grows to `config.agents` only under
+    /// real contention. [`from_slots`](Self::from_slots) keeps the old
+    /// all-`Live` shape for callers that genuinely provisioned every slot.
+    ///
+    /// # Panics
+    ///
+    /// If `intents.len() != slots.len()`. The two vectors index the same slots;
+    /// a mismatch is a programming error that would silently mis-scale the pool.
+    pub fn from_slots_with_intents(
+        slots: Vec<Option<OwnedAgent>>,
+        intents: Vec<SlotIntent>,
+    ) -> Self {
+        assert_eq!(
+            slots.len(),
+            intents.len(),
+            "slot intents must be parallel to slots"
+        );
         let (result_tx, result_rx) = mpsc::unbounded_channel();
+        let now = Instant::now();
+        let idle_since = slots
+            .iter()
+            .map(|slot| slot.as_ref().map(|_| now))
+            .collect();
         Self {
             agents: slots,
             result_tx,
             result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
+            slot_intent: intents,
+            idle_since,
+            claim_starved: false,
         }
     }
 
@@ -708,18 +755,33 @@ impl AgentPool {
                     .unwrap_or(false)
             });
             if let Some(i) = idx {
+                self.idle_since[i] = None;
                 return self.agents[i].take();
             }
         }
 
         // Pass 2: first idle agent.
         let idx = self.agents.iter().position(|slot| slot.is_some());
-        idx.map(|i| self.agents[i].take().unwrap())
+        match idx {
+            Some(i) => {
+                self.idle_since[i] = None;
+                Some(self.agents[i].take().unwrap())
+            }
+            None => {
+                // Demand the pool could not meet. The maintenance tick turns
+                // this into at most one extra runtime (BUG-064); it is a
+                // latch, not a counter, so a burst of starved claims still
+                // grows the pool one slot at a time.
+                self.claim_starved = true;
+                None
+            }
+        }
     }
 
     /// Return an agent to its slot after a task completes.
     pub fn return_agent(&mut self, agent: OwnedAgent) {
         let idx = agent.index;
+        self.idle_since[idx] = Some(Instant::now());
         if self.agents[idx].is_some() {
             // This is a bug: two tasks returned the same agent index. Log it
             // loudly so it shows up in production logs, then overwrite — the
@@ -838,6 +900,75 @@ impl AgentPool {
 
     pub fn agents_mut(&mut self) -> &mut Vec<Option<OwnedAgent>> {
         &mut self.agents
+    }
+
+    // ── Slot scaling (BUG-064) ───────────────────────────────────────────────
+
+    /// Whether a slot is deliberately not running — never started, or reaped
+    /// for idleness.
+    ///
+    /// The maintenance tick's refill loop must skip these. An empty `Live` slot
+    /// is a crashed agent and gets respawned; an empty `Cold` slot is the
+    /// reaper's work, and respawning it would undo the fix 30 seconds later.
+    pub fn slot_is_cold(&self, index: usize) -> bool {
+        self.slot_intent.get(index) == Some(&SlotIntent::Cold)
+    }
+
+    /// Describe every slot for the pure deciders in [`crate::slot_scaling`].
+    fn slot_views(&self) -> Vec<SlotView> {
+        (0..self.agents.len())
+            .map(|index| SlotView {
+                intent: self.slot_intent[index],
+                occupancy: match (&self.agents[index], self.idle_since[index]) {
+                    (Some(_), Some(since)) => SlotOccupancy::Idle(since),
+                    // An occupied slot always has an idle stamp (both are set
+                    // together). Treat a missing stamp as "just landed" rather
+                    // than reaping a slot on a bookkeeping gap.
+                    (Some(_), None) => SlotOccupancy::Idle(Instant::now()),
+                    (None, _) if self.task_map.values().any(|m| m.agent_index == index) => {
+                        SlotOccupancy::CheckedOut
+                    }
+                    (None, _) => SlotOccupancy::Empty,
+                },
+            })
+            .collect()
+    }
+
+    /// If a claim was starved since the last call, promote one cold slot to
+    /// `Live` and return its index for the caller to spawn.
+    ///
+    /// The starvation latch is consumed either way: when every slot is already
+    /// `Live` the pool is at its configured ceiling and the work must queue.
+    pub fn take_growth_slot(&mut self) -> Option<usize> {
+        if !std::mem::take(&mut self.claim_starved) {
+            return None;
+        }
+        let index = slot_scaling::pick_growth_slot(&self.slot_views())?;
+        self.slot_intent[index] = SlotIntent::Live;
+        Some(index)
+    }
+
+    /// Take one agent whose slot has sat idle past `idle_ttl`, marking the slot
+    /// `Cold` so the refill loop leaves it alone. The caller owns shutting the
+    /// returned agent down.
+    ///
+    /// **A checked-out slot can never be returned here**, and not merely
+    /// because [`slot_scaling::pick_reap_slot`] refuses to select one: a
+    /// checked-out agent has been *moved out* of `self.agents[index]` into its
+    /// task, so the `take()` below could only ever yield `None`. The selection
+    /// guard and the ownership model both have to fail before a running turn
+    /// could be shut down underneath itself.
+    pub fn reap_idle_slot(
+        &mut self,
+        now: Instant,
+        idle_ttl: Duration,
+        min_warm: usize,
+    ) -> Option<OwnedAgent> {
+        let index = slot_scaling::pick_reap_slot(&self.slot_views(), now, idle_ttl, min_warm)?;
+        let agent = self.agents[index].take()?;
+        self.slot_intent[index] = SlotIntent::Cold;
+        self.idle_since[index] = None;
+        Some(agent)
     }
 
     /// Remove the session for `channel_id` from all idle agents.

@@ -13,6 +13,9 @@ use crate::managed_agents::{
 };
 use crate::secret_store::{KeyringProbe, SecretStore};
 
+mod parallelism;
+pub(crate) use parallelism::migrate_legacy_parallelism;
+
 /// Keyring key name for an agent's nsec, namespaced from the human identity
 /// key (`"identity"`) which shares the service.
 fn agent_keyring_name(pubkey: &str) -> String {
@@ -244,7 +247,7 @@ fn load_agent_store(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> 
 
     let content = fs::read_to_string(&path)
         .map_err(|error| format!("failed to read agent store: {error}"))?;
-    serde_json::from_str(&content).map_err(|error| {
+    let mut records: Vec<ManagedAgentRecord> = serde_json::from_str(&content).map_err(|error| {
         // Fail loudly and preserve the evidence: a later in-app save rewrites
         // this file wholesale, which would silently destroy a malformed hand
         // edit. Best-effort file-authoring contract (see managed_agents::
@@ -253,7 +256,11 @@ fn load_agent_store(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> 
         // swallowed into an empty store.
         backup_invalid_store(&path);
         format!("failed to parse agent store (preserved as .invalid): {error}")
-    })
+    })?;
+    // Both halves of the store pass through here, so instances and definitions
+    // are clamped alike (BUG-064).
+    migrate_legacy_parallelism(&mut records);
+    Ok(records)
 }
 
 /// Load the keyed agent *instances*. Key-less definitions (former personas,

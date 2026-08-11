@@ -455,16 +455,22 @@ impl AcpClient {
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
     pub async fn shutdown(&mut self) {
-        // Kill the entire process group when possible. The child was spawned
-        // with process_group(0), so its PID == its PGID. Killing the group
-        // ensures subprocesses (MCP servers, tool processes) are cleaned up
-        // rather than orphaned to init.
+        // Kill the whole tree, not just the direct child. Subprocesses (MCP
+        // servers, tool processes, and on Windows the entire node/codex chain
+        // behind a `.cmd` shim) must die with the agent rather than being
+        // orphaned — see [`kill_process_tree`] for why a bare `start_kill` is
+        // not enough on Windows, and [`kill_process_group`] for the Unix path.
         //
-        // Falls back to start_kill() (direct child only) on non-Unix or if
-        // the child has been polled to completion (id() returns None).
+        // Falls back to start_kill() (direct child only) when neither
+        // tree-kill route is available, or if the child has already been polled
+        // to completion (id() returns None).
         match self.child.id() {
-            Some(pid) if kill_process_group(pid) => {}
-            _ => {
+            Some(pid) => {
+                if !kill_process_tree(pid).await && !kill_process_group(pid) {
+                    let _ = self.child.start_kill();
+                }
+            }
+            None => {
                 let _ = self.child.start_kill();
             }
         }
@@ -2362,6 +2368,48 @@ fn kill_process_group(_pid: u32) -> bool {
     false
 }
 
+/// Kill the whole process tree rooted at `pid`. Returns `true` if the tree kill
+/// was issued and reported success.
+///
+/// **This is what makes idle-slot reaping actually reclaim anything on
+/// Windows** (BUG-064). The desktop launches each agent through a `.cmd` shim,
+/// so `AcpClient::child` is `cmd.exe`; the `node` and `codex` processes holding
+/// the memory are its *grandchildren*. Windows has no process groups —
+/// [`kill_process_group`] is a `false`-returning stub there — so
+/// `Child::start_kill()` reaps `cmd.exe` and re-parents the rest of the chain,
+/// which keeps running while the harness believes the slot is gone. Reaping
+/// without this would free nothing and hide the fact that it freed nothing.
+///
+/// `taskkill /T /F` walks the tree, mirroring the desktop's after-restart
+/// teardown in `managed_agents::process_lifecycle::taskkill_tree`. Stdio is
+/// nulled and the console window suppressed so a reap never surfaces on the
+/// operator's screen.
+#[cfg(windows)]
+async fn kill_process_tree(pid: u32) -> bool {
+    use std::process::Stdio;
+
+    let mut cmd = tokio::process::Command::new("taskkill");
+    cmd.args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_no_window(&mut cmd);
+    match cmd.status().await {
+        Ok(status) => status.success(),
+        Err(e) => {
+            tracing::warn!("taskkill tree-kill for pid {pid} could not run: {e}");
+            false
+        }
+    }
+}
+
+/// Non-Windows: the process-group kill in [`kill_process_group`] already reaps
+/// the tree, so this is a `false`-returning stub that defers to it.
+#[cfg(not(windows))]
+async fn kill_process_tree(_pid: u32) -> bool {
+    false
+}
+
 /// Suppress the console window that Windows otherwise allocates for every
 /// console-subsystem child process spawned from a GUI (non-console) parent.
 /// No-op on non-Windows platforms.
@@ -2385,6 +2433,130 @@ mod tests {
     // probe's failure reason printed, instead of failing anonymously.
     // See `crate::test_support` — BUG-049.
     use crate::skip_without_posix_shell;
+
+    /// BUG-064 layer 3, the trap: **verify what actually dies.**
+    ///
+    /// Reaping an idle slot only reclaims memory if the agent's whole chain
+    /// goes with it. On Windows the harness's direct child is a `cmd.exe` shim
+    /// and the expensive processes are its grandchildren, so this test builds
+    /// the same two-level shape (a `.cmd` file whose body launches a
+    /// long-running `powershell.exe`) and pins both halves of the claim:
+    ///
+    /// 1. killing only the direct child leaves the grandchild running — the
+    ///    defect, demonstrated rather than asserted; and
+    /// 2. [`kill_process_tree`] stops it.
+    ///
+    /// Liveness is measured by the grandchild appending to a marker file, so
+    /// the test never has to inspect the process table or reuse a PID. Every
+    /// process it touches is one it spawned itself.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn tree_kill_reaps_the_grandchild_that_survives_a_direct_child_kill() {
+        use std::path::{Path, PathBuf};
+        use std::process::Stdio;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("buzz-acp-treekill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // Grandchild: writes its own PID once, then appends every 150 ms for
+        // ~60s. `-NoProfile` keeps startup off the operator's profile scripts.
+        fn write_shim(dir: &Path, tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+            let marker = dir.join(format!("{tag}-marker.txt"));
+            let pidfile = dir.join(format!("{tag}-pid.txt"));
+            let script = dir.join(format!("{tag}-shim.cmd"));
+            let _ = std::fs::remove_file(&marker);
+            let _ = std::fs::remove_file(&pidfile);
+            std::fs::write(
+                &script,
+                format!(
+                    "@echo off\r\npowershell -NoProfile -NonInteractive -Command \
+                     \"Set-Content -LiteralPath '{pid}' -Value $PID; \
+                     1..400 | ForEach-Object {{ Add-Content -LiteralPath '{mark}' -Value 'x'; \
+                     Start-Sleep -Milliseconds 150 }}\"\r\n",
+                    pid = pidfile.display(),
+                    mark = marker.display(),
+                ),
+            )
+            .expect("write shim");
+            (script, marker, pidfile)
+        }
+
+        fn spawn_chain(script: &Path) -> tokio::process::Child {
+            tokio::process::Command::new("cmd.exe")
+                .args(["/c", &script.display().to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn cmd.exe shim")
+        }
+
+        fn size(path: &Path) -> u64 {
+            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        }
+
+        /// Wait until the grandchild has proven it is alive and producing.
+        async fn wait_until_running(marker: &Path, pidfile: &Path) -> u32 {
+            for _ in 0..300 {
+                if size(marker) > 0 {
+                    if let Ok(text) = std::fs::read_to_string(pidfile) {
+                        if let Ok(pid) = text.trim().parse::<u32>() {
+                            return pid;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("grandchild never started within 30s — cannot test tree kill");
+        }
+
+        // ── 1. The defect: cmd.exe dies, the grandchild does not ────────────
+        let (script_a, marker_a, pidfile_a) = write_shim(&dir, "orphan");
+        let mut child_a = spawn_chain(&script_a);
+        let grandchild_a = wait_until_running(&marker_a, &pidfile_a).await;
+
+        let _ = child_a.start_kill();
+        let _ = child_a.wait().await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let before = size(&marker_a);
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let after = size(&marker_a);
+        assert!(
+            after > before,
+            "killing only the direct child must leave the grandchild running \
+             (this is the trap the reaper has to handle); marker stalled at {before} bytes"
+        );
+
+        // Clean up the survivor we just proved exists — our own PID only.
+        assert!(
+            kill_process_tree(grandchild_a).await,
+            "failed to clean up the orphaned grandchild pid {grandchild_a}"
+        );
+
+        // ── 2. The fix: the tree kill takes the grandchild with it ──────────
+        let (script_b, marker_b, pidfile_b) = write_shim(&dir, "tree");
+        let mut child_b = spawn_chain(&script_b);
+        wait_until_running(&marker_b, &pidfile_b).await;
+
+        let direct_b = child_b.id().expect("direct child pid");
+        assert!(
+            kill_process_tree(direct_b).await,
+            "taskkill /T must succeed against a live tree"
+        );
+        let _ = child_b.wait().await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let before = size(&marker_b);
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let after = size(&marker_b);
+        assert_eq!(
+            before, after,
+            "tree kill must stop the grandchild too — marker grew from {before} to {after} bytes \
+             after the reap, so the chain the slot was holding is still alive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn stop_reason_parses_all_known_values() {
