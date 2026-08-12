@@ -186,60 +186,41 @@
   transform-origin: center;
 }
 
+/*
+ * BUG-078. This used to slide a highlight across the text by animating
+ * `background-position` on a `background-clip: text` element, 2600ms linear
+ * infinite, mounted for as long as any agent is working.
+ *
+ * `background-position` cannot be composited. Every frame is a real repaint on
+ * the main thread, and `background-clip: text` re-rasterises the glyph mask with
+ * it. Measured on the operator's 4K 160 Hz display, with 12 agents working:
+ *
+ *     shimmer as shipped   1924 frames / 12 s  = 160.3 fps, and 1173 ms of
+ *                          paint per 10 s
+ *     shimmer disabled       11 ms of paint per 10 s   (-99% paint, -61% CPU
+ *                          across the renderer, compositor and GPU threads)
+ *
+ * The whole window was repainting at the display's full refresh rate for the
+ * entire duration of every agent task. Cost scales with refresh rate and pixel
+ * count, so high-refresh and high-DPI users pay the most.
+ *
+ * Two cheaper-but-still-animated options were measured before landing on this:
+ * promoting the element to its own compositing layer changed nothing (paint -3%,
+ * CPU +2% - `background-position` still cannot be composited), and quantising
+ * with `steps(26)` recovered -92% paint while keeping visible motion. The
+ * operator's call was that the shimmer is not worth any of it, so the animation
+ * is gone rather than merely throttled.
+ *
+ * The static appearance below is exactly what the `prefers-reduced-motion` path
+ * already rendered, so this is a look users could already get, not a new one.
+ *
+ * If motion is ever wanted back, do NOT restore `background-position` - animate
+ * a transform, and re-measure with scratchpad/ab-shimmer-fixes.mjs. A change
+ * that only looks cheaper in review is not cheaper.
+ */
 .buzz-shimmer {
-  --buzz-shimmer-duration: 2600ms;
-  --buzz-shimmer-band: 250%;
-  --buzz-shimmer-highlight: color-mix(
-    in srgb,
-    hsl(var(--background)) 60%,
-    hsl(var(--muted-foreground)) 40%
-  );
-  --buzz-shimmer-spread: 2rem;
-
-  animation: buzz-shimmer var(--buzz-shimmer-duration) linear infinite;
-  background-clip: text;
-  background-image:
-    linear-gradient(
-      90deg,
-      transparent calc(50% - var(--buzz-shimmer-spread)),
-      var(--buzz-shimmer-highlight) 50%,
-      transparent calc(50% + var(--buzz-shimmer-spread))
-    ),
-    linear-gradient(hsl(var(--muted-foreground)), hsl(var(--muted-foreground)));
-  background-position:
-    100% 0,
-    0 0;
-  background-repeat: no-repeat;
-  background-size:
-    var(--buzz-shimmer-band) 100%,
-    100% 100%;
-  color: transparent;
+  color: hsl(var(--muted-foreground));
   display: inline-block;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-
-@keyframes buzz-shimmer {
-  0% {
-    background-position:
-      100% 0,
-      0 0;
-  }
-
-  100% {
-    background-position:
-      0 0,
-      0 0;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .buzz-shimmer {
-    animation: none;
-    background: none;
-    color: hsl(var(--muted-foreground));
-    -webkit-text-fill-color: currentcolor;
-  }
 }
 
 .buzz-poof-layer {
