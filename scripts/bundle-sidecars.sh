@@ -34,12 +34,38 @@ else
     EXE=""
 fi
 
+# A file test alone is not enough. Dropbox recreates 0-byte placeholders in this
+# tree (BUG-057), and `-f` is true for every one of them. That is precisely how
+# BUG-046 shipped: an installer whose sidecars were all empty, so every agent
+# died with "%1 is not a valid Win32 application". The bundle step reported
+# success at every stage because nothing ever asked how big the files were.
+#
+# Smallest real sidecar here is ~2 MB. 100 KB is far below any true binary and
+# far above any placeholder, so it separates them without being brittle.
+MIN_SIDECAR_BYTES=102400
+
 missing=()
+empty=()
 for bin in "${SIDECARS[@]}"; do
-    [[ -f "$SRC_DIR/${bin}${EXE}" ]] || missing+=("${bin}${EXE}")
+    src="$SRC_DIR/${bin}${EXE}"
+    if [[ ! -f "$src" ]]; then
+        missing+=("${bin}${EXE}")
+        continue
+    fi
+    size=$(wc -c <"$src")
+    if (( size < MIN_SIDECAR_BYTES )); then
+        empty+=("${bin}${EXE} (${size} bytes)")
+    fi
 done
 if [[ ${#missing[@]} -gt 0 ]]; then
     echo "Error: missing release binaries in $SRC_DIR: ${missing[*]}" >&2
+    echo "Run '$BUILD_HINT' first." >&2
+    exit 1
+fi
+if [[ ${#empty[@]} -gt 0 ]]; then
+    echo "Error: placeholder-sized binaries in $SRC_DIR: ${empty[*]}" >&2
+    echo "These are stubs, not binaries. Bundling them produces an installer" >&2
+    echo "whose agents all fail with '%1 is not a valid Win32 application'." >&2
     echo "Run '$BUILD_HINT' first." >&2
     exit 1
 fi
@@ -55,5 +81,18 @@ for bin in "${SIDECARS[@]}"; do
     if [[ -z "$EXE" ]]; then
         chmod 755 "$destination"
     fi
+done
+
+# Verify what actually landed, not what we intended to copy. A copy into this
+# tree can be silently reverted by Dropbox sync between the cp and the bundle
+# step, and the success message above would still print.
+for bin in "${SIDECARS[@]}"; do
+    destination="$BINARIES_DIR/${bin}-${TARGET}${EXE}"
+    size=$(wc -c <"$destination" 2>/dev/null || echo 0)
+    if (( size < MIN_SIDECAR_BYTES )); then
+        echo "Error: $destination is ${size} bytes after copy - staging failed." >&2
+        exit 1
+    fi
+    printf '  %-46s %10d bytes\n' "$(basename "$destination")" "$size"
 done
 echo "Sidecars bundled for $TARGET"
